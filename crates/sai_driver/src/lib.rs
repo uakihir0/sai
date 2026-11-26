@@ -7745,6 +7745,22 @@ fn check_const_literal_owner(
         )?];
         return Ok(ConstLiteralCheck::SupportedNotConst { diagnostics });
     }
+    if let Some((span, code)) = find_invalid_array_length_type_argument(*ty, type_paths) {
+        let (message, label) = match code {
+            sai_diagnostics::Code::ConstArgNotSimple => (
+                "const arguments must be simple literals".to_string(),
+                "not a simple const argument",
+            ),
+            _ => (
+                "a const parameter takes a const argument, not a type".to_string(),
+                "type argument in const parameter position",
+            ),
+        };
+        let diagnostics = vec![const_literal_diagnostic(
+            owner.id, inputs, snapshot, span, code, message, label,
+        )?];
+        return Ok(ConstLiteralCheck::SupportedNotConst { diagnostics });
+    }
     let mut public_api_diagnostic = None;
     if matches!(item.vis, Visibility::Pub | Visibility::Export)
         && let Some(surface_type) = resolve_const_constructor_type(
@@ -19318,6 +19334,86 @@ fn check_const_nominal_constructor(
         ),
         "type mismatch",
     )?]))
+}
+
+/// Finds an `Array` type annotation whose length argument is a type
+/// argument — the shape a const-item path (`Array<I32, N>`) parses to.
+/// Const-item names and arithmetic are never valid const arguments (spec
+/// §5.2.2: `CONST_ARG_NOT_SIMPLE`), and const parameters cannot exist in
+/// the non-generic owners this slice checks, so every such annotation is
+/// spec-invalid. Returns the offending length argument's span.
+fn find_invalid_array_length_type_argument(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> Option<(sai_hir::Span, sai_diagnostics::Code)> {
+    match ty.kind {
+        TyKind::Path(path) => {
+            let is_prelude_array = path.root == PathRoot::Plain
+                && path.segments.len() == 1
+                && matches!(
+                    type_paths?.paths().get(&path.hir_id),
+                    Some(PathRes {
+                        base: Res::PrimTy(sai_resolve::prelude::PrimTy::Array),
+                        resolved_segments: 1,
+                        segment_count: 1,
+                    })
+                );
+            for segment in path.segments {
+                if let Some(args) = segment.args {
+                    if is_prelude_array
+                        && args.args.len() == 2
+                        && let GenericArg::Type(length) = args.args[1]
+                    {
+                        // A path that resolves to a const item is a
+                        // non-simple const argument (spec §5.2.2); any
+                        // other type in the length position is a
+                        // type/const kind mismatch.
+                        let code = match length.kind {
+                            TyKind::Path(length_path)
+                                if type_paths?.paths().get(&length_path.hir_id).is_some_and(
+                                    |resolution| {
+                                        // A path that names a value — a
+                                        // const, variant, or function — or
+                                        // a member path into a nominal type
+                                        // (`Status.Ready`) expresses a
+                                        // const-argument intent, so it is a
+                                        // non-simple const argument rather
+                                        // than a type argument.
+                                        matches!(
+                                            resolution.base,
+                                            Res::Def(
+                                                DefKind::Const | DefKind::Variant | DefKind::Fn,
+                                                _
+                                            )
+                                        ) || (resolution.resolved_segments
+                                            < resolution.segment_count)
+                                    },
+                                ) =>
+                            {
+                                sai_diagnostics::Code::ConstArgNotSimple
+                            }
+                            _ => sai_diagnostics::Code::GenericArgKindMismatch,
+                        };
+                        return Some((length.span, code));
+                    }
+                    for arg in args.args {
+                        if let GenericArg::Type(element) = arg
+                            && let Some(found) =
+                                find_invalid_array_length_type_argument(**element, type_paths)
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        TyKind::Tuple(elements) => elements
+            .iter()
+            .find_map(|element| find_invalid_array_length_type_argument(*element, type_paths)),
+        TyKind::Borrow(_, inner) => find_invalid_array_length_type_argument(*inner, type_paths),
+        _ => None,
+    }
 }
 
 fn resolve_const_array_type<'hir>(
