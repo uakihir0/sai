@@ -8957,6 +8957,7 @@ enum DiscardLiteralShape {
     Tuple(Vec<DiscardLiteralShape>),
     Array(Box<DiscardLiteralShape>, usize),
     Unknown,
+    Opaque,
 }
 
 impl DiscardLiteralShape {
@@ -8978,6 +8979,9 @@ fn unify_discard_shapes(
 ) -> Option<DiscardLiteralShape> {
     match (left, right) {
         (DiscardLiteralShape::Unknown, shape) | (shape, DiscardLiteralShape::Unknown) => {
+            Some(shape.clone())
+        }
+        (DiscardLiteralShape::Opaque, shape) | (shape, DiscardLiteralShape::Opaque) => {
             Some(shape.clone())
         }
         (DiscardLiteralShape::Tuple(left_elements), DiscardLiteralShape::Tuple(right_elements)) => {
@@ -9010,7 +9014,7 @@ fn unify_discard_shapes(
 // An integer literal that fits no integer type at all (positive above
 // `U64`, negative below `I64`) is out of range independent of inference
 // (spec 6.3.1), so it is diagnosed even when sibling elements gate.
-fn discard_impossible_int_literal<'a>(expr: &'a HirExpr<'_>) -> Option<&'a HirExpr<'a>> {
+fn discard_impossible_int_literals<'a>(expr: &'a HirExpr<'_>, literals: &mut Vec<&'a HirExpr<'a>>) {
     match expr.kind {
         ExprKind::Lit(Lit::Int { value, negated }) => {
             let impossible = match value {
@@ -9018,12 +9022,16 @@ fn discard_impossible_int_literal<'a>(expr: &'a HirExpr<'_>) -> Option<&'a HirEx
                 Some(value) => value > u64::MAX as u128,
                 None => true,
             };
-            impossible.then_some(expr)
+            if impossible {
+                literals.push(expr);
+            }
         }
         ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
-            elements.iter().find_map(discard_impossible_int_literal)
+            for element in elements {
+                discard_impossible_int_literals(element, literals);
+            }
         }
-        _ => None,
+        _ => {}
     }
 }
 
@@ -9097,24 +9105,26 @@ fn check_function_discarded_unit_tail(
                     owner, element, false, symbols, inputs, snapshot,
                 )?
                 else {
-                    let mut definite = Vec::new();
+                    let mut literals = Vec::new();
                     for checked in elements.iter() {
-                        if let Some(literal) = discard_impossible_int_literal(checked) {
-                            definite.push(const_literal_diagnostic(
-                                owner.id,
-                                inputs,
-                                snapshot,
-                                literal.span,
-                                sai_diagnostics::Code::LiteralOutOfRange,
-                                "integer literal out of range for every integer type".to_string(),
-                                "literal out of range",
-                            )?);
-                        }
+                        discard_impossible_int_literals(checked, &mut literals);
                     }
-                    if definite.is_empty() {
+                    if literals.is_empty() {
                         return Ok(None);
                     }
-                    return Ok(Some((DiscardLiteralShape::Unknown, definite)));
+                    let mut definite = Vec::new();
+                    for literal in literals {
+                        definite.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            literal.span,
+                            sai_diagnostics::Code::LiteralOutOfRange,
+                            "integer literal out of range for every integer type".to_string(),
+                            "literal out of range",
+                        )?);
+                    }
+                    return Ok(Some((DiscardLiteralShape::Opaque, definite)));
                 };
                 diagnostics.extend(element_diagnostics);
                 shapes.push(shape);
@@ -9130,24 +9140,26 @@ fn check_function_discarded_unit_tail(
                     owner, element, true, symbols, inputs, snapshot,
                 )?
                 else {
-                    let mut definite = Vec::new();
+                    let mut literals = Vec::new();
                     for checked in elements.iter() {
-                        if let Some(literal) = discard_impossible_int_literal(checked) {
-                            definite.push(const_literal_diagnostic(
-                                owner.id,
-                                inputs,
-                                snapshot,
-                                literal.span,
-                                sai_diagnostics::Code::LiteralOutOfRange,
-                                "integer literal out of range for every integer type".to_string(),
-                                "literal out of range",
-                            )?);
-                        }
+                        discard_impossible_int_literals(checked, &mut literals);
                     }
-                    if definite.is_empty() {
+                    if literals.is_empty() {
                         return Ok(None);
                     }
-                    return Ok(Some((DiscardLiteralShape::Unknown, definite)));
+                    let mut definite = Vec::new();
+                    for literal in literals {
+                        definite.push(const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            literal.span,
+                            sai_diagnostics::Code::LiteralOutOfRange,
+                            "integer literal out of range for every integer type".to_string(),
+                            "literal out of range",
+                        )?);
+                    }
+                    return Ok(Some((DiscardLiteralShape::Opaque, definite)));
                 };
                 diagnostics.extend(element_diagnostics);
                 if !conflict {
