@@ -8767,16 +8767,38 @@ fn check_function_body_shape_dispatch(
                     };
                     diagnostics
                 } else {
-                    if !is_direct_function_scalar_literal(tail) {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    if is_direct_function_scalar_literal(tail) {
+                        let Some(diagnostics) = check_const_literal_leaf(
+                            owner, *return_ty, tail, type_paths, symbols, inputs, snapshot,
+                            target_cfg,
+                        )?
+                        else {
+                            return Ok(FunctionBodyTypeCheck::Unsupported);
+                        };
+                        diagnostics
+                    } else {
+                        // Literal-only operator tails evaluate like const
+                        // initializers (spec 6.27); references and calls stay
+                        // gated.
+                        let Some(literal_type) =
+                            resolve_const_literal_type(*return_ty, type_paths, symbols, inputs)
+                        else {
+                            return Ok(FunctionBodyTypeCheck::Unsupported);
+                        };
+                        let Some(diagnostics) = check_function_operator_expression_against_type(
+                            owner.id,
+                            literal_type,
+                            tail,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
+                        )?
+                        else {
+                            return Ok(FunctionBodyTypeCheck::Unsupported);
+                        };
+                        diagnostics
                     }
-                    let Some(diagnostics) = check_const_literal_leaf(
-                        owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
-                    )?
-                    else {
-                        return Ok(FunctionBodyTypeCheck::Unsupported);
-                    };
-                    diagnostics
                 }
             }
             Some(FunctionDirectType::Str) => {
@@ -8853,6 +8875,41 @@ fn direct_composite_type_display(
     }
     let literal_type = resolve_const_literal_type(ty, type_paths, symbols, inputs)?;
     Some(local_enum_variant_type_name(literal_type).to_string())
+}
+
+// Literal operator expressions in function bodies reuse the const scalar
+// evaluator for type and range checks, but overflow, division by zero, and
+// shift overflow are runtime panics (spec 6.8 / D-TYPE-06), not compile
+// errors — `CONST_EVAL_PANIC` applies to const initializers only.
+#[allow(clippy::too_many_arguments)]
+fn check_function_operator_expression_against_type(
+    owner: OwnerId,
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(diagnostics) = check_const_operator_expression_against_type(
+        owner,
+        literal_type,
+        value,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code != sai_diagnostics::Code::ConstEvalPanic)
+            .collect(),
+    ))
 }
 
 // Composite literal elements in tuple/array returns recurse structurally
@@ -8960,11 +9017,24 @@ fn check_function_composite_literal_element(
         return Ok(None);
     }
     let is_unit_tuple = matches!(element.kind, ExprKind::Tuple(elements) if elements.is_empty());
-    if !is_direct_function_scalar_literal(element) && !is_unit_tuple {
-        return Ok(None);
+    if is_direct_function_scalar_literal(element) || is_unit_tuple {
+        return check_const_literal_leaf(
+            owner, ty, element, type_paths, symbols, inputs, snapshot, target_cfg,
+        );
     }
-    check_const_literal_leaf(
-        owner, ty, element, type_paths, symbols, inputs, snapshot, target_cfg,
+    // Literal-only operator expressions in element positions evaluate like
+    // const initializers (spec 6.27); references and calls stay gated.
+    let Some(literal_type) = resolve_const_literal_type(ty, type_paths, symbols, inputs) else {
+        return Ok(None);
+    };
+    check_function_operator_expression_against_type(
+        owner.id,
+        literal_type,
+        element,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
     )
 }
 
@@ -70793,6 +70863,13 @@ property "shared"() {}
                 "string_mismatch",
                 "42",
             ),
+            (
+                16,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `Byte`, found a byte string literal",
+                "byte_string_return",
+                "b\"text\"",
+            ),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
@@ -70831,12 +70908,21 @@ property "shared"() {}
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
 
+        let FunctionBodyTypeCheck::Supported { diagnostics } = owners[23]
+            .body_type_check()
+            .expect("primitive unit tail body check succeeds")
+        else {
+            panic!("unit tail against a primitive remains in the supported slice");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(diagnostics[0].message, "expected `I32`, found unit");
+
         for owner in owners[12..13]
             .iter()
-            .chain(owners[16..17].iter())
             .chain(owners[18..19].iter())
             .chain(owners[20..21].iter())
-            .chain(owners[22..].iter())
+            .chain(owners[22..23].iter())
         {
             assert!(matches!(
                 owner
