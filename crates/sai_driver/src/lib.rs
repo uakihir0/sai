@@ -40539,9 +40539,11 @@ impl RootDatabase {
                     let mut variant_names = HashSet::new();
                     let mut variants_are_supported = true;
                     for variant in variants {
-                        if variant.has_explicit_discriminant
-                            || !variant_names.insert(variant.name.sym)
-                        {
+                        // Explicit discriminants do not change construction
+                        // semantics: range, uniqueness, and unit-only shape
+                        // are validated by the enum ADT projection and the
+                        // parser, whose diagnostics surface independently.
+                        if !variant_names.insert(variant.name.sym) {
                             variants_are_supported = false;
                             break;
                         }
