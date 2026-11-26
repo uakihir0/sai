@@ -8236,39 +8236,6 @@ fn check_function_body_shape_dispatch(
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
         }
     }
-    let (parameter, parameter_pair) = match (sig.params, body.params) {
-        ([], []) => (None, None),
-        ([parameter], [body_parameter])
-            if !parameter.is_self
-                && parameter.mutable == body_parameter.mutable
-                && parameter
-                    .name
-                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
-                && parameter.name == body_parameter.name =>
-        {
-            (Some((parameter, body_parameter)), None)
-        }
-        ([first, second], [first_body, second_body])
-            if !first.is_self
-                && !second.is_self
-                && first.mutable == first_body.mutable
-                && second.mutable == second_body.mutable
-                && first
-                    .name
-                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
-                && second
-                    .name
-                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
-                && first.name == first_body.name
-                && second.name == second_body.name
-                && first.name != second.name
-                && first_body.binding != second_body.binding =>
-        {
-            (None, Some((first, first_body, second, second_body)))
-        }
-        _ => return Ok(FunctionBodyTypeCheck::Unsupported),
-    };
-
     let block = match body.value.kind {
         ExprKind::Block(block) if block.safety == sai_hir::Safety::Safe => block,
         _ => return Ok(FunctionBodyTypeCheck::Unsupported),
@@ -8276,13 +8243,28 @@ fn check_function_body_shape_dispatch(
     // Invalid literal array lengths in the return type are spec-invalid
     // (spec 5.2.2) independent of the body shape — including empty
     // array literals whose elements are never checked.
-    if let Some(return_ty) = sig.ret
-        && let Some((span, code)) = find_invalid_array_length_type_argument(
+    let mut invalid_length = None;
+    for parameter in sig.params {
+        if let Some(found) = find_invalid_array_length_type_argument(
+            *parameter.ty,
+            type_paths,
+            target_cfg.pointer_width(),
+        ) {
+            invalid_length = Some(found);
+            break;
+        }
+    }
+    if invalid_length.is_none()
+        && let Some(return_ty) = sig.ret
+        && let Some(found) = find_invalid_array_length_type_argument(
             *return_ty,
             type_paths,
             target_cfg.pointer_width(),
         )
     {
+        invalid_length = Some(found);
+    }
+    if let Some((span, code)) = invalid_length {
         let (message, label) = match code {
             sai_diagnostics::Code::ConstArgNotSimple => (
                 "const arguments must be simple literals".to_string(),
@@ -8352,6 +8334,39 @@ fn check_function_body_shape_dispatch(
             diagnostics: array_diagnostics,
         });
     }
+    let (parameter, parameter_pair) = match (sig.params, body.params) {
+        ([], []) => (None, None),
+        ([parameter], [body_parameter])
+            if !parameter.is_self
+                && parameter.mutable == body_parameter.mutable
+                && parameter
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                && parameter.name == body_parameter.name =>
+        {
+            (Some((parameter, body_parameter)), None)
+        }
+        ([first, second], [first_body, second_body])
+            if !first.is_self
+                && !second.is_self
+                && first.mutable == first_body.mutable
+                && second.mutable == second_body.mutable
+                && first
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                && second
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                && first.name == first_body.name
+                && second.name == second_body.name
+                && first.name != second.name
+                && first_body.binding != second_body.binding =>
+        {
+            (None, Some((first, first_body, second, second_body)))
+        }
+        _ => return Ok(FunctionBodyTypeCheck::Unsupported),
+    };
+
     let diagnostics = if let Some((parameter, body_parameter)) = parameter {
         let parameter_family =
             resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
