@@ -8943,29 +8943,66 @@ fn check_function_operator_expression_against_type(
 // A branch tail discarded against `()` must still be well-typed on its own
 // (spec 6.25.2): integer literals default to `I64` and float literals to
 // `F64` with range checks after resolution (6.3.1/6.3.2), array elements
-// share one type compared by literal shape, empty arrays need a type the
-// fragment cannot infer, and composite constructions validate recursively.
-// Forms needing inference gate.
-fn discard_literal_shape(expr: &HirExpr<'_>) -> Option<String> {
-    match expr.kind {
-        ExprKind::Lit(Lit::Int { .. }) => Some("integer".to_string()),
-        ExprKind::Lit(Lit::Float { .. }) => Some("float".to_string()),
-        ExprKind::Lit(Lit::Str(_)) => Some("string".to_string()),
-        ExprKind::Lit(Lit::ByteStr(_)) => Some("byte string".to_string()),
-        ExprKind::Lit(Lit::Char(_)) => Some("char".to_string()),
-        ExprKind::Lit(Lit::Byte(_)) => Some("byte".to_string()),
-        ExprKind::Lit(Lit::Bool(_)) => Some("bool".to_string()),
-        ExprKind::Tuple(elements) => {
-            let mut shapes = Vec::new();
-            for element in elements {
-                shapes.push(discard_literal_shape(element)?);
+// unify to one element type, and composite constructions validate
+// recursively. Forms needing inference gate.
+#[derive(Clone, PartialEq)]
+enum DiscardLiteralShape {
+    Integer,
+    Float,
+    Str,
+    ByteStr,
+    Char,
+    Byte,
+    Bool,
+    Tuple(Vec<DiscardLiteralShape>),
+    Array(Box<DiscardLiteralShape>, usize),
+    Unknown,
+}
+
+impl DiscardLiteralShape {
+    fn contains_unknown(&self) -> bool {
+        match self {
+            DiscardLiteralShape::Unknown => true,
+            DiscardLiteralShape::Tuple(elements) => {
+                elements.iter().any(DiscardLiteralShape::contains_unknown)
             }
-            Some(format!("({})", shapes.join(", ")))
+            DiscardLiteralShape::Array(element, _) => element.contains_unknown(),
+            _ => false,
         }
-        ExprKind::Array(elements) => {
-            let first = elements.first()?;
-            Some(format!("[{}]", discard_literal_shape(first)?))
+    }
+}
+
+fn unify_discard_shapes(
+    left: &DiscardLiteralShape,
+    right: &DiscardLiteralShape,
+) -> Option<DiscardLiteralShape> {
+    match (left, right) {
+        (DiscardLiteralShape::Unknown, shape) | (shape, DiscardLiteralShape::Unknown) => {
+            Some(shape.clone())
         }
+        (DiscardLiteralShape::Tuple(left_elements), DiscardLiteralShape::Tuple(right_elements)) => {
+            if left_elements.len() != right_elements.len() {
+                return None;
+            }
+            let mut unified = Vec::new();
+            for (left_element, right_element) in left_elements.iter().zip(right_elements) {
+                unified.push(unify_discard_shapes(left_element, right_element)?);
+            }
+            Some(DiscardLiteralShape::Tuple(unified))
+        }
+        (
+            DiscardLiteralShape::Array(left_element, left_length),
+            DiscardLiteralShape::Array(right_element, right_length),
+        ) => {
+            if left_length != right_length {
+                return None;
+            }
+            Some(DiscardLiteralShape::Array(
+                Box::new(unify_discard_shapes(left_element, right_element)?),
+                *left_length,
+            ))
+        }
+        (left_shape, right_shape) if left_shape == right_shape => Some(left_shape.clone()),
         _ => None,
     }
 }
@@ -8973,10 +9010,11 @@ fn discard_literal_shape(expr: &HirExpr<'_>) -> Option<String> {
 fn check_function_discarded_unit_tail(
     owner: &HirOwner<'_>,
     tail: &HirExpr<'_>,
+    in_array_element: bool,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
-) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+) -> Result<Option<(DiscardLiteralShape, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     match tail.kind {
         ExprKind::Lit(Lit::Int { value, negated }) => {
             let fits = match value {
@@ -8985,17 +9023,20 @@ fn check_function_discarded_unit_tail(
                 None => false,
             };
             if fits {
-                return Ok(Some(Vec::new()));
+                return Ok(Some((DiscardLiteralShape::Integer, Vec::new())));
             }
-            return Ok(Some(vec![const_literal_diagnostic(
-                owner.id,
-                inputs,
-                snapshot,
-                tail.span,
-                sai_diagnostics::Code::LiteralOutOfRange,
-                "integer literal out of range for `I64`".to_string(),
-                "literal out of range",
-            )?]));
+            return Ok(Some((
+                DiscardLiteralShape::Integer,
+                vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    tail.span,
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "integer literal out of range for `I64`".to_string(),
+                    "literal out of range",
+                )?],
+            )));
         }
         ExprKind::Lit(Lit::Float { text, .. }) => {
             let Ok(text) = symbols.resolve(text) else {
@@ -9006,64 +9047,69 @@ fn check_function_discarded_unit_tail(
                 .parse::<f64>()
                 .is_ok_and(|value| value.is_infinite())
             {
-                return Ok(Some(vec![const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    tail.span,
-                    sai_diagnostics::Code::LiteralOutOfRange,
-                    "floating-point literal out of range for `F64`".to_string(),
-                    "literal out of range",
-                )?]));
+                return Ok(Some((
+                    DiscardLiteralShape::Float,
+                    vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        tail.span,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        "floating-point literal out of range for `F64`".to_string(),
+                        "literal out of range",
+                    )?],
+                )));
             }
-            return Ok(Some(Vec::new()));
+            return Ok(Some((DiscardLiteralShape::Float, Vec::new())));
         }
-        ExprKind::Lit(_) => return Ok(Some(Vec::new())),
+        ExprKind::Lit(Lit::Str(_)) => return Ok(Some((DiscardLiteralShape::Str, Vec::new()))),
+        ExprKind::Lit(Lit::ByteStr(_)) => {
+            return Ok(Some((DiscardLiteralShape::ByteStr, Vec::new())));
+        }
+        ExprKind::Lit(Lit::Char(_)) => return Ok(Some((DiscardLiteralShape::Char, Vec::new()))),
+        ExprKind::Lit(Lit::Byte(_)) => return Ok(Some((DiscardLiteralShape::Byte, Vec::new()))),
+        ExprKind::Lit(Lit::Bool(_)) => return Ok(Some((DiscardLiteralShape::Bool, Vec::new()))),
         ExprKind::Tuple(elements) => {
             let mut diagnostics = Vec::new();
+            let mut shapes = Vec::new();
             for element in elements {
-                let Some(element_diagnostics) =
-                    check_function_discarded_unit_tail(owner, element, symbols, inputs, snapshot)?
+                let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
+                    owner, element, false, symbols, inputs, snapshot,
+                )?
                 else {
-                    return Ok(None);
-                };
-                diagnostics.extend(element_diagnostics);
-            }
-            return Ok(Some(diagnostics));
-        }
-        ExprKind::Array(elements) => {
-            if elements.is_empty() {
-                return Ok(Some(vec![const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    tail.span,
-                    sai_diagnostics::Code::TypeAnnotationsNeeded,
-                    "type annotations needed for the empty array literal".to_string(),
-                    "type annotations needed",
-                )?]));
-            }
-            let mut diagnostics = Vec::new();
-            let mut shapes: Vec<Option<String>> = Vec::new();
-            for element in elements {
-                let Some(element_diagnostics) =
-                    check_function_discarded_unit_tail(owner, element, symbols, inputs, snapshot)?
-                else {
-                    return Ok(None);
-                };
-                diagnostics.extend(element_diagnostics);
-                let Some(shape) = discard_literal_shape(element) else {
                     if diagnostics.is_empty() {
                         return Ok(None);
                     }
-                    return Ok(Some(diagnostics));
+                    return Ok(Some((DiscardLiteralShape::Unknown, diagnostics)));
                 };
-                shapes.push(Some(shape));
+                diagnostics.extend(element_diagnostics);
+                shapes.push(shape);
             }
-            if shapes
-                .first()
-                .is_some_and(|first| shapes.iter().any(|shape| shape != first))
-            {
+            return Ok(Some((DiscardLiteralShape::Tuple(shapes), diagnostics)));
+        }
+        ExprKind::Array(elements) => {
+            let mut diagnostics = Vec::new();
+            let mut unified: DiscardLiteralShape = DiscardLiteralShape::Unknown;
+            let mut conflict = false;
+            for element in elements {
+                let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
+                    owner, element, true, symbols, inputs, snapshot,
+                )?
+                else {
+                    if diagnostics.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some((DiscardLiteralShape::Unknown, diagnostics)));
+                };
+                diagnostics.extend(element_diagnostics);
+                if !conflict {
+                    match unify_discard_shapes(&unified, &shape) {
+                        Some(shape) => unified = shape,
+                        None => conflict = true,
+                    }
+                }
+            }
+            if conflict {
                 diagnostics.push(const_literal_diagnostic(
                     owner.id,
                     inputs,
@@ -9073,8 +9119,31 @@ fn check_function_discarded_unit_tail(
                     "array elements have mismatched types".to_string(),
                     "type mismatch",
                 )?);
+            } else if unified.contains_unknown() && !in_array_element && !elements.is_empty() {
+                diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    tail.span,
+                    sai_diagnostics::Code::TypeAnnotationsNeeded,
+                    "type annotations needed for the array literal".to_string(),
+                    "type annotations needed",
+                )?);
+            } else if elements.is_empty() && !in_array_element {
+                diagnostics.push(const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    tail.span,
+                    sai_diagnostics::Code::TypeAnnotationsNeeded,
+                    "type annotations needed for the array literal".to_string(),
+                    "type annotations needed",
+                )?);
             }
-            return Ok(Some(diagnostics));
+            return Ok(Some((
+                DiscardLiteralShape::Array(Box::new(unified), elements.len()),
+                diagnostics,
+            )));
         }
         _ => {}
     }
@@ -9131,8 +9200,9 @@ fn check_function_composite_literal_element(
         ) {
             let mut discard_diagnostics = Vec::new();
             for tail in [then_tail, else_tail] {
-                let Some(tail_diagnostics) =
-                    check_function_discarded_unit_tail(owner, tail, symbols, inputs, snapshot)?
+                let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
+                    owner, tail, false, symbols, inputs, snapshot,
+                )?
                 else {
                     return Ok(None);
                 };
