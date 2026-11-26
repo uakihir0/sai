@@ -9536,8 +9536,8 @@ fn check_function_discarded_unit_tail(
             let mut shapes = Vec::new();
             for element in elements {
                 let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
-                    owner, element, false, true, sig, body, locals, symbols, inputs, snapshot,
-                    type_paths, target_cfg,
+                    owner, element, in_array_element, true, sig, body, locals, symbols, inputs,
+                    snapshot, type_paths, target_cfg,
                 )?
                 else {
                     let mut literals = Vec::new();
