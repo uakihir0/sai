@@ -8621,6 +8621,56 @@ fn check_function_body_shape_dispatch(
             }
         }
     } else {
+        // Tuple returns of direct element types check tuple-literal tails
+        // element-wise: `pub fn pair() -> (I32, Bool) { (1, true) }` (spec
+        // 6.5.1 — the tail checks against the tuple element types).
+        if let Some(return_ty) = sig.ret
+            && let TyKind::Tuple(type_elements) = return_ty.kind
+            && !type_elements.is_empty()
+        {
+            if !block.stmts.is_empty() {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            let Some(tail) = block.tail else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            let ExprKind::Tuple(tail_elements) = tail.kind else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            if tail_elements.len() != type_elements.len() {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            let mut tuple_diagnostics = Vec::new();
+            for (type_element, tail_element) in type_elements.iter().zip(tail_elements) {
+                if resolve_function_direct_type(*type_element, type_paths, symbols, inputs)
+                    .is_none()
+                {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                let is_unit_tuple =
+                    matches!(tail_element.kind, ExprKind::Tuple(elements) if elements.is_empty());
+                if !is_direct_function_scalar_literal(tail_element) && !is_unit_tuple {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                let Some(element_diagnostics) = check_const_literal_leaf(
+                    owner,
+                    *type_element,
+                    tail_element,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+                else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                tuple_diagnostics.extend(element_diagnostics);
+            }
+            return Ok(FunctionBodyTypeCheck::Supported {
+                diagnostics: tuple_diagnostics,
+            });
+        }
         // A missing return type is the implicit `-> ()` (spec 6.5.1), so it
         // resolves to unit; an explicit annotation that does not resolve
         // stays unsupported.
