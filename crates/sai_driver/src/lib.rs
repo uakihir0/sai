@@ -17593,6 +17593,32 @@ fn check_function_if_parameter_comparison_condition(
         } else {
             return Ok(None);
         };
+    if matches!(
+        resolve_function_direct_type(parameter_ty, type_paths, symbols, inputs),
+        Some(FunctionDirectType::Str)
+    ) {
+        // `Str` comparisons mirror the primitive walker: string literals
+        // compare in any equality or ordering operator, and other literal
+        // kinds mismatch the parameter type.
+        let found = match literal.kind {
+            ExprKind::Lit(Lit::Str(_)) => return Ok(Some(Vec::new())),
+            ExprKind::Lit(Lit::Int { .. }) => "an integer literal",
+            ExprKind::Lit(Lit::Float { .. }) => "a floating-point literal",
+            ExprKind::Lit(Lit::Bool(_)) => "a Bool literal",
+            ExprKind::Lit(Lit::Char(_)) => "a character literal",
+            ExprKind::Lit(Lit::Byte(_)) => "a byte literal",
+            _ => return Ok(None),
+        };
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            literal.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `Str`, found {found}"),
+            "type mismatch",
+        )?]));
+    }
     let Some(FunctionDirectType::Primitive(parameter_primitive)) =
         resolve_function_direct_type(parameter_ty, type_paths, symbols, inputs)
     else {
