@@ -8864,6 +8864,11 @@ fn direct_composite_type_display(
                 *element, type_paths, symbols, inputs, target_cfg,
             )?);
         }
+        // `(T)` is a parenthesized type in sai, so 1-tuples render with the
+        // trailing comma `(T,)`.
+        if rendered.len() == 1 {
+            return Some(format!("({},)", rendered[0]));
+        }
         return Some(format!("({})", rendered.join(", ")));
     }
     if let Some((element, length)) =
@@ -8928,6 +8933,24 @@ fn check_function_composite_literal_element(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if let TyKind::Tuple(type_elements) = ty.kind
+        && type_elements.is_empty()
+        && let ExprKind::Tuple(tail_elements) = element.kind
+        && !tail_elements.is_empty()
+    {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            element.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `()`, found tuple of arity {}",
+                tail_elements.len()
+            ),
+            "type mismatch",
+        )?]));
+    }
     if let TyKind::Tuple(type_elements) = ty.kind
         && !type_elements.is_empty()
     {

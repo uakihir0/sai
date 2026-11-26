@@ -11616,6 +11616,10 @@ fn public_zero_parameter_tuple_arity_mismatch_is_diagnosed() {
             "pub fn f() -> (I32, (Bool, I8)) { (1, (true, 5, 2)) }\n",
             "expected `(Bool, I8)`, found tuple of arity 3",
         ),
+        (
+            "pub fn f() -> ((), I32) { ((1,), 2) }\n",
+            "expected `()`, found tuple of arity 1",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
