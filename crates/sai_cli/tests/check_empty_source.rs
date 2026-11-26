@@ -13487,6 +13487,66 @@ fn module_qualified_same_name_nominal_payload_checks() {
 }
 
 #[test]
+fn reexported_nominal_const_constructors_check() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/facade.{Point}\n",
+            "pub enum Status { Ready(Point) }\n",
+            "pub const STATUS: Status = Status.Ready(Point(x: 1))\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[
+            ("src/model.sai", "pub type Point { x: I32 }\n"),
+            ("src/middle.sai", "pub use acme:empty/model.{Point}\n"),
+            ("src/facade.sai", "pub use acme:empty/middle.{Point}\n"),
+        ],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
+fn reexported_cross_module_nominal_cycle_stays_gated() {
+    let output = run_check(
+        concat!("pub const ONE: I32 = 1\n", "pub fn zero() -> I32 { 0 }\n",),
+        "",
+        &[
+            (
+                "src/a.sai",
+                concat!("use acme:empty/b\n", "pub enum A { Wrap(b.B) }\n"),
+            ),
+            (
+                "src/b.sai",
+                concat!("use acme:empty/facade.{A}\n", "pub enum B { Wrap(A) }\n"),
+            ),
+            ("src/facade.sai", "pub use acme:empty/a.{A}\n"),
+        ],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "re-exported cross-module nominal cycle",
+    );
+}
+
+#[test]
+fn private_imported_nominal_payload_stays_gated_in_public_enum() {
+    let output = run_check(
+        concat!(
+            "use acme:empty/types.{Secret}\n",
+            "pub enum Status { Ready(Secret) }\n",
+            "pub const ONE: I32 = 1\n",
+            "pub fn zero() -> I32 { 0 }\n",
+        ),
+        "",
+        &[("src/types.sai", "type Secret { x: I32 }\n")],
+        &[],
+    );
+    assert_check_stays_gated_without_syntax_errors(&output, "private imported enum payload");
+}
+
+#[test]
 fn target_filtered_module_import_does_not_validate_qualified_payload() {
     let output = run_check(
         concat!(

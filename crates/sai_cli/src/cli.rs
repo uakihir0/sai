@@ -2230,12 +2230,43 @@ fn checked_source_module_path(source_directory: &str, path: &str) -> Option<Stri
         .or(Some(String::new()))
 }
 
+#[derive(Clone, Debug, Default)]
+struct ScannerModuleTypeInventory {
+    definitions: HashMap<String, bool>,
+    reexports: HashMap<String, (String, String)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PackageModuleTypeInventory {
+    modules: HashMap<String, ScannerModuleTypeInventory>,
+}
+
+impl PackageModuleTypeInventory {
+    fn resolve_type(&self, module_path: &str, name: &str) -> Option<(String, String, bool)> {
+        let mut module_path = module_path;
+        let mut name = name;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert((module_path.to_owned(), name.to_owned())) {
+                return None;
+            }
+            let module = self.modules.get(module_path)?;
+            if let Some(public) = module.definitions.get(name) {
+                return Some((module_path.to_owned(), name.to_owned(), *public));
+            }
+            let (next_module_path, next_name) = module.reexports.get(name)?;
+            module_path = next_module_path;
+            name = next_name;
+        }
+    }
+}
+
 fn package_module_type_inventory(
     input: &CheckModuleTreePackageInput,
-) -> HashMap<String, HashSet<String>> {
+) -> PackageModuleTypeInventory {
     use sai_syntax::ast::AstNode as _;
 
-    let mut inventory = HashMap::<String, HashSet<String>>::new();
+    let mut inventory = PackageModuleTypeInventory::default();
     for (path, _, source) in &input.source_inputs {
         let Some(module_path) = checked_source_module_path(&input.source_directory, path) else {
             continue;
@@ -2247,16 +2278,32 @@ fn package_module_type_inventory(
         let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
             continue;
         };
-        let names = inventory.entry(module_path).or_default();
+        let module = inventory.modules.entry(module_path).or_default();
         for item in source_file.items() {
-            let name = match item {
-                sai_syntax::ast::Item::Type(type_decl) => type_decl.name(),
-                sai_syntax::ast::Item::Enum(enumeration) => enumeration.name(),
-                sai_syntax::ast::Item::Distinct(distinct) => distinct.name(),
+            let (name, visibility) = match item {
+                sai_syntax::ast::Item::Type(type_decl) => {
+                    (type_decl.name(), type_decl.visibility())
+                }
+                sai_syntax::ast::Item::Enum(enumeration) => {
+                    (enumeration.name(), enumeration.visibility())
+                }
+                sai_syntax::ast::Item::Distinct(distinct) => {
+                    (distinct.name(), distinct.visibility())
+                }
                 _ => continue,
             };
             if let Some(token) = name.and_then(|name| name.token()) {
-                names.insert(normalize_type_name(token.text()));
+                module.definitions.insert(
+                    normalize_type_name(token.text()),
+                    is_public_visibility(visibility),
+                );
+            }
+        }
+        for import in use_item_imports(&source_file, source, &input.package_identity) {
+            if import.public {
+                module
+                    .reexports
+                    .insert(import.binding, (import.module_path, import.item_name));
             }
         }
     }
@@ -2447,7 +2494,7 @@ fn unqualified_constructor_type_name_is_known(
     name: &str,
     type_names: &HashSet<String>,
     item_imports: &HashMap<String, (String, String)>,
-    module_type_inventory: &HashMap<String, HashSet<String>>,
+    module_type_inventory: &PackageModuleTypeInventory,
 ) -> bool {
     matches!(
         name,
@@ -2476,8 +2523,8 @@ fn unqualified_constructor_type_name_is_known(
                 .get(name)
                 .is_some_and(|(module_path, item_name)| {
                     module_type_inventory
-                        .get(module_path)
-                        .is_some_and(|types| types.contains(item_name))
+                        .resolve_type(module_path, item_name)
+                        .is_some()
                 })))
 }
 
@@ -2486,7 +2533,7 @@ fn type_uses_known_names(
     type_names: &HashSet<String>,
     item_imports: &HashMap<String, (String, String)>,
     module_bindings: &HashMap<String, String>,
-    module_type_inventory: &HashMap<String, HashSet<String>>,
+    module_type_inventory: &PackageModuleTypeInventory,
 ) -> bool {
     match ty {
         sai_syntax::ast::Type::PathType(path) => {
@@ -2538,10 +2585,11 @@ fn type_uses_known_names(
                 );
             }
             names.len() == 2
-                && module_bindings
-                    .get(&names[0])
-                    .and_then(|module_path| module_type_inventory.get(module_path))
-                    .is_some_and(|module_types| module_types.contains(&names[1]))
+                && module_bindings.get(&names[0]).is_some_and(|module_path| {
+                    module_type_inventory
+                        .resolve_type(module_path, &names[1])
+                        .is_some()
+                })
         }
         sai_syntax::ast::Type::TupleType(tuple) => tuple.elements().all(|element| {
             type_uses_known_names(
@@ -2563,6 +2611,40 @@ fn type_uses_known_names(
         }),
         _ => false,
     }
+}
+
+fn type_public_surface_is_visible(
+    ty: &sai_syntax::ast::Type,
+    type_names: &HashSet<String>,
+    public_type_names: &HashSet<String>,
+    item_imports: &HashMap<String, (String, String)>,
+    module_bindings: &HashMap<String, String>,
+    module_type_inventory: &PackageModuleTypeInventory,
+) -> bool {
+    type_reference_names(ty)
+        .into_iter()
+        .all(|reference| match reference {
+            ScannerTypeReference::Unqualified(name) => {
+                if type_names
+                    .iter()
+                    .any(|candidate| normalize_type_name(candidate) == name)
+                {
+                    public_type_names
+                        .iter()
+                        .any(|candidate| normalize_type_name(candidate) == name)
+                } else if let Some((module_path, item_name)) = item_imports.get(&name) {
+                    module_type_inventory
+                        .resolve_type(module_path, item_name)
+                        .is_none_or(|(_, _, public)| public)
+                } else {
+                    true
+                }
+            }
+            ScannerTypeReference::Qualified { binding, name } => module_bindings
+                .get(&binding)
+                .and_then(|module_path| module_type_inventory.resolve_type(module_path, &name))
+                .is_none_or(|(_, _, public)| public),
+        })
 }
 
 fn const_arg_is_supported_array_length(argument: &sai_syntax::ast::ConstArg) -> bool {
@@ -2684,14 +2766,21 @@ fn type_reference_names(ty: &sai_syntax::ast::Type) -> Vec<ScannerTypeReference>
     references
 }
 
-fn use_item_import_bindings(
+struct ScannerUseItemImport {
+    binding: String,
+    module_path: String,
+    item_name: String,
+    public: bool,
+}
+
+fn use_item_imports(
     source_file: &sai_syntax::ast::SourceFile,
     source: &[u8],
     package_identity: &str,
-) -> HashMap<String, (String, String)> {
+) -> Vec<ScannerUseItemImport> {
     use sai_syntax::ast::AstNode as _;
 
-    let mut imports = HashMap::new();
+    let mut imports = Vec::new();
     for item in source_file.items() {
         let sai_syntax::ast::Item::Use(use_decl) = item else {
             continue;
@@ -2708,6 +2797,7 @@ fn use_item_import_bindings(
         let Some(use_items) = use_decl.items() else {
             continue;
         };
+        let public = is_public_visibility(use_decl.visibility());
         for use_item in use_items.items() {
             let Some(item_name) = use_item.name().and_then(|name| {
                 let range = name.syntax().text_range();
@@ -2732,13 +2822,26 @@ fn use_item_import_bindings(
             else {
                 continue;
             };
-            imports.insert(
-                normalize_type_name(&binding),
-                (module_path.to_owned(), normalize_type_name(&item_name)),
-            );
+            imports.push(ScannerUseItemImport {
+                binding: normalize_type_name(&binding),
+                module_path: module_path.clone(),
+                item_name: normalize_type_name(&item_name),
+                public,
+            });
         }
     }
     imports
+}
+
+fn use_item_import_bindings(
+    source_file: &sai_syntax::ast::SourceFile,
+    source: &[u8],
+    package_identity: &str,
+) -> HashMap<String, (String, String)> {
+    use_item_imports(source_file, source, package_identity)
+        .into_iter()
+        .map(|import| (import.binding, (import.module_path, import.item_name)))
+        .collect()
 }
 
 fn scanner_type_references_in_item(item: &sai_syntax::ast::Item) -> Vec<ScannerTypeReference> {
@@ -2862,9 +2965,8 @@ fn package_nominal_types_are_acyclic(input: &CheckModuleTreePackageInput) -> boo
                             Some((file.module_path.clone(), name.clone()))
                         } else if let Some((module_path, item_name)) = file.item_imports.get(name) {
                             inventory
-                                .get(module_path)
-                                .is_some_and(|types| types.contains(item_name))
-                                .then(|| (module_path.clone(), item_name.clone()))
+                                .resolve_type(module_path, item_name)
+                                .map(|(module_path, item_name, _)| (module_path, item_name))
                         } else {
                             None
                         }
@@ -2879,15 +2981,14 @@ fn package_nominal_types_are_acyclic(input: &CheckModuleTreePackageInput) -> boo
 
     fn module_binding_target(
         module_bindings: &HashMap<String, String>,
-        inventory: &HashMap<String, HashSet<String>>,
+        inventory: &PackageModuleTypeInventory,
         binding: &str,
         name: &str,
     ) -> Option<(String, String)> {
         let module_path = module_bindings.get(binding)?;
         inventory
-            .get(module_path)
-            .is_some_and(|types| types.contains(name))
-            .then(|| (module_path.clone(), name.to_owned()))
+            .resolve_type(module_path, name)
+            .map(|(module_path, name, _)| (module_path, name))
     }
 
     let mut state: HashMap<(String, String), u8> = HashMap::new();
@@ -3127,7 +3228,7 @@ fn check_impl_decl_is_inherent_public_methods(
 fn check_source_is_mixed_public_items_fragment(
     source: &[u8],
     package_identity: &str,
-    module_type_inventory: &HashMap<String, HashSet<String>>,
+    module_type_inventory: &PackageModuleTypeInventory,
 ) -> (bool, bool, bool, bool) {
     use sai_syntax::ast::AstNode as _;
 
@@ -3261,6 +3362,15 @@ fn check_source_is_mixed_public_items_fragment(
                                         &module_bindings,
                                         module_type_inventory,
                                     ) && type_has_supported_const_constructor_shape(&ty)
+                                        && (!is_public_visibility(enumeration.visibility())
+                                            || type_public_surface_is_visible(
+                                                &ty,
+                                                &type_names,
+                                                &public_type_names,
+                                                &item_imports,
+                                                &module_bindings,
+                                                module_type_inventory,
+                                            ))
                                 })
                             })
                             && variant.record_shape().is_none_or(|shape| {
@@ -3274,6 +3384,15 @@ fn check_source_is_mixed_public_items_fragment(
                                                 &module_bindings,
                                                 module_type_inventory,
                                             ) && type_has_supported_const_constructor_shape(&ty)
+                                                && (!is_public_visibility(enumeration.visibility())
+                                                    || type_public_surface_is_visible(
+                                                        &ty,
+                                                        &type_names,
+                                                        &public_type_names,
+                                                        &item_imports,
+                                                        &module_bindings,
+                                                        module_type_inventory,
+                                                    ))
                                         })
                                 })
                             })
@@ -3315,6 +3434,16 @@ fn check_source_is_mixed_public_items_fragment(
                             &module_bindings,
                             module_type_inventory,
                         ) || !type_has_supported_const_constructor_shape(&ty)
+                            || (is_public_visibility(distinct.visibility())
+                                && distinct.inner_pub_token().is_some()
+                                && !type_public_surface_is_visible(
+                                    &ty,
+                                    &type_names,
+                                    &public_type_names,
+                                    &item_imports,
+                                    &module_bindings,
+                                    module_type_inventory,
+                                ))
                     })
                 {
                     return (false, false, false, false);
