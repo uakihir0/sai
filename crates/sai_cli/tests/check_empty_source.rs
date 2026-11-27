@@ -26940,10 +26940,7 @@ fn statement_only_unit_bodies_are_checked() {
             "pub fn f(x: I32) {\n    let y = x + 1.5\n}\n",
             &[("TYPE_MISMATCH", 1)],
         ),
-        (
-            "pub fn f() {\n    let y = 300\n}\n",
-            &[],
-        ),
+        ("pub fn f() {\n    let y = 300\n}\n", &[]),
     ];
     for (source, code_counts) in cases {
         let output = run_check(source, "", &[], &[]);
