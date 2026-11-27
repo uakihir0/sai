@@ -13129,7 +13129,8 @@ fn check_function_body_primitive_local_block(
             source: LoopSource::Loop,
             ..
         }
-    );
+    ) || return_type.is_none()
+        && matches!(tail.kind, ExprKind::Loop { .. });
 
     // A nested `{ e }` block tail admits the same tail shapes as a branch
     // tail — the inner block must hold only a tail (stmt-bearing inner
@@ -17076,7 +17077,12 @@ fn primitive_if_stmt_shape_is_supported(
     let ExprKind::If { cond, then, els } = expression.kind else {
         return false;
     };
-    if !primitive_if_condition_shape_is_supported(
+    // The kernel checks statement-position `if`s branch-wise in unit mode:
+    // a no-`else` branch checks against `()` directly (spec 6.14.1), and a
+    // statement-shaped first branch seeds the chain's `()` expectation.
+    // Whatever the kernel cannot check falls back to the validators, so
+    // admission only walks the shapes for their primitive-type collection.
+    let _ = primitive_if_condition_shape_is_supported(
         cond,
         preceding_bindings,
         locals,
@@ -17087,10 +17093,8 @@ fn primitive_if_stmt_shape_is_supported(
         unknown_self_fields,
         direct_call_signatures,
         primitive_types,
-    ) {
-        return false;
-    }
-    if !primitive_stmt_block_shape_is_supported(
+    );
+    let _ = primitive_stmt_block_shape_is_supported(
         then,
         preceding_bindings,
         locals,
@@ -17101,39 +17105,41 @@ fn primitive_if_stmt_shape_is_supported(
         unknown_self_fields,
         direct_call_signatures,
         primitive_types,
-    ) {
-        return false;
+    );
+    if let Some(els) = els {
+        match els.kind {
+            ExprKind::Block(block) => {
+                let _ = primitive_stmt_block_shape_is_supported(
+                    block,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                );
+            }
+            ExprKind::If { .. } => {
+                let _ = primitive_if_stmt_shape_is_supported(
+                    els,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                );
+            }
+            _ => {}
+        }
     }
-    match els {
-        None => true,
-        Some(els) => match els.kind {
-            ExprKind::Block(block) => primitive_stmt_block_shape_is_supported(
-                block,
-                preceding_bindings,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                self_field_projections,
-                unknown_self_fields,
-                direct_call_signatures,
-                primitive_types,
-            ),
-            ExprKind::If { .. } => primitive_if_stmt_shape_is_supported(
-                els,
-                preceding_bindings,
-                locals,
-                inputs,
-                symbols,
-                type_paths,
-                self_field_projections,
-                unknown_self_fields,
-                direct_call_signatures,
-                primitive_types,
-            ),
-            _ => false,
-        },
-    }
+    true
 }
 
 /// Statement-position `match`: the same scrutinee, pattern and guard
@@ -102803,7 +102809,7 @@ property "shared"() {}
         assert_eq!(owners.len(), 42);
 
         for index in [
-            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 23, 26, 29, 31, 32, 33, 39, 40,
+            0, 1, 2, 3, 4, 5, 6, 11, 12, 13, 16, 17, 20, 23, 26, 29, 31, 32, 33, 34, 39, 40,
         ] {
             let check = owners[index]
                 .body_type_check()
@@ -102859,7 +102865,7 @@ property "shared"() {}
         ));
         // `stmt_match` stays gated: statement-position `match` discards its
         // arm values, so unifying them with the return type would be wrong.
-        for index in [15, 18, 19, 21, 34, 35, 41] {
+        for index in [15, 18, 19, 21, 35, 41] {
             let check = owners[index]
                 .body_type_check()
                 .expect("match shapes outside the slice are gated");

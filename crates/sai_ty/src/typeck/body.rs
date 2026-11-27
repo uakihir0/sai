@@ -701,6 +701,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     Some(els) => self.check_unit_if_else_tail(els),
                 }
             }
+            ExprKind::Loop {
+                body,
+                label,
+                source,
+            } => {
+                // `loop`/`while` are `()`-typed or diverging, so they check
+                // in place like a statement-position loop.
+                self.check_loop_stmt(tail.hir_id, body, label, source)
+            }
+            ExprKind::Break { label, value } => self.check_break(tail.hir_id, label, value),
+            ExprKind::Continue { label } => self.check_continue(tail.hir_id, label),
+            ExprKind::Return(value) => self.check_return(tail.hir_id, value),
             _ => {
                 let check = self.check_initializer_value(tail, None)?;
                 self.record_expression_type(tail.hir_id, check.local_type);
@@ -3575,7 +3587,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 Some(tail) => match tail.kind {
                     ExprKind::Break { label, value } => self.check_break(tail.hir_id, label, value),
                     ExprKind::Continue { label } => self.check_continue(tail.hir_id, label),
-                    ExprKind::If { .. } | ExprKind::Match { .. } => self.check_expr_stmt(tail),
+                    // The loop body checks against `()` (T-Loop), so an
+                    // `if`/`match` tail discards branch-wise like any
+                    // other unit-position tail — this is what admits the
+                    // `while` desugaring's user body.
+                    ExprKind::If { .. } | ExprKind::Match { .. } => {
+                        self.check_unit_tail_expression(tail)
+                    }
                     ExprKind::Return(value) => self.check_return(tail.hir_id, value),
                     _ => Err(()),
                 },
@@ -4009,14 +4027,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         els: Option<&'hir Expr<'hir>>,
     ) -> Result<(), ()> {
         self.check_if_condition(condition)?;
-        self.check_stmt_block(then)?;
         match els {
-            None => Ok(()),
-            Some(els) => match els.kind {
-                ExprKind::Block(block) => self.check_stmt_block(block),
-                ExprKind::If { cond, then, els } => self.check_if_stmt(cond, then, els),
-                _ => Err(()),
-            },
+            // An `if` without `else` has type `()` and its block checks
+            // against `()` (spec 6.14.1), so a tail value discards per
+            // §6.25.2 — independent of the `if`'s own position.
+            None => self.check_block_unit(then),
+            Some(els) => {
+                // The statement-position `if` synthesizes: the first
+                // branch determines the type every other branch checks
+                // against. Only statement-shaped first branches are in
+                // scope — they are `()`-typed, so the rest of the chain
+                // checks branch-wise against `()` exactly like a unit
+                // tail. Value-carrying first branches need cross-branch
+                // unification and stay gated.
+                self.check_stmt_block(then)?;
+                self.check_unit_if_else_tail(els)
+            }
         }
     }
 
