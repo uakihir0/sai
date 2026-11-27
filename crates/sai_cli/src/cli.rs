@@ -3224,12 +3224,9 @@ fn check_impl_decl_is_inherent_public_methods(
                         // track it across impls too.
                         && seen_methods.insert((type_text.to_owned(), normalized))
                 });
-            name_is_distinct
-                && method.attrs().next().is_none()
-                && method.body().is_some()
-                && method
-                    .visibility()
-                    .is_some_and(|visibility| visibility.pub_token().is_some())
+            // Method visibility is irrelevant to body checking (spec
+            // 4.6.1 has no module-private level).
+            name_is_distinct && method.attrs().next().is_none() && method.body().is_some()
         })
         && saw_method
 }
@@ -3608,12 +3605,9 @@ fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> 
                     sai_syntax::normalize_identifier(text.strip_prefix("r#").unwrap_or(text))
                 })
                 .is_some_and(|normalized| method_names.insert(normalized));
-            name_is_distinct
-                && method.attrs().next().is_none()
-                && method.body().is_some()
-                && method
-                    .visibility()
-                    .is_some_and(|visibility| visibility.pub_token().is_some())
+            // Method visibility is irrelevant to body checking (spec
+            // 4.6.1 has no module-private level).
+            name_is_distinct && method.attrs().next().is_none() && method.body().is_some()
         })
         && saw_method
 }

@@ -11309,3 +11309,31 @@ requires `EXPORT_FN_NON_SCALAR` for boundary-violating export
 signatures in core-module builds, and that diagnostic is not
 implemented yet, so the conservative gate keeps the invalid program
 from passing silently. Scalar-only exports check like any function.
+
+## IR-1204: Package-private inherent methods check like public ones
+
+**Slice.** The same visibility rule that opened function bodies opens
+inherent method bodies: spec 4.6.1 has no module-private level, so a
+method without a `pub` marker is as visible inside its package as a
+`pub` one and its body checks identically.
+
+```sai
+type Rec { x: I32 }
+impl Rec {
+    fn double(self: borrow Self) -> I32 { self.x + self.x }
+}
+```
+
+The admission surfaced a wide range of method-bodied shapes that had
+only ever been exercised through the privacy gate, and the kernel
+handles them correctly: `self`-receiver arithmetic, bitwise and shift
+forms pass when valid, `Char`/`Bool`/`F64` bitwise report
+`OPERATOR_NOT_SUPPORTED` (bitwise is integer- and `Byte`-only, spec
+6.8.4), scalar operand errors report `TYPE_MISMATCH`, and integer or
+`Byte` bitwise pairs pass.
+
+**Implementation.** The CLI inherent-method shape gates dropped their
+`pub_token` requirement on method items, matching the function-side
+admission of IR-1203. Twenty-two method-bodied cases moved out of the
+gated-expectation tables into a dedicated checked-behavior test that
+asserts each case's diagnostics or success.
