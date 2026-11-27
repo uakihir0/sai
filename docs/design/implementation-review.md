@@ -5884,7 +5884,6 @@
 - **Reason:** The latest hosted run for `6f1ccfb66cae55991a0047fb50090959a9d70456` (run #45, `39210897733`) completed successfully on Ubuntu, macOS, and Windows. Run #44's Windows workspace job was cancelled after a newer push superseded it under `cancel-in-progress: true`; its Windows cache stress and recovery tests had passed. No failing test or runner issue was observed.
 - **Review:** **Review required:** Confirm that cancelling an older run after a newer push is acceptable; set `cancel-in-progress: false` only if preserving every commit's full CI result is preferred over faster feedback and lower runner use.
 
-
 ### CI verification update (2026-10-19)
 
 - **Decision:** Keep GitHub Actions enabled; no workflow change is needed.
@@ -6879,7 +6878,6 @@
 - **Review:** **Review required:** Confirm only a preceding direct unannotated float-literal source and unannotated plain-path copies are eligible; typed or computed copies must not seed alias provenance. Verify 3+ hop chains across `&`, `|`, and `^`, repeated uses, F64 default, later F32 narrowing, F32 and signed F64 overflow at the original source literal span, Char recovery, full-initializer mismatch and following-use/tail recovery. Ensure concrete typed copies and concrete computed-local paths continue to use IR-807 behavior, while integer aliases, ByteString aliases, chains from computed non-concrete float initializers, forward/self/qualified/generic paths, generic/method owners, and nested/chained/computed operator expressions remain gated. Confirm stable source-span ordering remains scoped to deferred-diagnostic bodies and no Char bitwise semantics, lowering, or runtime support is claimed.
 - **Remaining scope:** Aliases without direct unannotated float-literal provenance, integer alias inference, ByteString RHSs, nested/chained/computed operator expressions, unresolved or qualified paths, generic/method owners, Char bitwise lowering/runtime behavior, and complete `TypeckResults`.
 
-
 ### IR-813: propagate integer-literal provenance through unannotated local-copy chains
 
 - **Decision:** Admit a Char-literal-left `&`, `|`, or `^` flat-local initializer when the plain RHS path resolves by `BindingId` to a preceding local whose provenance traces through any number of unannotated plain-path copies to a direct unannotated integer literal. Each copy retains the original `LiteralVariable`, so later integer constraints and repeated operator uses apply to the source literal; otherwise it defaults to I64. Check the complete signed source literal at its declaration under the final type, resolve each pending missing-trait diagnostic using that type and the full expression span, and recover each bitwise expression as Char. A differing supported result annotation reports full-initializer `TYPE_MISMATCH`, then later uses and the function tail recover to that annotation. Typed copies and computed initializers do not seed or extend unannotated provenance. Preserve IR-807 acceptance of concrete primitive typed copies and concrete computed-local paths. At this IR-813 milestone, the `additional_site` guard kept computed integer origins, including literal-left bitwise results, gated; IR-815 below adds one narrow direct integer-bitwise-pair exception. ByteString, nested/chained/computed operator expressions, unresolved/self/forward/qualified/generic paths, and generic/method owners remain gated.
@@ -6888,7 +6886,6 @@
 - **Hostile review:** Independent read-only adversarial review found one P2 test gap: the existing `1 + 2` computed case did not separately cover a computed integer literal variable with no `additional_site`, while `1 & 2` could be rejected by that guard. Added a computed `1 + base` I32-origin chain with three unannotated copies to driver and CLI gates; the reviewer confirmed the P2 is resolved and found no remaining actionable P0–P2 findings.
 - **Review:** **Review required:** Confirm only preceding direct unannotated integer literals and unannotated plain-path copies are newly eligible by `BindingId`, with the original literal variable retained. Verify three or more copies, all `&`, `|`, and `^` operators, repeated uses, unconstrained I64 default, later I32/I8 constraints, signed range errors at the original literal span, Char recovery, full-initializer annotation mismatch, and subsequent-use/tail recovery. Confirm typed copies and concrete computed-local paths still use IR-807, other computed integer origins remain gated with and without `additional_site`, and the general guard remains. Check ByteString, nested/chained/computed RHSs, unresolved/self/forward/qualified/generic paths, and generic/method owners remain gated. Confirm IR-802 through IR-812 behavior remains intact and no Char bitwise semantics, lowering, or runtime support is claimed.
 - **Remaining scope at IR-813:** ByteString RHS inference, computed integer provenance, nested/chained/computed operator expressions, unresolved or qualified paths, generic/method owners, Char bitwise lowering/runtime behavior, and complete `TypeckResults` remained out of scope; IR-815 later adds only the direct integer-bitwise-pair alias path.
-
 
 ### IR-814: diagnose Char bitwise paths through resolved arithmetic-literal aliases
 
@@ -6899,7 +6896,6 @@
 - **Review:** **Review required:** Confirm only unannotated numeric literal-left `+`, `-`, `*`, or `/` initializers with a concrete RHS path, an already-resolved numeric literal variable, and no `additional_site` seed the new binding provenance. Verify propagation through three or more unannotated path copies for both integer and float types, `&`, `|`, and `^`, correct resolved trait type, source-literal range spans, full-expression trait spans, Char recovery, and annotation mismatch/tail recovery. At the IR-814 milestone, a constrained `1 & 2`-origin alias remained gated even after its variable resolved to I32; verify IR-815's separate narrow pair provenance below. Unresolved direct-literal aliases continue through deferred defaulting; concrete typed/computed locals still use IR-807; computed expressions without the approved provenance, nested/chained RHSs, ByteString, generic/method owners, and previous gates remain intact. Confirm there is no new Char bitwise semantics, lowering, or runtime support.
 - **Remaining scope:** Other computed-literal origins, computed expressions that are not resolved by a concrete numeric path, ByteString RHS inference, nested/chained/computed operator expressions, unresolved or qualified paths, generic/method owners, Char bitwise lowering/runtime behavior, and complete `TypeckResults` remain out of scope.
 
-
 ### IR-815: defer Char trait diagnostics through direct integer-bitwise-pair aliases
 
 - **Decision:** Admit a Char-literal-left `&`, `|`, or `^` flat-local initializer when its plain RHS path resolves to an unannotated local initialized by a bitwise operator over two direct integer literals. Track this separate origin by `BindingId` and extend it only across unannotated plain-path copies. Keep the originating shared integer `LiteralVariable`, including its second literal site; do not apply IR-814's resolved-arithmetic rule or relax the `additional_site` guard for other origins. If the Char operator is checked before the integer variable resolves, queue the missing-trait diagnostic until later uses/annotations constrain it or body-end defaulting chooses I64; if the variable is already resolved, report the trait failure immediately using its resolved type. Range-check both original literals under the final type and report each trait failure using that type and the full Char bitwise expression span. Recover the result as Char; preserve full-initializer annotation mismatch and following-use/tail recovery. Existing concrete typed/computed path behavior remains IR-807 and resolved arithmetic aliases remain IR-814.
@@ -6908,7 +6904,6 @@
 - **Hostile review:** Independent read-only adversarial review found no code or test P0–P2 issue. It identified one P2 documentation mismatch: IR-813/814 records and the implementation/CLI progress descriptions still said `1 & 2` aliases remained gated. This IR-815 entry and the corresponding progress text narrow those historical claims to their milestone and document the newly supported direct-pair provenance.
 - **Review:** **Review required:** Confirm the seed initializer has no annotation, has exactly `&`, `|`, or `^` with both operands direct integer literals, and produces the unresolved integer literal variable with an `additional_site`. Confirm only unannotated plain-path copies propagate its `BindingId` provenance; both literal sites retain range checks after I64 defaulting and later I32/I8 constraints; unresolved Char uses queue all three operator diagnostics, while already-resolved paths report immediately; diagnostics use the final trait type and complete expression span and recover as Char; and a differing supported result annotation recovers later uses and the tail. Verify IR-814's supported `1 + base` provenance remains supported while other computed integer origins such as literal/literal arithmetic `1 + 2` and non-direct-pair bitwise expressions remain gated. Also check ByteString, nested/chained expressions, generic/method owners, and existing unsupported shapes. Confirm IR-807 concrete paths and IR-814 resolved arithmetic aliases remain unchanged, with no Char bitwise semantics, lowering, or runtime support.
 - **Remaining scope:** Other computed integer origins, ByteString RHS inference, nested/chained/computed operator expressions, unresolved/qualified/generic paths, generic/method owners, Char bitwise lowering/runtime behavior, and complete `TypeckResults` remain out of scope.
-
 
 ### CI-1: run workspace tests serially to avoid package-cache test interference
 
@@ -8240,7 +8235,6 @@
 - **Hostile review:** An independent read-only review found no actionable issue. It confirmed the scope-validated exact identity join, fail-closed mismatch handling, HIR-keyed entries, documented Unit/Tuple/Record shapes, and regression coverage for missing entries on unsupported paths.
 - **Remaining scope:** Full `TypeckResults`, general method and type-relative path definitions, generic enum path types, record-constructor misuse diagnostics, constructor-call checking, general `type_of`, and broader alias/dependency/WIT resolution remain separate work.
 
-
 ### IR-923 (2026-10-26): record local enum variants as type-dependent definitions
 
 - **Decision:** Add the deliberately narrow `LocalTypeDependentDef::Variant(DefId)` projection to `LocalEnumVariantPathResolution`, keyed by the exact suffix `Field` HIR ID. Derive it only from the same resolved outcome that produced the validated enum/variant pair. Include unit, tuple, and record variants; omit unknown, non-enum, and unsupported paths.
@@ -9034,7 +9028,6 @@
 - **Verification:** With pinned Rust 1.99.1, `cargo test -p sai_driver --lib --locked --offline primitive_body_type_results_include_exact_direct_function_calls` passed (1 test; all ten integer types at root and nested positions, Byte literals, `~-128`/`~-129` signed `I8` boundary, full signed range span, mismatch/range taint, and sibling recovery). `cargo test -p sai_cli --test check_empty_source --locked --offline unary_bitwise_not_literal_arguments_to_direct_calls_remain_behind_the_stage_gate` passed (1 test). `cargo fmt --all -- --check` and `git diff --check` passed. Broader workspace tests were not run.
 - **Hostile review:** Independent read-only review found no actionable correctness or scope findings. It confirmed the driver/body-checker gates align at the specified root and one-level nesting, integer inference/range checks reuse the existing checker, Byte mismatch retains its operand fact while taint suppresses unary/call/alias facts, sibling recovery and rejected shapes are covered, and Stage 0 remains gated. No implementation fixes were needed.
 - **Boundary coverage re-review (2026-10-27):** An independent hostile read-only review found no actionable coverage gaps. It verified `~-128` success facts, `~-129` taint and full signed diagnostic span, valid `~-128` sibling recovery, the CLI Stage 0 fixture, and matching verification documentation.
-
 
 ### IR-990 (2026-10-27): flat-local unary negation of resolved paths
 
@@ -10283,7 +10276,6 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 
 - 类型化 Str 循环的 `break match` 贡献以及标量 `match` 初始化器（`let n = match s { "a" => 1, _ => 2 }` 绑定 `I64`）。`str_expr_family` 新增无期望的 `Match` 分支：审视 scrutinee（须为 `Str` 字面量或 `Str` 绑定），按 `check_function_str_match` 镜像逐 arm 检查 — 仅 `Lit::Str` 字面量、`Or` 全 `Str` 元素、`Wild`/无 guard 绑定 catch-all；guard 仅 `Lit::Bool`；catch-all 后的 arm 报告 UNREACHABLE_PATTERN，缺 catch-all 报告 NON_EXHAUSTIVE_MATCH；非 `Str` 字面量模式报告 `expected `Str`, found <lit>`；arm 体经 `str_expr_family(expected=None)` 分类，join 跳过 `!`，分歧报告 TypeMismatch，diverging 返回 `!`。带标注的 `match` 初始化器仍 gate（期望为非 `Str` pin），`Str` pin 走语句级 join。driver 782 / CLI 392。
 
-
 ### IR-1105 (2026-11-23): scalar-annotated `loop`/`match` initializers in `-> Str` bodies
 
 - **Decision:** `let n: I8 = loop { .. }` and `let m: I8 = match s { .. }` no longer gate — `str_loop_family`/`str_match_family` take `expected: Option<PrimTy>`; the annotation seeds the contribution/arm join (a differing family reports `expected <pin>, found <family>` at the contribution, a `()` contribution reports InvalidBreakValue), default-`I64` literal contributions fold into the pin with the annotation's range check (`let n: I8 = loop { break 200 }` → LiteralOutOfRange), and match arm bodies evaluate under `expected` so `let m: I8 = match s { "x" => 1, _ => 2 }` binds `I8`. The local-block initializer dispatch gains `ExprKind::Match`, so the unannotated `let m = match s { .. => int }` also binds `I64`. Also in this round: statement-level `let` initializers admit `if`/`loop`/`block`/`match` shapes through `str_expr_family` (loop-body `let n = match` no longer gates), and the break-contribution scan seeds `Str` for match-arm bindings when the scrutinee is `Str` (`return match s { other => { break other } }` classifies).
@@ -10627,7 +10619,6 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Review fix (round 1):** the root-source check used `source_inputs.first()` — files sorted ahead of `lib.sai` (e.g. `accounts.sai`) dropped the whole package from coverage. The check now requires `lib.sai` to exist anywhere in `source_inputs`, and per-file validation switched to `check_source_is_mixed_public_items_fragment` (the same item checks without the package-level impl requirement) so fn-only, type-only, and const-only files — including `lib.sai` — are admitted when the package has ≥1 impl.
 - **Remaining scope:** `use`/import resolution (module tree `imports`), non-mixed file kinds across files, `for` loops (deferred — iterator calls outside the walk), sources with only `type` decls (deliberate bound — no owners to check).
 
-
 ### IR-1142 (2026-11-25): `use` item imports in checkable sources
 - **Decision:** `use pkg/module.{item}` and `.{item as alias}` declarations no longer gate a source file. The `UseDecl` children rejection is removed from every source-shape predicate (`check_source_is_unattributed_public_const_set`, `check_source_is_single_unattributed_public_function`, `check_source_is_mixed_public_items`, `check_source_is_mixed_public_items_fragment`, `check_source_is_single_unattributed_public_inherent_method`), `Item::Use` is admitted in each item-kind loop (or filtered out of the single type+impl pair), and the `module.imports.is_empty()` condition is removed from all four coverage gates. The driver's `inherent_method_primitive_field_types` / `str_inherent_method_field_types` drop their own `use` rejections and admit `Item::Use` in their item scans — a `use` in the same file as an `impl` no longer blanks every method's field-type table.
 - **Reason:** the named "`use`/import resolution" item — Phase 1 already resolves `ImportBinding`s into `module.imports`/`module.scope`, and `resolve_owner_module_paths` + `direct_primitive_call_sites` map imported names to callee `DefId`s, so the only missing piece was the syntactic admission gates plus one real bug: any `use` in a file blanked that file's impl member checks wholesale.
@@ -10904,7 +10895,6 @@ Post-merge review amendment (IR-1004): `check_block` defaulted *all* unresolved 
 - **Verification:** CLI fixtures cover tuple/array/nested parameter elements and the mismatch diagnostic. Driver 795 / CLI 555.
 - **Remaining scope:** local bindings and projections in composite positions, operators over parameter references, tuple/array types in parameters and locals, borrows/nominal types in function bodies, generalized aggregate compile-time values, literal-value-aware const-pattern semantics, imported `type` names in signatures, cross-package nominal constructors, constructor visibility/lints, and `for` loops (deferred — iterator calls outside the walk).
 
-
 ## IR-1183: Unit positions discard literal if-branch tails
 
 **Decision.** `if` branch tails checked against `()` in composite literal
@@ -11123,3 +11113,18 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Probes accept `(N, 1)` against `(I64, I64)`, `[N, 1]` against `Array<I32, 2>`, and `(S, 1)` with `S: Str`; `N: I64` against `(I32, I32)` diagnoses TYPE_MISMATCH. CLI suite extended.
 
 **Remaining scope.** Array-position unification in discards; kernel unit-return integration for operators and local bindings.
+||||||| 9ac8f5dc
+**Remaining scope.** Pair-parameter conditions; array-position const/parameter unification; parameter operators in discard positions; local bindings.
+**Remaining scope.** array-position const/parameter unification; parameter operators in discard positions; local bindings.
+
+## IR-1193: Pair-parameter conditions in unit discards
+
+**Decision.** Two-parameter `if` conditions in unit positions are self-typed when both operands are parameter paths of compatible types: logical operators need two `Bool` parameters, comparisons need two parameters of the same primitive type, and negations unwrap to the same forms. Mixed-type comparisons gate rather than passing silently, consistent with the primitive-return pair arm.
+
+**Reason.** The operands are concrete-typed parameter paths, so compatibility is fully determined in the direct fragment — no inference is involved. The same type compatibility rule already governs the primitive-return pair arm; applying it in discard positions only required the binding-use check the shared helper already provides.
+
+**Failure boundary.** Mixed-type pair conditions gate (matching the primitive-return arm); pair conditions in bodies with three or more parameters gate; nested logical/comparison combinations (`x < y and y < z`) gate for the mixed-condition slice.
+
+**Verification.** Probes accept `x and y`, `not (x or y)`, and `x < y` in two-parameter unit bodies; mixed-type and three-parameter forms gate. CLI suite extended.
+
+**Remaining scope.** Mixed-type pair diagnostics; array-position const/parameter unification; parameter operators in discard positions; local bindings.
