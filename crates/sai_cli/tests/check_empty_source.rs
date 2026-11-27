@@ -26720,3 +26720,83 @@ fn cross_family_compound_assignments_are_diagnosed() {
         }
     }
 }
+
+#[test]
+fn non_integer_shift_counts_are_diagnosed() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            "pub fn f(x: I32) -> I32 {\n    x << true\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    x << 2.5\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f() -> I32 {\n    1 << true\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x: I32 = 1\n",
+                "    x <<= true\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x <<= true\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x >>= 2.5\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        ("pub fn f(x: I32) -> I32 {\n    x << 2\n}\n", &[]),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x <<= 2\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "non-integer shift counts should be diagnosed, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
