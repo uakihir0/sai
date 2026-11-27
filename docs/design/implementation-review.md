@@ -11503,3 +11503,29 @@ literal arm, mirroring the condition-position rule of IR-1206:
 primitive literal families report `LiteralTypeMismatch` against
 `Bool`, `Str`/`Slice<Byte>` literals the scalar form. `not` operands
 inherit the rule through the shared operand recursion.
+
+## IR-1211: Statement-only unit bodies check in the primitive kernel
+
+**Slice.** A unit-returning body whose final item is a statement — no
+tail expression — evaluates to `()` (spec 6.25.2), so it is valid
+wherever `()` is returned:
+
+```sai
+pub fn f(x: I32) {
+    let y = x + 1
+}
+```
+
+These bodies now check in the primitive kernel: statements are typed
+with full inference, so `let y = x + 1.5` reports `TYPE_MISMATCH`
+while valid bindings are accepted. Bodies ending in `let` bindings of
+any literal kind (`b'a'`, `'a'`, `true`, `1.5`) check the same way.
+
+**Implementation.** The kernel's `check_block_unit` already accepted a
+missing tail; the gate was driver-side. The tail mirror flags in
+`check_function_body_primitive_local_block` now read an optional tail
+(`tail_kind`), and the tail-mirror block is skipped wholesale when no
+tail is present. Primitive-returning bodies without a tail stay gated
+— their `()`-versus-primitive mismatch diagnostic is a separate slice.
+`primitive_body_errors_to_diagnostics` takes the tail as an `Option`
+for its span fallback.

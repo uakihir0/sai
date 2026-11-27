@@ -13688,9 +13688,15 @@ fn check_function_body_primitive_local_block(
     if block.safety != sai_hir::Safety::Safe {
         return Ok(None);
     }
-    let Some(tail) = block.tail else {
+    // A statement-only unit body (no tail expression) evaluates to `()`
+    // (spec 6.25.2), so a unit-returning body admits it — the kernel
+    // checks the statements and the implicit unit result. A missing tail
+    // in a primitive-returning body stays gated.
+    if block.tail.is_none() && return_type.is_some() {
         return Ok(None);
-    };
+    }
+    let tail = block.tail;
+    let tail_kind = tail.map(|tail| tail.kind);
     // `s.len()`/`s.is_empty()` calls on `Str` receivers check as
     // zero-parameter primitive calls: their signatures ride the same
     // map every admission mirror reads, so augment it before any
@@ -13722,38 +13728,43 @@ fn check_function_body_primitive_local_block(
     } else {
         Some(&augmented_call_signatures)
     };
-    let is_supported_field_tail = matches!(tail.kind, ExprKind::Field { .. })
-        && (self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
-            || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
-    let is_supported_call_tail = matches!(tail.kind, ExprKind::Call { base: None, .. })
-        && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
-    let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
-    let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(_));
+    let is_supported_field_tail = tail.is_some_and(|tail| {
+        matches!(tail.kind, ExprKind::Field { .. })
+            && (self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
+                || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)))
+    });
+    let is_supported_call_tail = tail.is_some_and(|tail| {
+        matches!(tail.kind, ExprKind::Call { base: None, .. })
+            && direct_call_signatures
+                .is_some_and(|signatures| signatures.contains_key(&tail.hir_id))
+    });
+    let is_supported_binary_tail = matches!(tail_kind, Some(ExprKind::Binary(..)));
+    let is_supported_literal_tail = matches!(tail_kind, Some(ExprKind::Lit(_)));
     // In unit mode the unit-literal tail trivially discards (spec 6.11.1);
     // the kernel's initializer synthesis has no composite representation
     // for it, so admission skips the shape whitelist below.
     let is_supported_unit_tail = return_type.is_none()
-        && matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty());
+        && matches!(tail_kind, Some(ExprKind::Tuple(elements)) if elements.is_empty());
     // Unit-mode `if` tails check branch-wise in the kernel, so an omitted
     // `else` — `{}` by spec 6.14.1 — is admissible there too.
-    let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. })
-        || return_type.is_none() && matches!(tail.kind, ExprKind::If { .. });
+    let is_supported_if_tail = matches!(tail_kind, Some(ExprKind::If { els: Some(_), .. }))
+        || return_type.is_none() && matches!(tail_kind, Some(ExprKind::If { .. }));
     let is_supported_match_tail = matches!(
-        tail.kind,
-        ExprKind::Match {
+        tail_kind,
+        Some(ExprKind::Match {
             source: MatchSource::Normal,
             ..
-        }
+        })
     );
-    let is_supported_return_tail = matches!(tail.kind, ExprKind::Return(..));
+    let is_supported_return_tail = matches!(tail_kind, Some(ExprKind::Return(..)));
     let is_supported_loop_tail = matches!(
-        tail.kind,
-        ExprKind::Loop {
+        tail_kind,
+        Some(ExprKind::Loop {
             source: LoopSource::Loop,
             ..
-        }
+        })
     ) || return_type.is_none()
-        && matches!(tail.kind, ExprKind::Loop { .. });
+        && matches!(tail_kind, Some(ExprKind::Loop { .. }));
 
     // A nested `{ e }` block tail admits the same tail shapes as a branch
     // tail — the inner block must hold only a tail (stmt-bearing inner
@@ -13772,8 +13783,8 @@ fn check_function_body_primitive_local_block(
     // `Str` parameters/leaves are admitted everywhere a preceding local
     // is — the kernel decides which operand positions reject `Str`.
     block_bindings.extend(str_admissions.locals.iter().copied());
-    let is_supported_unary_tail = match tail.kind {
-        ExprKind::Unary(operator, operand)
+    let is_supported_unary_tail = match tail_kind {
+        Some(ExprKind::Unary(operator, operand))
             if matches!(operator, UnOp::Neg | UnOp::BitNot | UnOp::Not) =>
         {
             unary_tail_operand_shape_is_supported(
@@ -13792,8 +13803,8 @@ fn check_function_body_primitive_local_block(
         }
         _ => false,
     };
-    let is_supported_block_tail = match tail.kind {
-        ExprKind::Block(inner) => primitive_inner_block_shape_is_supported(
+    let is_supported_block_tail = match tail_kind {
+        Some(ExprKind::Block(inner)) => primitive_inner_block_shape_is_supported(
             inner,
             &block_bindings,
             locals,
@@ -13807,15 +13818,15 @@ fn check_function_body_primitive_local_block(
         ),
         _ => false,
     };
-    let tail_binding = match tail.kind {
-        ExprKind::Path(tail_path) => {
+    let tail_binding = match tail_kind {
+        Some(ExprKind::Path(tail_path)) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
             else {
                 return Ok(None);
             };
             Some(tail_binding)
         }
-        ExprKind::Unary(_, operand) if is_supported_unary_tail => {
+        Some(ExprKind::Unary(_, operand)) if is_supported_unary_tail => {
             // A `self.f` operand desugars to `let t = self.f` like a field
             // tail, and a literal or logical operand carries no binding —
             // none defer through a binding.
@@ -13833,16 +13844,18 @@ fn check_function_body_primitive_local_block(
                 Some(operand_binding)
             }
         }
-        ExprKind::Binary(..) if is_supported_binary_tail => None,
-        ExprKind::Lit(_) if is_supported_literal_tail => None,
-        ExprKind::Field { .. } if is_supported_field_tail => None,
-        ExprKind::Call { .. } if is_supported_call_tail => None,
-        ExprKind::If { .. } if is_supported_if_tail => None,
-        ExprKind::Match { .. } if is_supported_match_tail => None,
-        ExprKind::Return(..) if is_supported_return_tail => None,
-        ExprKind::Loop { .. } if is_supported_loop_tail => None,
-        ExprKind::Block(_) if is_supported_block_tail => None,
-        ExprKind::Tuple(_) if is_supported_unit_tail => None,
+        Some(ExprKind::Binary(..)) if is_supported_binary_tail => None,
+        Some(ExprKind::Lit(_)) if is_supported_literal_tail => None,
+        Some(ExprKind::Field { .. }) if is_supported_field_tail => None,
+        Some(ExprKind::Call { .. }) if is_supported_call_tail => None,
+        Some(ExprKind::If { .. }) if is_supported_if_tail => None,
+        Some(ExprKind::Match { .. }) if is_supported_match_tail => None,
+        Some(ExprKind::Return(..)) if is_supported_return_tail => None,
+        Some(ExprKind::Loop { .. }) if is_supported_loop_tail => None,
+        Some(ExprKind::Block(_)) if is_supported_block_tail => None,
+        Some(ExprKind::Tuple(_)) if is_supported_unit_tail => None,
+        // A statement-only unit body carries no tail binding.
+        None => None,
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
@@ -13952,110 +13965,20 @@ fn check_function_body_primitive_local_block(
     if tail_binding.is_some_and(|binding| !preceding_bindings.contains(&binding)) {
         return Ok(None);
     }
-    // Unit-mode `if` tails skip the shape mirror entirely: it requires
-    // an `else` at every chain level and non-empty branches because
-    // primitive positions need values, while the kernel's branch-wise
-    // unit checking validates every branch shape itself, admits omitted
-    // `else`s (spec 6.14.1), and accepts empty branches as unit blocks.
-    // Shapes the kernel cannot check still fall back to the validators.
-    let skip_if_tail_mirror = return_type.is_none() && matches!(tail.kind, ExprKind::If { .. });
-    if is_supported_if_tail
-        && !skip_if_tail_mirror
-        && !primitive_if_tail_shape_is_supported(
-            tail,
-            &preceding_bindings,
-            locals,
-            inputs,
-            symbols,
-            type_paths,
-            self_field_projections,
-            unknown_self_fields,
-            direct_call_signatures,
-            &mut primitive_types,
-        )
-    {
-        return Ok(None);
-    }
-    if let (
-        true,
-        ExprKind::Match {
-            scrutinee,
-            arms,
-            source,
-        },
-    ) = (is_supported_match_tail, tail.kind)
-    {
-        if !primitive_match_tail_shape_is_supported(
-            scrutinee,
-            arms,
-            source,
-            &preceding_bindings,
-            locals,
-            inputs,
-            symbols,
-            type_paths,
-            self_field_projections,
-            unknown_self_fields,
-            direct_call_signatures,
-            &mut primitive_types,
-        ) {
-            return Ok(None);
-        }
-    }
-    if let (
-        true,
-        ExprKind::Call {
-            args, base: None, ..
-        },
-    ) = (is_supported_call_tail, tail.kind)
-    {
-        let Some(signature) =
-            direct_call_signatures.and_then(|signatures| signatures.get(&tail.hir_id))
-        else {
-            return Ok(None);
-        };
-        if !args
-            .iter()
-            .take(signature.parameters.len())
-            .all(|argument| {
-                is_supported_direct_call_argument_shape(
-                    argument.expr,
-                    &preceding_bindings,
-                    locals,
-                    inputs,
-                    symbols,
-                    type_paths,
-                    self_field_projections,
-                    unknown_self_fields,
-                    direct_call_signatures,
-                    &mut primitive_types,
-                )
-            })
-        {
-            return Ok(None);
-        }
-    }
-
-    if let (true, ExprKind::Loop { body, .. }) = (is_supported_loop_tail, tail.kind) {
-        if !primitive_loop_body_shape_is_supported(
-            body,
-            &preceding_bindings,
-            locals,
-            inputs,
-            symbols,
-            type_paths,
-            self_field_projections,
-            unknown_self_fields,
-            direct_call_signatures,
-            &mut primitive_types,
-        ) {
-            return Ok(None);
-        }
-    }
-    if let (true, ExprKind::Return(value)) = (is_supported_return_tail, tail.kind) {
-        if !value.is_none_or(|value| {
-            primitive_value_expression_shape_is_supported(
-                value,
+    // Tailless unit bodies skip every tail mirror — the kernel checks
+    // the statement-only block as-is.
+    if let Some(tail) = tail {
+        // Unit-mode `if` tails skip the shape mirror entirely: it requires
+        // an `else` at every chain level and non-empty branches because
+        // primitive positions need values, while the kernel's branch-wise
+        // unit checking validates every branch shape itself, admits omitted
+        // `else`s (spec 6.14.1), and accepts empty branches as unit blocks.
+        // Shapes the kernel cannot check still fall back to the validators.
+        let skip_if_tail_mirror = return_type.is_none() && matches!(tail.kind, ExprKind::If { .. });
+        if is_supported_if_tail
+            && !skip_if_tail_mirror
+            && !primitive_if_tail_shape_is_supported(
+                tail,
                 &preceding_bindings,
                 locals,
                 inputs,
@@ -14066,8 +13989,102 @@ fn check_function_body_primitive_local_block(
                 direct_call_signatures,
                 &mut primitive_types,
             )
-        }) {
+        {
             return Ok(None);
+        }
+        if let (
+            true,
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            },
+        ) = (is_supported_match_tail, tail.kind)
+        {
+            if !primitive_match_tail_shape_is_supported(
+                scrutinee,
+                arms,
+                source,
+                &preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                &mut primitive_types,
+            ) {
+                return Ok(None);
+            }
+        }
+        if let (
+            true,
+            ExprKind::Call {
+                args, base: None, ..
+            },
+        ) = (is_supported_call_tail, tail.kind)
+        {
+            let Some(signature) =
+                direct_call_signatures.and_then(|signatures| signatures.get(&tail.hir_id))
+            else {
+                return Ok(None);
+            };
+            if !args
+                .iter()
+                .take(signature.parameters.len())
+                .all(|argument| {
+                    is_supported_direct_call_argument_shape(
+                        argument.expr,
+                        &preceding_bindings,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        self_field_projections,
+                        unknown_self_fields,
+                        direct_call_signatures,
+                        &mut primitive_types,
+                    )
+                })
+            {
+                return Ok(None);
+            }
+        }
+
+        if let (true, ExprKind::Loop { body, .. }) = (is_supported_loop_tail, tail.kind) {
+            if !primitive_loop_body_shape_is_supported(
+                body,
+                &preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                &mut primitive_types,
+            ) {
+                return Ok(None);
+            }
+        }
+        if let (true, ExprKind::Return(value)) = (is_supported_return_tail, tail.kind) {
+            if !value.is_none_or(|value| {
+                primitive_value_expression_shape_is_supported(
+                    value,
+                    &preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    &mut primitive_types,
+                )
+            }) {
+                return Ok(None);
+            }
         }
     }
 
@@ -18332,7 +18349,7 @@ fn is_supported_direct_call_leaf_argument_shape(
 fn primitive_body_errors_to_diagnostics(
     owner: &HirOwner<'_>,
     block: &sai_hir::expressions::Block<'_>,
-    tail: &HirExpr<'_>,
+    tail: Option<&HirExpr<'_>>,
     errors: Vec<sai_ty::typeck::body::PrimitiveBodyError>,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -18376,7 +18393,7 @@ fn primitive_body_errors_to_diagnostics(
                         .iter()
                         .find_map(|stmt| (stmt.hir_id == error.node).then_some(stmt.span))
                 })
-                .or_else(|| primitive_body_error_span(tail, error.node)),
+                .or_else(|| tail.and_then(|tail| primitive_body_error_span(tail, error.node))),
         };
         let Some(span) = span else {
             return Ok(None);
