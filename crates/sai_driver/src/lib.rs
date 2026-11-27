@@ -13814,6 +13814,30 @@ fn check_function_body_primitive_local_block(
         ),
         _ => false,
     };
+    // Projection/index tails read composite locals built in the body —
+    // the base must chain to a block binding, and the index expression
+    // follows value admission like any other operand.
+    let is_supported_projection_tail = tail.is_some_and(|tail| match tail.kind {
+        ExprKind::TupleField { base, .. } => {
+            primitive_projection_base_shape_is_supported(base, &block_bindings, locals, inputs)
+        }
+        ExprKind::Index(base, index) => {
+            primitive_projection_base_shape_is_supported(base, &block_bindings, locals, inputs)
+                && primitive_value_expression_shape_is_supported(
+                    index,
+                    &block_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    &mut primitive_types,
+                )
+        }
+        _ => false,
+    });
     let tail_binding = match tail_kind {
         Some(ExprKind::Path(tail_path)) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -13849,6 +13873,9 @@ fn check_function_body_primitive_local_block(
         Some(ExprKind::Return(..)) if is_supported_return_tail => None,
         Some(ExprKind::Loop { .. }) if is_supported_loop_tail => None,
         Some(ExprKind::Block(_)) if is_supported_block_tail => None,
+        Some(ExprKind::TupleField { .. } | ExprKind::Index(..)) if is_supported_projection_tail => {
+            None
+        }
         Some(ExprKind::Tuple(_)) if is_supported_unit_tail => None,
         // A statement-only unit body carries no tail binding.
         None => None,
@@ -13870,6 +13897,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_loop_tail
         && !is_supported_block_tail
         && !is_supported_unit_tail
+        && !is_supported_projection_tail
     {
         return Ok(None);
     }
@@ -15001,6 +15029,27 @@ fn primitive_nested_operand_shape_is_supported(
         ExprKind::Lit(_) => is_direct_function_scalar_literal(operand),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        // Projections and indexing in operand positions read composite
+        // locals — the kernel resolves the element type through the same
+        // funnel it uses for paths.
+        ExprKind::TupleField { base, .. } => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+        }
+        ExprKind::Index(base, index) => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+                && primitive_nested_operand_shape_is_supported(
+                    index,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+        }
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))

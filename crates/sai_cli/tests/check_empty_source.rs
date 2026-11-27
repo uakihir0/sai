@@ -27147,3 +27147,71 @@ fn tuple_and_array_literal_construction_in_let_bindings() {
         }
     }
 }
+
+#[test]
+fn tuple_projections_and_array_indexing_read_composite_locals() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Tuple fields and built-in indexing read composite locals in
+        // tail, initializer and operand positions (spec 6.6.2, 6.7.1).
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, 1)\n    t.0\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    a[0]\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, (1, 2))\n    t.1.0\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    a[0] + a[1]\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> Bool {\n    let t = (x, 1)\n    t.0 > t.1\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    let i = 0\n    a[i]\n}\n",
+            &[],
+        ),
+        // The projected element type unifies with the expectation.
+        (
+            "pub fn f(x: I32) -> Bool {\n    let t = (x, true)\n    t.0\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        // Out-of-range tuple indices diagnose; constant array indices
+        // are a runtime bounds check, never a compile error.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, 1)\n    t.5\n}\n",
+            &[("TUPLE_INDEX_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    a[7]\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "projections and indexing should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}

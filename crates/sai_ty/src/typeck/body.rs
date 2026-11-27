@@ -4769,6 +4769,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     )?;
                     LocalType::Concrete(expected)
                 }
+                // Tuple field projections and built-in indexing read
+                // composite locals — the scalar result unifies with the
+                // expectation like a path tail.
+                ExprKind::TupleField { base, index } => {
+                    self.check_tuple_field_projection(base, index, expression.hir_id)?
+                }
+                ExprKind::Index(base, index) => self.check_builtin_index(base, index)?,
                 _ => self.check_local_path(expression)?,
             }
         };
