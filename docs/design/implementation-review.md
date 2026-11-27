@@ -11075,3 +11075,15 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** CLI suite green with the new acceptance cases; the prior gating expectations for `str_param_to_unit`/`str_param_without_return` moved to the success suite.
 
 **Remaining scope.** Const item paths in discards; array-position parameter unification; local bindings.
+
+## IR-1190: Unit discards in multi-parameter bodies and literal if chains
+
+**Decision.** Hoist the unit-discard tail validation ahead of the parameter-count split: parameterized unit-returning bodies of any arity validate non-`if` tails through the shared discard validator, and `if` tails with literal conditions validate through the literal chain collector. Every parameter type must resolve in the direct fragment and no parameter may be `self`, so ill-formed signatures gate rather than passing silently. Parameter references nested in tuples inside arrays propagate the array position and gate for the inference slice.
+
+**Reason.** Spec 6.11.1/6.25.2 discard the tail value regardless of arity. Review of IR-1189 surfaced that the single-parameter arm left two-parameter bodies gated, accepted ill-formed parameter types (`I32<Bool>`, unresolved names), accepted `self` in free functions, and lost array-ness inside nested tuples — all corrected here.
+
+**Failure boundary.** Parameter-based `if` conditions in multi-parameter bodies still gate (the comparison machinery is single-parameter); array positions containing parameter references gate; ill-formed or unsupported parameter types gate.
+
+**Verification.** CLI suite green including `pub fn f(x: I32, y: I32) { 1 }` and literal-condition chains in two-parameter bodies; probes confirm `x: I32<Bool>`, `x: Missing`, `self` parameters, and `[(x, 1), (true, 2)]` gate.
+
+**Remaining scope.** Multi-parameter `if` conditions; const item paths in discards; array-position parameter unification; local bindings.

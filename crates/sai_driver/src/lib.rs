@@ -8485,7 +8485,6 @@ fn check_function_body_shape_dispatch(
         && sig.params.len() == body.params.len()
         && block.stmts.is_empty()
         && let Some(tail) = block.tail
-        && !matches!(tail.kind, ExprKind::If { .. })
     {
         let tail_unit_return = match sig.ret {
             Some(return_ty) => matches!(
@@ -8501,16 +8500,30 @@ fn check_function_body_shape_dispatch(
                 && resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
                     .is_some()
         });
-        if tail_unit_return
-            && parameters_resolve
-            && let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
+        if tail_unit_return && parameters_resolve {
+            // `if` tails validate their branch tails through the literal
+            // chain collector; parameter-based conditions in multi-parameter
+            // bodies stay with the single-parameter arm below or gate.
+            if matches!(tail.kind, ExprKind::If { .. }) {
+                let mut tails = Vec::new();
+                if collect_literal_unit_if_chain_tails(tail, &mut tails)
+                    && let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
+                        owner, &tails, sig, body, locals, type_paths, symbols, inputs, snapshot,
+                        target_cfg,
+                    )?
+                {
+                    return Ok(FunctionBodyTypeCheck::Supported {
+                        diagnostics: tail_diagnostics,
+                    });
+                }
+            } else if let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
                 owner, tail, false, false, sig, body, locals, symbols, inputs, snapshot,
                 type_paths, target_cfg,
-            )?
-        {
-            return Ok(FunctionBodyTypeCheck::Supported {
-                diagnostics: tail_diagnostics,
-            });
+            )? {
+                return Ok(FunctionBodyTypeCheck::Supported {
+                    diagnostics: tail_diagnostics,
+                });
+            }
         }
     }
 
@@ -9354,21 +9367,35 @@ fn discard_operator_expression_type(expr: &HirExpr<'_>) -> Option<ConstLiteralTy
     let mut has_float = false;
     let mut has_byte = false;
     let mut has_other_numeric = false;
-    let mut stack = vec![expr];
-    while let Some(current) = stack.pop() {
+    // Shift amounts do not participate in the result type (spec 6.8), so
+    // right operands of `<<`/`>>` are scanned for literal-ness but do not
+    // count toward the type determination.
+    let mut stack = vec![(expr, true)];
+    while let Some((current, counted)) = stack.pop() {
         match current.kind {
             ExprKind::Lit(Lit::Float { .. }) => {
-                has_float = true;
-                has_other_numeric = true;
+                if counted {
+                    has_float = true;
+                    has_other_numeric = true;
+                }
             }
-            ExprKind::Lit(Lit::Byte(_)) => has_byte = true,
-            ExprKind::Lit(Lit::Int { .. }) => has_other_numeric = true,
+            ExprKind::Lit(Lit::Byte(_)) => {
+                if counted {
+                    has_byte = true;
+                }
+            }
+            ExprKind::Lit(Lit::Int { .. }) => {
+                if counted {
+                    has_other_numeric = true;
+                }
+            }
             ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Str(_)) => {}
-            ExprKind::Binary(_, left, right) => {
-                stack.push(left);
-                stack.push(right);
+            ExprKind::Binary(operator, left, right) => {
+                let shift = matches!(operator, BinOp::Shl | BinOp::Shr);
+                stack.push((left, counted));
+                stack.push((right, counted && !shift));
             }
-            ExprKind::Unary(_, operand) => stack.push(operand),
+            ExprKind::Unary(_, operand) => stack.push((operand, counted)),
             _ => return None,
         }
     }
