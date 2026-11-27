@@ -657,19 +657,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
-    /// A body block checked against `()`: every value tail discards its
-    /// result (spec 6.11.1/6.25.2), so it is synthesized without an
-    /// expectation and any type is accepted. Statements stay gated for
-    /// their own slice; `if`/`match` tails fall to the driver-level
-    /// validators until branch-wise unit checking lands here.
+    /// A body block checked against `()`: statement-position values and a
+    /// value tail discard their results (spec 6.11.1/6.25.2), so the tail
+    /// is synthesized without an expectation and any type is accepted.
+    /// `if`/`match` tails fall to the driver-level validators until
+    /// branch-wise unit checking lands here.
     fn check_block_unit(&mut self, block: &Block<'hir>) -> Result<(), ()> {
-        if block.safety != Safety::Safe || !block.stmts.is_empty() {
+        if block.safety != Safety::Safe {
             return Err(());
         }
+        let literal_floor = self.literal_variables.len();
+        for stmt in block.stmts {
+            self.check_stmt(stmt)?;
+        }
         let Some(tail) = block.tail else {
+            self.default_unresolved_literals(literal_floor);
             return Ok(());
         };
-        let literal_floor = self.literal_variables.len();
+        // The unit literal trivially checks against `()`; the initializer
+        // synthesis has no composite tuple representation for it.
+        if matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
+            self.default_unresolved_literals(literal_floor);
+            return Ok(());
+        }
         let check = self.check_initializer_value(tail, None)?;
         self.record_expression_type(tail.hir_id, check.local_type);
         self.default_unresolved_literals(literal_floor);
@@ -3324,10 +3334,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Block(_) => return Err(()),
             _ => {}
         }
-        let Some(return_type) = self.input.return_type else {
-            return Err(());
+        let local_type = match self.input.return_type {
+            Some(return_type) => self.check_expr_value(expression, return_type)?,
+            // Expression-statements in a unit body discard their value
+            // (spec 6.11.1): synthesize without an expectation like the
+            // tail — any type is accepted.
+            None => self
+                .check_initializer_value(expression, None)
+                .map(|check| check.local_type)?,
         };
-        let local_type = self.check_expr_value(expression, return_type)?;
         self.record_expression_type(expression.hir_id, local_type);
         Ok(())
     }
