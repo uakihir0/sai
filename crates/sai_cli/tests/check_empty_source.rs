@@ -26964,3 +26964,47 @@ fn statement_only_unit_bodies_are_checked() {
         }
     }
 }
+
+#[test]
+fn primitive_bodies_missing_value_tails_are_diagnosed() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            "pub fn f() -> I32 {\n    let y = 1\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        ("pub fn f() -> I32 {\n}\n", &[("TYPE_MISMATCH", 1)]),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let y = x + 1.5\n}\n",
+            &[("TYPE_MISMATCH", 2)],
+        ),
+        ("pub fn f() -> I32 {\n    1\n}\n", &[]),
+        ("pub fn f() {\n}\n", &[]),
+        ("pub fn f(x: I32) {\n    let y = x + 1\n}\n", &[]),
+        ("pub fn f() -> I32 {\n    return 1\n    let y = 2\n}\n", &[]),
+        (
+            "pub fn f(x: I32) -> I32 {\n    while x < 10 { x + 1 }\n    let y = 1\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "primitive bodies missing value tails should be diagnosed, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}

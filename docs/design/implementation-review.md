@@ -11529,3 +11529,26 @@ tail is present. Primitive-returning bodies without a tail stay gated
 — their `()`-versus-primitive mismatch diagnostic is a separate slice.
 `primitive_body_errors_to_diagnostics` takes the tail as an `Option`
 for its span fallback.
+
+## IR-1212: Primitive bodies missing value tails diagnose as unit mismatches
+
+**Slice.** A statement-only block evaluates to `()` (spec 6.25.2), so a
+primitive-returning body without a value tail is always a type error:
+
+```sai
+pub fn f() -> I32 {
+    let y = 1   // TYPE_MISMATCH: expected `I32`, found `()`
+}
+```
+
+The statements still check with full inference, so their own errors
+surface alongside the missing-tail mismatch (`let y = x + 1.5` reports
+both). Empty primitive bodies diagnose the same way; empty unit bodies
+stay valid.
+
+**Implementation.** `check_block_expected` gained the tailless arm:
+statements check first, then `MissingBlockTail` reports the `()`-vs-
+primitive mismatch. The driver dropped the tailless-primitive gate,
+exempted tailless bodies from the tail-shape bail (the kernel decides),
+and resolves the error span from the last statement or the block
+itself.
