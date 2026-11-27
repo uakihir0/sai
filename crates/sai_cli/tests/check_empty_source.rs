@@ -11703,6 +11703,12 @@ fn public_unit_return_discards_tail_values() {
         "pub fn str_param_without_return(value: Str) { value }\n",
         "pub fn f(x: I32, y: I32) { 1 }\n",
         "pub fn f(x: Bool, y: Bool) { if true { 1 } else { 2 } }\n",
+        "const N: I64 = 1\npub fn f() { N }\n",
+        "const N: I64 = 1\npub fn f(x: I32) { N }\n",
+        "const N: I64 = 1\npub fn f() { (N, true) }\n",
+        "const N: I64 = 1\npub fn f() { if true { N } else { 2 } }\n",
+        "const S: Str = \"a\"\npub fn f() { S }\n",
+        "const C: I64 = 1\nconst D: I64 = C\npub fn f() { D }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }

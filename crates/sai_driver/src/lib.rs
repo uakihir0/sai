@@ -8294,6 +8294,7 @@ fn check_unit_discard_if_branch_tails(
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -8303,7 +8304,18 @@ fn check_unit_discard_if_branch_tails(
     let mut unsupported = false;
     for tail in tails.iter().copied().flatten() {
         match check_function_discarded_unit_tail(
-            owner, tail, false, false, sig, body, locals, symbols, inputs, snapshot, type_paths,
+            owner,
+            tail,
+            false,
+            false,
+            sig,
+            body,
+            locals,
+            symbols,
+            inputs,
+            snapshot,
+            type_paths,
+            const_path_types,
             target_cfg,
         )? {
             Some((_, tail_diagnostics)) => diagnostics.extend(tail_diagnostics),
@@ -8442,7 +8454,17 @@ fn check_function_body_shape_dispatch(
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
         let Some(tuple_diagnostics) = check_function_composite_literal_element(
-            owner, *return_ty, tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            owner,
+            *return_ty,
+            tail,
+            sig,
+            body,
+            locals,
+            type_paths,
+            const_path_types,
+            symbols,
+            inputs,
+            snapshot,
             target_cfg,
         )?
         else {
@@ -8466,7 +8488,17 @@ fn check_function_body_shape_dispatch(
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
         let Some(array_diagnostics) = check_function_composite_literal_element(
-            owner, *return_ty, tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            owner,
+            *return_ty,
+            tail,
+            sig,
+            body,
+            locals,
+            type_paths,
+            const_path_types,
+            symbols,
+            inputs,
+            snapshot,
             target_cfg,
         )?
         else {
@@ -8508,7 +8540,16 @@ fn check_function_body_shape_dispatch(
                 let mut tails = Vec::new();
                 if collect_literal_unit_if_chain_tails(tail, &mut tails)
                     && let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
-                        owner, &tails, sig, body, locals, type_paths, symbols, inputs, snapshot,
+                        owner,
+                        &tails,
+                        sig,
+                        body,
+                        locals,
+                        type_paths,
+                        const_path_types,
+                        symbols,
+                        inputs,
+                        snapshot,
                         target_cfg,
                     )?
                 {
@@ -8517,8 +8558,19 @@ fn check_function_body_shape_dispatch(
                     });
                 }
             } else if let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
-                owner, tail, false, false, sig, body, locals, symbols, inputs, snapshot,
-                type_paths, target_cfg,
+                owner,
+                tail,
+                false,
+                false,
+                sig,
+                body,
+                locals,
+                symbols,
+                inputs,
+                snapshot,
+                type_paths,
+                const_path_types,
+                target_cfg,
             )? {
                 return Ok(FunctionBodyTypeCheck::Supported {
                     diagnostics: tail_diagnostics,
@@ -8708,7 +8760,16 @@ fn check_function_body_shape_dispatch(
                         }
                     }
                     let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
-                        owner, &tails, sig, body, locals, type_paths, symbols, inputs, snapshot,
+                        owner,
+                        &tails,
+                        sig,
+                        body,
+                        locals,
+                        type_paths,
+                        const_path_types,
+                        symbols,
+                        inputs,
+                        snapshot,
                         target_cfg,
                     )?
                     else {
@@ -9012,8 +9073,17 @@ fn check_function_body_shape_dispatch(
                             return Ok(FunctionBodyTypeCheck::Unsupported);
                         }
                         let Some(diagnostics) = check_unit_discard_if_branch_tails(
-                            owner, &tails, sig, body, locals, type_paths, symbols, inputs,
-                            snapshot, target_cfg,
+                            owner,
+                            &tails,
+                            sig,
+                            body,
+                            locals,
+                            type_paths,
+                            const_path_types,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            target_cfg,
                         )?
                         else {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -9021,8 +9091,19 @@ fn check_function_body_shape_dispatch(
                         diagnostics
                     } else {
                         let Some((_, diagnostics)) = check_function_discarded_unit_tail(
-                            owner, tail, false, false, sig, body, locals, symbols, inputs,
-                            snapshot, type_paths, target_cfg,
+                            owner,
+                            tail,
+                            false,
+                            false,
+                            sig,
+                            body,
+                            locals,
+                            symbols,
+                            inputs,
+                            snapshot,
+                            type_paths,
+                            const_path_types,
+                            target_cfg,
                         )?
                         else {
                             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -9422,7 +9503,7 @@ fn check_function_discarded_unit_tail(
     owner: &HirOwner<'_>,
     tail: &HirExpr<'_>,
     in_array_element: bool,
-    in_composite: bool,
+    _in_composite: bool,
     sig: sai_hir::body::FnSig<'_>,
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
@@ -9430,6 +9511,7 @@ fn check_function_discarded_unit_tail(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     type_paths: Option<&TypeOwnerPathResolution>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
     target_cfg: &TargetCfg,
 ) -> Result<Option<(DiscardLiteralShape, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     match tail.kind {
@@ -9559,6 +9641,18 @@ fn check_function_discarded_unit_tail(
             }
             return Ok(Some((DiscardLiteralShape::Opaque, Vec::new())));
         }
+        ExprKind::Path(_) | ExprKind::Field { .. }
+            if !in_array_element
+                && const_path_types.is_some_and(|types| types.contains_key(&tail.hir_id)) =>
+        {
+            // A const reference is a self-typed value whose initializer
+            // validates at its own definition, so discarding it needs no
+            // further checks — the indexed sites carry only consts whose
+            // type resolved in the direct fragment. Array positions stay
+            // gated for the element-unification inference slice, same as
+            // parameter references.
+            return Ok(Some((DiscardLiteralShape::Opaque, Vec::new())));
+        }
         ExprKind::Tuple(elements) => {
             let mut diagnostics = Vec::new();
             let mut shapes = Vec::new();
@@ -9575,6 +9669,7 @@ fn check_function_discarded_unit_tail(
                     inputs,
                     snapshot,
                     type_paths,
+                    const_path_types,
                     target_cfg,
                 )?
                 else {
@@ -9610,8 +9705,19 @@ fn check_function_discarded_unit_tail(
             let mut conflict = false;
             for element in elements {
                 let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
-                    owner, element, true, true, sig, body, locals, symbols, inputs, snapshot,
-                    type_paths, target_cfg,
+                    owner,
+                    element,
+                    true,
+                    true,
+                    sig,
+                    body,
+                    locals,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    type_paths,
+                    const_path_types,
+                    target_cfg,
                 )?
                 else {
                     let mut literals = Vec::new();
@@ -9692,6 +9798,7 @@ fn check_function_composite_literal_element(
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -9722,7 +9829,17 @@ fn check_function_composite_literal_element(
                 return Ok(None);
             }
             return check_unit_discard_if_branch_tails(
-                owner, &tails, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
+                owner,
+                &tails,
+                sig,
+                body,
+                locals,
+                type_paths,
+                const_path_types,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
             );
         }
         let Some(else_expr) = els else {
@@ -9741,14 +9858,34 @@ fn check_function_composite_literal_element(
             return Ok(None);
         };
         let Some(mut diagnostics) = check_function_composite_literal_element(
-            owner, ty, then_tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            owner,
+            ty,
+            then_tail,
+            sig,
+            body,
+            locals,
+            type_paths,
+            const_path_types,
+            symbols,
+            inputs,
+            snapshot,
             target_cfg,
         )?
         else {
             return Ok(None);
         };
         let Some(mut else_diagnostics) = check_function_composite_literal_element(
-            owner, ty, else_tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            owner,
+            ty,
+            else_tail,
+            sig,
+            body,
+            locals,
+            type_paths,
+            const_path_types,
+            symbols,
+            inputs,
+            snapshot,
             target_cfg,
         )?
         else {
@@ -9833,6 +9970,7 @@ fn check_function_composite_literal_element(
                 body,
                 locals,
                 type_paths,
+                const_path_types,
                 symbols,
                 inputs,
                 snapshot,
@@ -9895,6 +10033,7 @@ fn check_function_composite_literal_element(
                 body,
                 locals,
                 type_paths,
+                const_path_types,
                 symbols,
                 inputs,
                 snapshot,
