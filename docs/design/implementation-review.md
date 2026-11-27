@@ -11099,21 +11099,6 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Probes accept `const N: I64 = 1` discarded directly, in tuples, in `if` branch tails, with parameters present, through chained const references, and through `use`-imported and member-access (`helper.LIMIT`) paths; `[N, 1]` gates. CLI suite extended with the single-file forms.
 
 **Remaining scope.** Array-position const/parameter unification; parameter operators in discard positions; local bindings.
-<<<<<<< HEAD
-
-## IR-1194: Const references in composite return elements
-
-**Decision.** Const paths and member-access const references in composite return element positions validate as self-typed values: the element type must match the const's declared type exactly, since concrete types do not coerce (spec 6.1). Matching accepts; mismatching diagnoses TYPE_MISMATCH at the element; consts absent from the direct-fragment index gate.
-
-**Reason.** The const-path site index already carries the declared type of every resolvable const reference in the body, so element validation only needs the equality check — no evaluation, since type correctness does not depend on the value. Unlike discard positions, array elements accept const references here because the expected type comes from the signature rather than element unification.
-
-**Failure boundary.** Tuple-typed or otherwise non-direct const types are not indexed and gate; elements whose expected type does not resolve in the direct fragment gate.
-
-**Verification.** Probes accept `(N, 1)` against `(I64, I64)`, `[N, 1]` against `Array<I32, 2>`, and `(S, 1)` with `S: Str`; `N: I64` against `(I32, I32)` diagnoses TYPE_MISMATCH. CLI suite extended.
-
-**Remaining scope.** Array-position unification in discards; kernel unit-return integration for operators and local bindings.
-||||||| 4e9b28f9
-=======
 
 ## IR-1192: Multi-parameter if conditions in unit discards
 
@@ -11126,4 +11111,15 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Probes accept `pub fn f(x: Bool, y: Bool) { if x { 1 } else { 2 } }`, negations, comparisons, `else if` chains across different parameters, and three-parameter bodies; `pub fn f(x: Str, y: I32) { if x < 10 { 1 } else { 2 } }` diagnoses TYPE_MISMATCH; `x and y` and `x < y` gate. CLI suite extended with the multi-parameter forms.
 
 **Remaining scope.** Pair-parameter conditions; array-position const/parameter unification; parameter operators in discard positions; local bindings.
->>>>>>> origin/main
+
+## IR-1194: Const references in composite return elements
+
+**Decision.** Const paths and member-access const references in composite return element positions validate as self-typed values: the element type must match the const's declared type exactly, since concrete types do not coerce (spec 6.1). Matching accepts; mismatching diagnoses TYPE_MISMATCH at the element; consts absent from the direct-fragment index gate.
+
+**Reason.** The const-path site index already carries the declared type of every resolvable const reference in the body, so element validation only needs the equality check — no evaluation, since type correctness does not depend on the value. Unlike discard positions, array elements accept const references here because the expected type comes from the signature rather than element unification.
+
+**Failure boundary.** Tuple-typed or otherwise non-direct const types are not indexed and gate; elements whose expected type does not resolve in the direct fragment gate.
+
+**Verification.** Probes accept `(N, 1)` against `(I64, I64)`, `[N, 1]` against `Array<I32, 2>`, and `(S, 1)` with `S: Str`; `N: I64` against `(I32, I32)` diagnoses TYPE_MISMATCH. CLI suite extended.
+
+**Remaining scope.** Array-position unification in discards; kernel unit-return integration for operators and local bindings.
