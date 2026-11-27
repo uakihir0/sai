@@ -13328,12 +13328,13 @@ fn check_function_body_primitive_local_block(
     if tail_binding.is_some_and(|binding| !preceding_bindings.contains(&binding)) {
         return Ok(None);
     }
-    // Unit-mode `if` tails skip the shape mirror: it requires an `else`
-    // because primitive positions need both branches, while the kernel's
-    // branch-wise unit checking validates every branch shape itself and
-    // admits an omitted `else` (spec 6.14.1).
-    let skip_if_tail_mirror =
-        return_type.is_none() && matches!(tail.kind, ExprKind::If { els: None, .. });
+    // Unit-mode `if` tails skip the shape mirror entirely: it requires
+    // an `else` at every chain level and non-empty branches because
+    // primitive positions need values, while the kernel's branch-wise
+    // unit checking validates every branch shape itself, admits omitted
+    // `else`s (spec 6.14.1), and accepts empty branches as unit blocks.
+    // Shapes the kernel cannot check still fall back to the validators.
+    let skip_if_tail_mirror = return_type.is_none() && matches!(tail.kind, ExprKind::If { .. });
     if is_supported_if_tail
         && !skip_if_tail_mirror
         && !primitive_if_tail_shape_is_supported(
