@@ -26633,3 +26633,90 @@ fn non_bool_literal_conditions_are_diagnosed() {
         }
     }
 }
+
+#[test]
+fn cross_family_compound_assignments_are_diagnosed() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x += 2.5\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x += true\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> F64 {\n",
+                "    var x = 1.5\n",
+                "    x += 1\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x += \"a\"\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x += 2\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[],
+        ),
+        (
+            concat!(
+                "pub fn f() -> F64 {\n",
+                "    var x = 1.5\n",
+                "    x += 2.5\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "cross-family compound assignments should be diagnosed, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
