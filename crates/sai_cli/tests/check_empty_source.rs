@@ -27051,3 +27051,74 @@ fn else_if_chains_and_nested_ifs_in_initializers_join_literals() {
         }
     }
 }
+
+#[test]
+fn tuple_and_array_literal_construction_in_let_bindings() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Tuple and array literals in `let` initializers build composite
+        // locals; every element sits in an inference position.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, 1)\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, (1, 2))\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x + 1, if x > 0 { 1 } else { 2 })\n    x\n}\n",
+            &[],
+        ),
+        // Composite locals copy through plain paths.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, 1)\n    let u = t\n    x\n}\n",
+            &[],
+        ),
+        // Statement-only unit bodies check composite constructions too.
+        ("pub fn f(x: I32) {\n    let t = (x, 1)\n}\n", &[]),
+        // Array elements unify: mismatched concrete elements, out-of-range
+        // literals against a concrete anchor and `Str` mixes all diagnose
+        // instead of gating.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, true]\n    x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: U8) -> U8 {\n    let a = [x, 300]\n    x\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, \"a\"]\n    x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x + 1.5, 2)\n    x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "tuple/array construction in let bindings should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}

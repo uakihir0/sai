@@ -15177,6 +15177,43 @@ fn primitive_value_expression_shape_is_supported(
     let init = expression;
     match init.kind {
         ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
+        // Tuple and array literals admit element-wise (§6.3.1): every
+        // element sits in an inference position, so each element follows
+        // the same value admission. The kernel builds the composite type
+        // from the elements; element shapes it cannot check yet (nested
+        // arrays, cross-family literal joins) fall back to the gate.
+        ExprKind::Tuple(elements) if elements.len() >= 2 => {
+            return elements.iter().all(|element| {
+                primitive_value_expression_shape_is_supported(
+                    element,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            });
+        }
+        ExprKind::Array(elements) if !elements.is_empty() => {
+            return elements.iter().all(|element| {
+                primitive_value_expression_shape_is_supported(
+                    element,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            });
+        }
         // Value-producing `if`/`match` unify each branch/arm body against
         // the let annotation or the assign place type; unannotated
         // initializers join the branch literal tails through the checker's
@@ -18803,6 +18840,9 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
         ExprKind::Binary(_, left, right) => {
             primitive_body_error_span(left, node).or_else(|| primitive_body_error_span(right, node))
         }
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => elements
+            .iter()
+            .find_map(|element| primitive_body_error_span(element, node)),
         ExprKind::Call { callee, args, base } => primitive_body_error_span(callee, node)
             .or_else(|| {
                 args.iter()
