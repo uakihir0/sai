@@ -11753,6 +11753,14 @@ fn public_unit_return_discards_tail_values() {
         "pub fn f(x: I32) { loop { if x < 10 { x + 1 } else { break } }\n1 }\n",
         "pub fn f(x: I32) { loop { if x < 10 { x + 1 } }\n1 }\n",
         "pub fn f(x: I32) { while x < 10 { continue }\n1 }\n",
+        // Discarding expression statements synthesize without the return
+        // type's expectation, and loop-body `match` tails discard
+        // branch-wise.
+        "pub fn f() -> Bool { ~1\ntrue }\n",
+        "pub fn f() -> Bool { if true { ~1 }\ntrue }\n",
+        "pub fn f(x: I32) { loop { match x { 1 => 1, _ => x + 1 } }\n1 }\n",
+        "pub fn f(x: I32) { loop { match x { 1 => { x + 1 }, _ => {} } }\n1 }\n",
+        "pub fn f(x: I32) -> I32 { x + 1\n0 }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }

@@ -3468,15 +3468,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Block(_) => return Err(()),
             _ => {}
         }
-        let local_type = match self.input.return_type {
-            Some(return_type) => self.check_expr_value(expression, return_type)?,
-            // Expression-statements in a unit body discard their value
-            // (spec 6.11.1): synthesize without an expectation like the
-            // tail — any type is accepted.
-            None => self
-                .check_initializer_value(expression, None)
-                .map(|check| check.local_type)?,
-        };
+        // Expression statements discard their value wherever the enclosing
+        // function returns (spec 6.11.1/6.25.2): they synthesize without
+        // an expectation — the return type never constrains them.
+        let local_type = self
+            .check_initializer_value(expression, None)
+            .map(|check| check.local_type)?;
         self.record_expression_type(expression.hir_id, local_type);
         Ok(())
     }
@@ -4041,6 +4038,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // tail. Value-carrying first branches need cross-branch
                 // unification and stay gated.
                 self.check_stmt_block(then)?;
+                // A first branch ending in `return`/`break`/`continue`
+                // diverges, so its type is `Never` rather than `()` — the
+                // rest of the chain synthesizes with cross-branch
+                // unification (spec 6.14.1 rule 2), which stays gated.
+                if matches!(
+                    then.tail.map(|tail| tail.kind),
+                    Some(ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. })
+                ) {
+                    return Err(());
+                }
                 self.check_unit_if_else_tail(els)
             }
         }
