@@ -3333,11 +3333,7 @@ fn check_source_is_mixed_public_items_fragment(
                 }
             }
             sai_syntax::ast::Item::Function(function) => {
-                if function.attrs().next().is_some()
-                    || !function
-                        .visibility()
-                        .is_some_and(|visibility| visibility.pub_token().is_some())
-                {
+                if function.attrs().next().is_some() {
                     return (false, false, false, false);
                 }
                 saw_fn = true;
