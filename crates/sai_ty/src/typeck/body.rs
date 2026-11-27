@@ -674,16 +674,138 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.default_unresolved_literals(literal_floor);
             return Ok(());
         };
-        // The unit literal trivially checks against `()`; the initializer
-        // synthesis has no composite tuple representation for it.
-        if matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
-            self.default_unresolved_literals(literal_floor);
-            return Ok(());
-        }
-        let check = self.check_initializer_value(tail, None)?;
-        self.record_expression_type(tail.hir_id, check.local_type);
+        self.check_unit_tail_expression(tail)?;
         self.default_unresolved_literals(literal_floor);
         Ok(())
+    }
+
+    /// One discarding tail in unit mode: the unit literal trivially
+    /// checks, `if`/`match` expressions check branch-wise (spec 6.25.2 —
+    /// no cross-branch unification), and everything else synthesizes
+    /// without an expectation so any resulting type is accepted.
+    fn check_unit_tail_expression(&mut self, tail: &'hir Expr<'hir>) -> Result<(), ()> {
+        if matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
+            return Ok(());
+        }
+        match tail.kind {
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => self.check_unit_match_tail(scrutinee, arms, source),
+            ExprKind::If { cond, then, els } => {
+                self.check_if_condition(cond)?;
+                self.check_block_unit(then)?;
+                match els {
+                    None => Ok(()),
+                    Some(els) => self.check_unit_if_else_tail(els),
+                }
+            }
+            _ => {
+                let check = self.check_initializer_value(tail, None)?;
+                self.record_expression_type(tail.hir_id, check.local_type);
+                Ok(())
+            }
+        }
+    }
+
+    /// `else`/`else if` chains in a unit tail: `else if` nests the same
+    /// branch-wise unit checking; anything else gates.
+    fn check_unit_if_else_tail(&mut self, els: &'hir Expr<'hir>) -> Result<(), ()> {
+        match els.kind {
+            ExprKind::Block(block) => self.check_block_unit(block),
+            ExprKind::If { cond, then, els } => {
+                self.check_if_condition(cond)?;
+                self.check_block_unit(then)?;
+                match els {
+                    None => Ok(()),
+                    Some(els) => self.check_unit_if_else_tail(els),
+                }
+            }
+            _ => Err(()),
+        }
+    }
+
+    /// Unit-position `match` tail: the scrutinee, patterns, guards, and
+    /// exhaustiveness mirror `check_match_tail`, but every arm body
+    /// discards against `()` (spec 6.25.2) — block bodies are unit-mode
+    /// blocks and bare bodies synthesize without an expectation, so any
+    /// resulting type is accepted.
+    fn check_unit_match_tail(
+        &mut self,
+        scrutinee: &'hir Expr<'hir>,
+        arms: &'hir [Arm<'hir>],
+        source: MatchSource,
+    ) -> Result<(), ()> {
+        if !matches!(source, MatchSource::Normal) {
+            return Err(());
+        }
+        let scrutinee_type = self.check_primitive_match_scrutinee(scrutinee)?;
+        let mut catch_all = false;
+        let mut bool_cover = (false, false);
+        let mut arm_binding: Option<(BindingId, Option<LocalType>)> = None;
+        for arm in arms {
+            if catch_all {
+                self.errors.push(PrimitiveBodyError {
+                    node: arm.pat.hir_id,
+                    kind: PrimitiveBodyErrorKind::UnreachablePattern,
+                });
+                if let PatKind::Binding {
+                    mode: BindingMode::Value,
+                    binding,
+                    sub: None,
+                    ..
+                } = arm.pat.kind
+                {
+                    arm_binding = Some((
+                        binding,
+                        self.known_bindings
+                            .insert(binding, LocalType::Concrete(scrutinee_type)),
+                    ));
+                }
+                let body_result = self.check_unit_match_arm_body(arm.body);
+                self.restore_arm_binding(&mut arm_binding);
+                body_result?;
+                continue;
+            }
+            self.check_match_arm_pattern(
+                arm,
+                scrutinee_type,
+                &mut catch_all,
+                &mut bool_cover,
+                &mut arm_binding,
+            )?;
+            let body_result = arm
+                .guard
+                .map(|guard| self.check_if_condition(guard))
+                .unwrap_or(Ok(()))
+                .and_then(|_| self.check_unit_match_arm_body(arm.body));
+            self.restore_arm_binding(&mut arm_binding);
+            body_result?;
+        }
+        if !catch_all
+            && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true))
+            && !integer_patterns_cover_domain(arms, scrutinee_type)
+        {
+            self.errors.push(PrimitiveBodyError {
+                node: scrutinee.hir_id,
+                kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
+            });
+        }
+        Ok(())
+    }
+
+    /// One arm body in a unit-position match: block bodies check as
+    /// unit-mode blocks; bare bodies discard through the expectation-free
+    /// synthesis, recording the resulting type when there is one.
+    fn check_unit_match_arm_body(&mut self, body: &'hir Expr<'hir>) -> Result<(), ()> {
+        if let ExprKind::Block(block) = body.kind {
+            return self.check_block_unit(block);
+        }
+        // Bare arm bodies discard exactly like unit tails, so nested
+        // `if`/`match` expressions check branch-wise instead of gating in
+        // the initializer synthesis.
+        self.check_unit_tail_expression(body)
     }
 
     fn check_block_expected(&mut self, block: &Block<'hir>, expected: PrimTy) -> Result<(), ()> {

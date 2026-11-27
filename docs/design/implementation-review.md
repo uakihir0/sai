@@ -11172,6 +11172,18 @@ no-effect warning, and must-use discard diagnostics.
 
 **Remaining scope.** Array-position unification in discards; kernel unit-return integration for operators and local bindings.
 
+## IR-1198: Branch-wise unit checking for if and match tails
+
+**Decision.** `if` and `match` tails in unit-returning bodies now check in the kernel rather than only through the driver validators: each `if`/`else if`/`else` branch is itself a unit-mode block whose tail discards independently (spec 6.25.2 — no cross-branch unification), and match arm bodies discard the same way — block bodies as unit-mode blocks, bare bodies through the expectation-free synthesis. An omitted `else` is admissible in unit mode (`{}` by spec 6.14.1), with the driver skipping the primitive shape mirror there since the mirror requires both branches. Scrutinee, pattern, guard, and exhaustiveness handling share the primitive tail walk exactly, including integer-domain coverage.
+
+**Reason.** The driver validators only admit simple branch shapes (parameter paths, literals); operator branches like `if x < 10 { x + 1 } else { x }` gated even though the kernel types the same expressions everywhere else. Branch-wise checking is the spec semantics for unit positions, so the kernel recursion is the correct home — and it composes with let bindings, nested chains, and the full operator surface for free.
+
+**Failure boundary.** Primitive-return no-`else` `if` tails still gate (a genuine type error the slice does not yet diagnose); `Str`-typed arm bodies in matches gate (the Str branch-tail walk is expectation-driven); the match shape mirror still constrains scrutinee shapes at admission.
+
+**Verification.** Probes accept operator branches with and without `else`, let bindings inside branches, `else if` chains, operator match arms, and range-covered matches in unit positions; `x + 1.5` branches and arms diagnose TYPE_MISMATCH; partial matches still diagnose NON_EXHAUSTIVE_MATCH; primitive-return shapes are unchanged. CLI suite extended.
+
+**Remaining scope.** Composite operator elements in returns; `Str` arm bodies; tail-less statement-only unit bodies.
+
 ## IR-1199: Structural operator checking in composite return elements
 
 **Decision.** Operator expressions over parameter and const references in composite return elements — `(x + 1, 2)` against `(I32, I32)` — now type through a structural checker: leaves synthesize as concrete types (parameters, consts, typed literals) or undetermined integer/float literals, operators unify their operands per the kernel's rules (arithmetic/bitwise yield the operand type, comparisons and logicals yield Bool, shifts carry the left type), and the result unifies with the element type. Concrete types must match exactly (spec 6.1 — no coercions); literals adopt the type they meet with a range check. Literal-only expressions still evaluate through the const machinery first, keeping the merged behavior for that slice.
