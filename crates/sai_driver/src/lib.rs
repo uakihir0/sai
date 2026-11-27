@@ -8159,9 +8159,9 @@ fn check_function_body_type(
     let OwnerNode::Item(item) = owner.node else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
-    if item.vis != Visibility::Pub {
-        return Ok(FunctionBodyTypeCheck::Unsupported);
-    }
+    // Visibility does not change how a body type-checks — spec 4.6 has no
+    // module-private level, so a package-private function is as visible as a
+    // `pub` one inside its package and its body is checked the same way.
     let ItemKind::Fn {
         sig,
         generics,
@@ -8181,6 +8181,28 @@ fn check_function_body_type(
         || !function_name_is_supported(item.name, symbols, inputs)
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+    // An exported `export fn` of the root package in a core-module build
+    // must have a boundary-scalar signature (spec 12.8 item 1,
+    // `EXPORT_FN_NON_SCALAR`). That diagnostic is not implemented yet, so
+    // an export whose signature uses a non-scalar type — `Str` is the
+    // only one the supported slice can express — stays gated rather than
+    // passing silently. Scalar-only exports check like any function.
+    if item.vis == Visibility::Export {
+        let non_scalar = sig.params.iter().any(|parameter| {
+            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+                .is_some_and(|direct| !matches!(direct, FunctionDirectType::Primitive(_)))
+        }) || sig.ret.is_some_and(|ret| {
+            resolve_function_direct_type(*ret, type_paths, symbols, inputs).is_some_and(|direct| {
+                !matches!(
+                    direct,
+                    FunctionDirectType::Primitive(_) | FunctionDirectType::Unit
+                )
+            })
+        });
+        if non_scalar {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
     }
     check_function_body_shape_dispatch(
         owner,
@@ -10997,9 +11019,9 @@ fn check_inherent_method_body_type<'a>(
     let OwnerNode::ImplItem(method) = method_owner.node else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
+    // Method visibility is likewise irrelevant to the body's own checking.
     if method.owner_id != method_owner.id
         || method.impl_def != impl_item.owner_id.def_id
-        || method.vis != Visibility::Pub
         || !function_name_is_supported(method.name, symbols, inputs)
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);

@@ -2074,13 +2074,13 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     if !check_type_decls_acyclic(&source_file, source, &type_names) {
         return false;
     }
+    // Visibility is irrelevant to body checking: spec 4.6.1 has no
+    // module-private level, so package-private, `pub` and `export`
+    // function bodies all check the same way inside the package.
     source_file.items().all(|item| match item {
         sai_syntax::ast::Item::Function(function) => {
             saw_function = true;
             function.attrs().next().is_none()
-                && function
-                    .visibility()
-                    .is_some_and(|visibility| visibility.pub_token().is_some())
         }
         sai_syntax::ast::Item::Type(type_decl) => {
             type_decl.attrs().next().is_none()
@@ -3333,11 +3333,7 @@ fn check_source_is_mixed_public_items_fragment(
                 }
             }
             sai_syntax::ast::Item::Function(function) => {
-                if function.attrs().next().is_some()
-                    || !function
-                        .visibility()
-                        .is_some_and(|visibility| visibility.pub_token().is_some())
-                {
+                if function.attrs().next().is_some() {
                     return (false, false, false, false);
                 }
                 saw_fn = true;

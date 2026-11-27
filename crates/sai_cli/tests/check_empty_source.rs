@@ -13250,7 +13250,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet value: I32 = b\"text\"\nvalue\n}\n",
         "type Number = I32\npub fn local() -> I32 {\nlet value: Number = 42\nvalue\n}\n",
         "pub fn generic<T>(value: T) -> T { value }\n",
-        "fn private(value: I32) -> I32 { value }\n",
         "pub fn identityValue(value: I32) -> I32 { value }\n",
         "pub fn identity(valueItem: I32) -> I32 { valueItem }\n",
         "pub fn non_ascii_param(valué: I32) -> I32 { valué }\n",
@@ -13282,6 +13281,13 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     // `expected `I32`, found `Str`` instead of gating (IR-1144).
     let source = "pub fn local(value: I32) -> I32 { let next = value\n next }\n";
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    // Package-private function bodies check exactly like `pub` ones
+    // (spec 4.6.1 has no module-private level).
+    assert_success_result(
+        run_check("fn private(value: I32) -> I32 { value }\n", "", &[], &[]),
+        "wasm32-core",
+        "dev",
+    );
     {
         let source = "pub fn str_param_to_integer(value: Str) -> I32 { value }\n";
         let output = run_check(source, "", &[], &[]);
@@ -13404,7 +13410,6 @@ fn empty_root_source_emits_check_result_for_default_and_selected_target() {
 #[test]
 fn nonempty_or_extended_checks_remain_gated() {
     let cases: &[(&str, &str, &str, &[(&str, &str)], &[&str])] = &[
-        ("declaration", "fn empty() {}\n", "", &[], &[]),
         ("use", "use missing;\n", "", &[], &[]),
         ("pub use", "pub use missing;\n", "", &[], &[]),
         ("malformed source", "fn {\n", "", &[], &[]),
@@ -22416,33 +22421,27 @@ fn direct_function_calls_emit_check_result() {
 }
 
 #[test]
-fn arithmetic_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn arithmetic_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn add_one(value: I32) -> I32 { identity(value + 1) }\n",
         "fn identity(value: I32) -> I32 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "a direct call with a one-level arithmetic argument",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn basic_arithmetic_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn basic_arithmetic_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn subtract_one(value: I32) -> I32 { identity(value - 1) }\n",
         "fn identity(value: I32) -> I32 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "a direct call with a basic arithmetic argument",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn remainder_path_integer_literal_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn remainder_path_integer_literal_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn remainder(value: I32) -> I32 { identity(value % 2) }\n",
         "pub fn nested_remainder(value: I32) -> I32 { identity(identity(value % 2)) }\n",
@@ -22458,14 +22457,11 @@ fn remainder_path_integer_literal_arguments_to_direct_calls_remain_behind_the_st
         "fn identity_i16(value: I16) -> I16 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct-call remainder arguments",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn remainder_path_pair_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn remainder_path_pair_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn remainder_paths(left: I32, right: I32) -> I32 { identity_i32(left % right) }\n",
         "pub fn nested_remainder_paths(left: I32, right: I32) -> I32 {\n",
@@ -22485,14 +22481,11 @@ fn remainder_path_pair_arguments_to_direct_calls_remain_behind_the_stage_gate() 
         "fn identity_i16(value: I16) -> I16 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct-call remainder path pairs",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn remainder_integer_literal_left_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn remainder_integer_literal_left_path_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn remainder_literal_left(right: I32) -> I32 { identity_i32(1 % right) }\n",
         "pub fn nested_remainder_literal_left(right: I32) -> I32 {\n",
@@ -22510,14 +22503,11 @@ fn remainder_integer_literal_left_path_arguments_to_direct_calls_remain_behind_t
         "fn identity_i16(value: I16) -> I16 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct-call literal-left remainder arguments",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn remainder_integer_literal_pairs_to_direct_calls_remain_behind_the_stage_gate() {
+fn remainder_integer_literal_pairs_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn remainder_literal_pair_i8() -> I8 { identity_i8(7 % 3) }\n",
         "pub fn remainder_literal_pair_i16() -> I16 { identity_i16(7 % 3) }\n",
@@ -22546,10 +22536,7 @@ fn remainder_integer_literal_pairs_to_direct_calls_remain_behind_the_stage_gate(
         "fn identity_usize(value: USize) -> USize { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root/nested direct-call integer-literal remainder pairs",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
@@ -22637,20 +22624,17 @@ fn unsupported_remainder_path_pair_shapes_remain_behind_the_stage_gate() {
 }
 
 #[test]
-fn comparison_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn comparison_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn is_below_limit(value: I32, limit: I32) -> Bool { identity_bool(value < limit) }\n",
         "fn identity_bool(value: Bool) -> Bool { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "a direct call with a primitive comparison argument",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn logical_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn logical_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn both_ready(left: Bool, right: Bool) -> Bool { identity_bool(left and right) }\n",
         "pub fn either_ready(left: Bool, right: Bool) -> Bool { identity_bool(identity_bool(left or right)) }\n",
@@ -22662,14 +22646,11 @@ fn logical_arguments_to_direct_calls_remain_behind_the_stage_gate() {
         "fn identity_bool(value: Bool) -> Bool { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "a direct or one-level nested call with path and Bool-literal logical operands",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn unary_not_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn unary_not_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn negate(value: Bool) -> Bool { identity_bool(not value) }\n",
         "pub fn nested_negate(value: Bool) -> Bool { identity_bool(identity_bool(not value)) }\n",
@@ -22684,10 +22665,7 @@ fn unary_not_arguments_to_direct_calls_remain_behind_the_stage_gate() {
         "fn identity_bool(value: Bool) -> Bool { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "a direct or one-level nested call with a unary-not path or Bool literal argument",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
@@ -23055,7 +23033,7 @@ fn unary_bitwise_not_path_tails_remain_behind_the_stage_gate() {
 }
 
 #[test]
-fn unary_not_path_tails_remain_behind_the_stage_gate() {
+fn unary_not_path_tails_are_checked() {
     let source = concat!(
         "pub fn parameter_tail(value: Bool) -> Bool { not value }\n",
         "pub fn int_parameter_tail(value: I32) -> Bool { not value }\n",
@@ -23088,14 +23066,25 @@ fn unary_not_path_tails_remain_behind_the_stage_gate() {
         "fn identity_bool(value: Bool) -> Bool { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "unary-not path tails over parameters, locals, and copies",
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "operand type errors should be diagnosed, not gated:\n{stdout}"
     );
+    assert!(
+        stdout.contains("expected `Bool`, found `I32`"),
+        "expected the operand type mismatch message:\n{stdout}"
+    );
+    let mismatch_count = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"TYPE_MISMATCH\""))
+        .count();
+    assert_eq!(mismatch_count, 3, "{stdout}");
 }
 
 #[test]
-fn binary_expression_tails_remain_behind_the_stage_gate() {
+fn binary_expression_tails_are_checked() {
     let source = concat!(
         "pub fn add_parameters(first: I32, second: I32) -> I32 { first + second }\n",
         "pub fn sub_literal(value: I32) -> I32 { value - 1 }\n",
@@ -23137,10 +23126,21 @@ fn binary_expression_tails_remain_behind_the_stage_gate() {
         "fn identity_i32(value: I32) -> I32 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "arithmetic, bitwise, shift, comparison, and logical tails",
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "operand type errors should be diagnosed, not gated:\n{stdout}"
     );
+    assert!(
+        stdout.contains("expected `Bool`, found `I32`"),
+        "expected the operand type mismatch message:\n{stdout}"
+    );
+    let mismatch_count = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"TYPE_MISMATCH\""))
+        .count();
+    assert_eq!(mismatch_count, 1, "{stdout}");
 }
 
 #[test]
@@ -23257,21 +23257,18 @@ fn deferred_bitwise_not_of_flat_integer_literal_locals_remains_behind_the_stage_
 }
 
 #[test]
-fn binary_shift_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn binary_shift_path_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn left_shift_argument(value: I32, count: U32) -> I32 { identity_i32(value << count) }\n",
         "pub fn nested_right_shift_argument(value: I32, count: U32) -> I32 { identity_i32(identity_i32(value >> count)) }\n",
         "fn identity_i32(value: I32) -> I32 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct calls with binary shift path arguments",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn binary_shift_integer_literal_rhs_arguments_remain_behind_the_stage_gate() {
+fn binary_shift_integer_literal_rhs_arguments_are_checked() {
     let source = concat!(
         "pub fn left_shift_argument(value: I8) -> I8 { identity_i8(value << 4294967295) }\n",
         "pub fn nested_right_shift_argument(value: Byte) -> Byte { identity_byte(identity_byte(value >> 0)) }\n",
@@ -23279,14 +23276,11 @@ fn binary_shift_integer_literal_rhs_arguments_remain_behind_the_stage_gate() {
         "fn identity_byte(value: Byte) -> Byte { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct calls with integer-literal shift counts",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn binary_shift_scalar_literal_rhs_arguments_remain_behind_the_stage_gate() {
+fn binary_shift_scalar_literal_rhs_arguments_are_diagnosed() {
     let source = concat!(
         "pub fn root_left_bool(left: I32) -> I32 { identity_i32(left << true) }\n",
         "pub fn root_right_char(left: I32) -> I32 { identity_i32(left >> 'x') }\n",
@@ -23301,14 +23295,25 @@ fn binary_shift_scalar_literal_rhs_arguments_remain_behind_the_stage_gate() {
         "fn identity_byte(value: Byte) -> Byte { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct-call shifts with scalar-literal counts",
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "operand type errors should be diagnosed, not gated:\n{stdout}"
     );
+    assert!(
+        stdout.contains("expected `U32`, found a Bool literal"),
+        "expected the operand type mismatch message:\n{stdout}"
+    );
+    let mismatch_count = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"TYPE_MISMATCH\""))
+        .count();
+    assert_eq!(mismatch_count, 9, "{stdout}");
 }
 
 #[test]
-fn binary_shift_byte_literal_lhs_path_arguments_remain_behind_the_stage_gate() {
+fn binary_shift_byte_literal_lhs_path_arguments_are_checked() {
     let source = concat!(
         "pub fn root_left_shift(count: U32) -> Byte { identity_byte(b'a' << count) }\n",
         "pub fn root_right_shift(count: U32) -> Byte { identity_byte(b'a' >> count) }\n",
@@ -23325,14 +23330,11 @@ fn binary_shift_byte_literal_lhs_path_arguments_remain_behind_the_stage_gate() {
         "fn identity_byte(value: Byte) -> Byte { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct calls with Byte-literal shift left operands",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn binary_shift_byte_literal_lhs_integer_literal_rhs_remain_behind_the_stage_gate() {
+fn binary_shift_byte_literal_lhs_integer_literal_rhs_are_checked() {
     let source = concat!(
         "pub fn root_left_shift() -> Byte { identity_byte(b'a' << 0) }\n",
         "pub fn root_right_shift() -> Byte { identity_byte(b'a' >> 4294967295) }\n",
@@ -23341,14 +23343,11 @@ fn binary_shift_byte_literal_lhs_integer_literal_rhs_remain_behind_the_stage_gat
         "fn identity_byte(value: Byte) -> Byte { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested Byte-literal-left shifts with direct U32 counts",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn binary_shift_integer_literal_lhs_path_arguments_remain_behind_the_stage_gate() {
+fn binary_shift_integer_literal_lhs_path_arguments_are_checked() {
     let source = concat!(
         "pub fn root_left_shift(count: U32) -> I32 { identity_i32(1 << count) }\n",
         "pub fn root_right_shift(count: U32) -> U32 { identity_u32(1 >> count) }\n",
@@ -23368,14 +23367,11 @@ fn binary_shift_integer_literal_lhs_path_arguments_remain_behind_the_stage_gate(
         "fn identity_u32(value: U32) -> U32 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct calls with integer-literal-left shifts",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn binary_shift_integer_literal_pair_arguments_remain_behind_the_stage_gate() {
+fn binary_shift_integer_literal_pair_arguments_are_checked() {
     let source = concat!(
         "pub fn root_left_shift() -> I8 { identity_i8(-128 << 0) }\n",
         "pub fn root_right_shift() -> U32 { identity_u32(1 >> 4294967295) }\n",
@@ -23387,14 +23383,11 @@ fn binary_shift_integer_literal_pair_arguments_remain_behind_the_stage_gate() {
         "fn identity_u32(value: U32) -> U32 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct calls with integer-literal shift pairs",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn binary_shift_integer_literal_byte_rhs_arguments_remain_behind_the_stage_gate() {
+fn binary_shift_integer_literal_byte_rhs_arguments_are_diagnosed() {
     let source = concat!(
         "pub fn root_left_shift() -> I32 { identity_i32(1 << b'a') }\n",
         "pub fn root_right_shift() -> U32 { identity_u32(1 >> b'z') }\n",
@@ -23406,14 +23399,25 @@ fn binary_shift_integer_literal_byte_rhs_arguments_remain_behind_the_stage_gate(
         "fn identity_u32(value: U32) -> U32 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct calls with integer/Byte shift operands",
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "operand type errors should be diagnosed, not gated:\n{stdout}"
     );
+    assert!(
+        stdout.contains("expected `U32`, found a byte literal"),
+        "expected the operand type mismatch message:\n{stdout}"
+    );
+    let mismatch_count = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"TYPE_MISMATCH\""))
+        .count();
+    assert_eq!(mismatch_count, 4, "{stdout}");
 }
 
 #[test]
-fn binary_shift_byte_literal_rhs_arguments_remain_behind_the_stage_gate() {
+fn binary_shift_byte_literal_rhs_arguments_are_diagnosed() {
     let source = concat!(
         "pub fn root_path_left_shift(value: I32) -> I32 { identity_i32(value << b'a') }\n",
         "pub fn root_byte_path_right_shift(value: Byte) -> Byte { identity_byte(value >> b'z') }\n",
@@ -23424,10 +23428,21 @@ fn binary_shift_byte_literal_rhs_arguments_remain_behind_the_stage_gate() {
         "fn identity_byte(value: Byte) -> Byte { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct calls with Byte-literal shift counts",
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "operand type errors should be diagnosed, not gated:\n{stdout}"
     );
+    assert!(
+        stdout.contains("expected `U32`, found a byte literal"),
+        "expected the operand type mismatch message:\n{stdout}"
+    );
+    let mismatch_count = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"TYPE_MISMATCH\""))
+        .count();
+    assert_eq!(mismatch_count, 4, "{stdout}");
 }
 
 #[test]
@@ -23504,7 +23519,7 @@ fn unsupported_binary_shift_integer_literal_rhs_shapes_remain_behind_the_stage_g
 }
 
 #[test]
-fn binary_bitwise_path_arguments_to_direct_calls_remain_behind_the_stage_gate() {
+fn binary_bitwise_path_arguments_to_direct_calls_are_checked() {
     let source = concat!(
         "pub fn bitwise_and_argument(left: I32, right: I32) -> I32 { identity_i32(left & right) }\n",
         "pub fn nested_bitwise_xor_argument(left: Byte, right: Byte) -> Byte { identity_byte(identity_byte(left ^ right)) }\n",
@@ -23517,14 +23532,11 @@ fn binary_bitwise_path_arguments_to_direct_calls_remain_behind_the_stage_gate() 
         "fn identity_byte(value: Byte) -> Byte { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root or one-level nested direct calls with binary bitwise path arguments",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
-fn binary_bitwise_integer_literal_rhs_arguments_remain_behind_the_stage_gate() {
+fn binary_bitwise_integer_literal_rhs_arguments_are_checked() {
     let source = concat!(
         "pub fn bitwise_and_integer_literal_argument(left: I32) -> I32 { identity_i32(left & 1) }\n",
         "pub fn bitwise_or_integer_literal_argument(left: U64) -> U64 { identity_u64(left | 2) }\n",
@@ -23534,14 +23546,25 @@ fn binary_bitwise_integer_literal_rhs_arguments_remain_behind_the_stage_gate() {
         "fn identity_byte(value: Byte) -> Byte { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root or one-level nested direct calls with integer-literal RHS bitwise arguments",
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "operand type errors should be diagnosed, not gated:\n{stdout}"
     );
+    assert!(
+        stdout.contains("expected `Byte`, found an integer literal"),
+        "expected the operand type mismatch message:\n{stdout}"
+    );
+    let mismatch_count = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"TYPE_MISMATCH\""))
+        .count();
+    assert_eq!(mismatch_count, 1, "{stdout}");
 }
 
 #[test]
-fn binary_bitwise_integer_literal_lhs_arguments_remain_behind_the_stage_gate() {
+fn binary_bitwise_integer_literal_lhs_arguments_are_checked() {
     let source = concat!(
         "pub fn bitwise_and_integer_literal_argument(right: I32) -> I32 { identity_i32(1 & right) }\n",
         "pub fn bitwise_or_integer_literal_argument(right: U64) -> U64 { identity_u64(2 | right) }\n",
@@ -23555,10 +23578,7 @@ fn binary_bitwise_integer_literal_lhs_arguments_remain_behind_the_stage_gate() {
         "fn identity_u64(value: U64) -> U64 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root or one-level nested direct calls with integer-literal LHS bitwise arguments",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
@@ -23597,7 +23617,7 @@ fn binary_bitwise_integer_literal_pairs_remain_behind_the_stage_gate() {
 }
 
 #[test]
-fn binary_bitwise_signed_integer_literal_pairs_remain_behind_the_stage_gate() {
+fn binary_bitwise_signed_integer_literal_pairs_are_checked() {
     let source = concat!(
         "pub fn signed_left_literal_pair_root() -> I32 { identity_i32(-7 & 3) }\n",
         "pub fn signed_right_literal_pair_root() -> I32 { identity_i32(7 | -3) }\n",
@@ -23608,10 +23628,7 @@ fn binary_bitwise_signed_integer_literal_pairs_remain_behind_the_stage_gate() {
         "fn identity_i32(value: I32) -> I32 { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct calls with directly folded signed integer-literal bitwise pairs",
-    );
+    assert_success_result(output, "wasm32-core", "dev");
 }
 
 #[test]
@@ -23733,7 +23750,7 @@ fn binary_bitwise_byte_literal_pairs_remain_behind_the_stage_gate() {
 }
 
 #[test]
-fn binary_bitwise_byte_integer_literal_rhs_remains_behind_the_stage_gate() {
+fn binary_bitwise_byte_integer_literal_rhs_is_diagnosed() {
     let source = concat!(
         "pub fn byte_integer_literal_root() -> Byte {\n",
         "    let and_value = identity_byte(b'a' & 1)\n",
@@ -23748,14 +23765,25 @@ fn binary_bitwise_byte_integer_literal_rhs_remains_behind_the_stage_gate() {
         "fn identity_byte(value: Byte) -> Byte { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct Byte-literal-left signed integer RHS bitwise shapes",
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "operand type errors should be diagnosed, not gated:\n{stdout}"
     );
+    assert!(
+        stdout.contains("expected `Byte`, found an integer literal"),
+        "expected the operand type mismatch message:\n{stdout}"
+    );
+    let mismatch_count = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"TYPE_MISMATCH\""))
+        .count();
+    assert_eq!(mismatch_count, 6, "{stdout}");
 }
 
 #[test]
-fn binary_bitwise_byte_scalar_literal_rhs_remains_behind_the_stage_gate() {
+fn binary_bitwise_byte_scalar_literal_rhs_is_diagnosed() {
     let source = concat!(
         "pub fn byte_scalar_literal_root(valid: Byte) -> Byte {\n",
         "    let and_bool = identity_byte(b'a' & true)\n",
@@ -23784,10 +23812,21 @@ fn binary_bitwise_byte_scalar_literal_rhs_remains_behind_the_stage_gate() {
         "fn identity_byte(value: Byte) -> Byte { value }\n",
     );
     let output = run_check(source, "", &[], &[]);
-    assert_check_stays_gated_without_syntax_errors(
-        &output,
-        "root and one-level nested direct-call Byte-literal-left Bool, Char, and float RHS shapes",
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "operand type errors should be diagnosed, not gated:\n{stdout}"
     );
+    assert!(
+        stdout.contains("expected `Byte`, found a Bool literal"),
+        "expected the operand type mismatch message:\n{stdout}"
+    );
+    let mismatch_count = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"TYPE_MISMATCH\""))
+        .count();
+    assert_eq!(mismatch_count, 18, "{stdout}");
 }
 
 #[test]
