@@ -11171,3 +11171,15 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Probes accept `(N, 1)` against `(I64, I64)`, `[N, 1]` against `Array<I32, 2>`, and `(S, 1)` with `S: Str`; `N: I64` against `(I32, I32)` diagnoses TYPE_MISMATCH. CLI suite extended.
 
 **Remaining scope.** Array-position unification in discards; kernel unit-return integration for operators and local bindings.
+
+## IR-1199: Structural operator checking in composite return elements
+
+**Decision.** Operator expressions over parameter and const references in composite return elements — `(x + 1, 2)` against `(I32, I32)` — now type through a structural checker: leaves synthesize as concrete types (parameters, consts, typed literals) or undetermined integer/float literals, operators unify their operands per the kernel's rules (arithmetic/bitwise yield the operand type, comparisons and logicals yield Bool, shifts carry the left type), and the result unifies with the element type. Concrete types must match exactly (spec 6.1 — no coercions); literals adopt the type they meet with a range check. Literal-only expressions still evaluate through the const machinery first, keeping the merged behavior for that slice.
+
+**Reason.** The element type is always known in composite positions, so the expectation-driven fragment of inference suffices — no type variables are needed. This is the same shape the kernel uses in checking mode, bounded to references and literals as leaves. `as` casts, calls, composite operands, and non-numeric arithmetic (the kernel-wide Bool boundary) gate.
+
+**Failure boundary.** Operand positions that need real inference (two references of different types meeting in arithmetic — a genuine mismatch — diagnoses, but overloaded shapes like unsuffixed mixed literals in exotic positions) stay conservative; `Str` concatenation and equality over non-primitive composites gate; shift right-operands validate only for integer-ness.
+
+**Verification.** Probes accept parameter arithmetic/bitwise/shift/comparison/logical/unary elements in tuples, arrays, and nested composites, const-reference operands, and float arithmetic; `x + 1.5` with `x: I32`, `x + 1` against `(I64, I32)` with `x: I32`, and int/float mixing diagnose TYPE_MISMATCH; `x + 300` with `x: U8` diagnoses LITERAL_OUT_OF_RANGE; `as` casts gate. CLI suite extended.
+
+**Remaining scope.** `as` casts in element positions; `Str` operator elements; composite operands inside operators; method calls in composite positions.
