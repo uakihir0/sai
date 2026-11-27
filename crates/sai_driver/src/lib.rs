@@ -8548,7 +8548,17 @@ fn check_function_body_shape_dispatch(
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
         let Some(tuple_diagnostics) = check_function_composite_literal_element(
-            owner, *return_ty, tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            owner,
+            *return_ty,
+            tail,
+            sig,
+            body,
+            locals,
+            type_paths,
+            const_path_types,
+            symbols,
+            inputs,
+            snapshot,
             target_cfg,
         )?
         else {
@@ -8572,7 +8582,17 @@ fn check_function_body_shape_dispatch(
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
         let Some(array_diagnostics) = check_function_composite_literal_element(
-            owner, *return_ty, tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            owner,
+            *return_ty,
+            tail,
+            sig,
+            body,
+            locals,
+            type_paths,
+            const_path_types,
+            symbols,
+            inputs,
+            snapshot,
             target_cfg,
         )?
         else {
@@ -9871,6 +9891,7 @@ fn check_function_composite_literal_element(
     body: &sai_hir::body::Body<'_>,
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -9901,7 +9922,16 @@ fn check_function_composite_literal_element(
                 return Ok(None);
             }
             return check_unit_discard_if_branch_tails(
-                owner, &tails, sig, body, locals, type_paths, None, symbols, inputs, snapshot,
+                owner,
+                &tails,
+                sig,
+                body,
+                locals,
+                type_paths,
+                const_path_types,
+                symbols,
+                inputs,
+                snapshot,
                 target_cfg,
             );
         }
@@ -9921,14 +9951,34 @@ fn check_function_composite_literal_element(
             return Ok(None);
         };
         let Some(mut diagnostics) = check_function_composite_literal_element(
-            owner, ty, then_tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            owner,
+            ty,
+            then_tail,
+            sig,
+            body,
+            locals,
+            type_paths,
+            const_path_types,
+            symbols,
+            inputs,
+            snapshot,
             target_cfg,
         )?
         else {
             return Ok(None);
         };
         let Some(mut else_diagnostics) = check_function_composite_literal_element(
-            owner, ty, else_tail, sig, body, locals, type_paths, symbols, inputs, snapshot,
+            owner,
+            ty,
+            else_tail,
+            sig,
+            body,
+            locals,
+            type_paths,
+            const_path_types,
+            symbols,
+            inputs,
+            snapshot,
             target_cfg,
         )?
         else {
@@ -10013,6 +10063,7 @@ fn check_function_composite_literal_element(
                 body,
                 locals,
                 type_paths,
+                const_path_types,
                 symbols,
                 inputs,
                 snapshot,
@@ -10075,6 +10126,7 @@ fn check_function_composite_literal_element(
                 body,
                 locals,
                 type_paths,
+                const_path_types,
                 symbols,
                 inputs,
                 snapshot,
