@@ -26888,6 +26888,18 @@ fn non_bool_literal_logical_operands_are_diagnosed() {
             &[("TYPE_MISMATCH", 1)],
         ),
         (
+            "pub fn f(x: Bool) -> Bool {\n    let y = x and 1\n    y\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: Bool) -> Bool {\n    not 1\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: Bool) -> Bool {\n    let y = x and true\n    y\n}\n",
+            &[],
+        ),
+        (
             "pub fn f() -> Bool {\n    not 1\n}\n",
             &[("TYPE_MISMATCH", 1)],
         ),
