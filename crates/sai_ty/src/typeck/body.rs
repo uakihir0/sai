@@ -6725,17 +6725,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         then: &'hir Block<'hir>,
         els: Option<&'hir Expr<'hir>>,
     ) -> Result<LocalType, ()> {
-        let Some(els) = els else {
-            return Err(());
-        };
-        let ExprKind::Block(else_block) = els.kind else {
-            return Err(());
-        };
-        self.check_if_condition(condition)?;
+        // `else` blocks and `else if` chains join through the same
+        // shared variable — nested branch `if`s contribute their own
+        // sites through the arm-site recursion.
         let mut joined = None;
-        for branch in [then, else_block] {
-            self.join_literal_branch_site(branch, &mut joined)?;
-        }
+        self.join_literal_if_chain(condition, then, els, &mut joined)?;
         // Both branches diverging leaves `β` unfixed — the `if` yields
         // `!`.
         Ok(joined.unwrap_or(LocalType::Error(None)))
@@ -6828,7 +6822,31 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.check_expr_stmt(expression)
             }
             ExprKind::Block(block) => self.join_literal_branch_site(block, joined),
+            ExprKind::If { cond, then, els } => self.join_literal_if_chain(cond, then, els, joined),
             _ => self.join_literal_site(expression, joined),
+        }
+    }
+
+    /// Nested and chained `if`s in a literal join: every branch
+    /// contributes its sites to the same shared variable. An `if`
+    /// without `else` is `()`-typed (spec 6.14.1), so it can never join
+    /// a literal group and gates.
+    fn join_literal_if_chain(
+        &mut self,
+        condition: &'hir Expr<'hir>,
+        then: &'hir Block<'hir>,
+        els: Option<&'hir Expr<'hir>>,
+        joined: &mut Option<LocalType>,
+    ) -> Result<(), ()> {
+        let Some(els) = els else {
+            return Err(());
+        };
+        self.check_if_condition(condition)?;
+        self.join_literal_branch_site(then, joined)?;
+        match els.kind {
+            ExprKind::Block(else_block) => self.join_literal_branch_site(else_block, joined),
+            ExprKind::If { cond, then, els } => self.join_literal_if_chain(cond, then, els, joined),
+            _ => Err(()),
         }
     }
 

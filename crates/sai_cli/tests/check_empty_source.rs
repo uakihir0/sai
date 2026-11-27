@@ -27008,3 +27008,46 @@ fn primitive_bodies_missing_value_tails_are_diagnosed() {
         }
     }
 }
+
+#[test]
+fn else_if_chains_and_nested_ifs_in_initializers_join_literals() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            "pub fn f(x: I32) -> I32 {\n    let y = if x > 5 { 2 } else if x > 0 { 1 } else { 0 }\n    y\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let y = if x > 0 { if x > 5 { 2 } else { 1 } } else { 0 }\n    y\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> U8 {\n    let y = if x > 5 { 2 } else if x > 0 { 1 } else { 0 }\n    y\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let y = if x > 0 { 1 } else { 2 }\n    y + 1\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "else-if chains and nested ifs in initializers should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
