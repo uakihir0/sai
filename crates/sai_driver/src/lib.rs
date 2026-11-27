@@ -8485,7 +8485,6 @@ fn check_function_body_shape_dispatch(
         && sig.params.len() == body.params.len()
         && block.stmts.is_empty()
         && let Some(tail) = block.tail
-        && !matches!(tail.kind, ExprKind::If { .. })
     {
         let tail_unit_return = match sig.ret {
             Some(return_ty) => matches!(
@@ -8501,16 +8500,30 @@ fn check_function_body_shape_dispatch(
                 && resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
                     .is_some()
         });
-        if tail_unit_return
-            && parameters_resolve
-            && let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
+        if tail_unit_return && parameters_resolve {
+            // `if` tails validate their branch tails through the literal
+            // chain collector; parameter-based conditions in multi-parameter
+            // bodies stay with the single-parameter arm below or gate.
+            if matches!(tail.kind, ExprKind::If { .. }) {
+                let mut tails = Vec::new();
+                if collect_literal_unit_if_chain_tails(tail, &mut tails)
+                    && let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
+                        owner, &tails, sig, body, locals, type_paths, symbols, inputs, snapshot,
+                        target_cfg,
+                    )?
+                {
+                    return Ok(FunctionBodyTypeCheck::Supported {
+                        diagnostics: tail_diagnostics,
+                    });
+                }
+            } else if let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
                 owner, tail, false, false, sig, body, locals, symbols, inputs, snapshot,
                 type_paths, target_cfg,
-            )?
-        {
-            return Ok(FunctionBodyTypeCheck::Supported {
-                diagnostics: tail_diagnostics,
-            });
+            )? {
+                return Ok(FunctionBodyTypeCheck::Supported {
+                    diagnostics: tail_diagnostics,
+                });
+            }
         }
     }
 
