@@ -17848,22 +17848,23 @@ fn primitive_match_stmt_shape_is_supported(
                 }
             }
         }
-        let ExprKind::Block(block) = arm.body.kind else {
-            return false;
-        };
-        if !primitive_stmt_block_shape_is_supported(
-            block,
-            arm_bindings.as_ref().unwrap_or(preceding_bindings),
-            locals,
-            inputs,
-            symbols,
-            type_paths,
-            self_field_projections,
-            unknown_self_fields,
-            direct_call_signatures,
-            primitive_types,
-        ) {
-            return false;
+        // Arm bodies in unit positions (loop tails, unit blocks) discard
+        // branch-wise in the kernel; plain statement-position matches the
+        // kernel cannot check fall back to the validators. Either way the
+        // admission only walks the body shapes for their collection.
+        if let ExprKind::Block(block) = arm.body.kind {
+            let _ = primitive_stmt_block_shape_is_supported(
+                block,
+                arm_bindings.as_ref().unwrap_or(preceding_bindings),
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            );
         }
     }
     // Missing catch-alls and non-Bool coverage are diagnosed
