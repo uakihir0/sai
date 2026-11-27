@@ -11552,3 +11552,24 @@ primitive mismatch. The driver dropped the tailless-primitive gate,
 exempted tailless bodies from the tail-shape bail (the kernel decides),
 and resolves the error span from the last statement or the block
 itself.
+
+## IR-1213: `else if` chains and nested `if`s join literals in initializers
+
+**Slice.** Unannotated `let` initializers join branch literals into one
+shared inference variable, but the join only reached flat
+`if c { 1 } else { 2 }` shapes — `else if` chains and nested branch
+`if`s gated:
+
+```sai
+pub fn f(x: I32) -> I32 {
+    let y = if x > 5 { 2 } else if x > 0 { 1 } else { 0 }
+    y   // I64 by default; a `-> U8` return resolves the whole chain
+}
+```
+
+**Implementation.** The chain recursion `join_literal_if_chain` walks
+`else if` spines contributing every branch's sites to the same shared
+variable, and the arm-site join recurses into nested branch `if`s. An
+`if` without `else` is `()`-typed (spec 6.14.1) and still gates — it
+can never join a literal group. Divergent branches contribute no site
+as before.
