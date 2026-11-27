@@ -12890,7 +12890,6 @@ fn unsupported_zero_parameter_if_shapes_remain_gated() {
         "pub fn choose() -> I32 { if 1 == 1 { 1 } else { 2 } }\n",
         "pub fn choose() -> I32 { if true { 1 } }\n",
         "pub fn choose() -> I32 { if true { let value = 1; value } else { 2 } }\n",
-        "pub fn choose() -> I32 { if 1 { 1 } else { 2 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -26513,6 +26512,111 @@ fn assignments_to_literal_inferred_variables_are_checked() {
         assert!(
             !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
             "assignments to literal-inferred variables should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn non_bool_literal_conditions_are_diagnosed() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    if 1 { 1 } else { 2 }\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    if 'a' { 1 } else { 2 }\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    if \"a\" { 1 } else { 2 }\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    if b\"a\" { 1 } else { 2 }\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    if x { 1 } else { 2 }\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    while 1 { break }\n",
+                "    0\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    while x { break }\n",
+                "    0\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    if true { 1 } else { 2 }\n",
+                "}\n",
+            ),
+            &[],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    while x < 10 { x += 1 }\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "non-Bool literal conditions should be diagnosed, not gated:\n{stdout}"
         );
         let expected_exit = if code_counts.is_empty() {
             Some(0)

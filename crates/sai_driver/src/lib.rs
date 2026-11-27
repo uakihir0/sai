@@ -16841,6 +16841,10 @@ fn primitive_if_condition_shape_is_supported(
             _ => false,
         },
         ExprKind::Lit(Lit::Bool(_)) => true,
+        // Non-`Bool` literals are admitted only so the checker diagnoses
+        // them: sai has no truthiness coercion, so a literal condition of
+        // any other type is always a type error, never a valid program.
+        ExprKind::Lit(_) => true,
         ExprKind::Binary(operator, ..) => matches!(
             operator,
             BinOp::Eq
@@ -79036,12 +79040,23 @@ property "shared"() {}
                 "the `{name}` non-Bool operand under `not` is a recoverable type error"
             );
         }
-        for name in [
-            "no_else",
-            "sibling_scope_leak",
-            "if_expression_statement",
-            "literal_condition",
-        ] {
+        // `if 1` — a non-`Bool` literal condition can never hold, so it
+        // is diagnosed rather than gated.
+        {
+            let owner = owner_named(&database, &resolved, "literal_condition");
+            assert!(
+                matches!(
+                    owner.body_type_check(),
+                    Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+                        if diagnostics.len() == 1
+                            && diagnostics.iter().all(|diagnostic| {
+                                diagnostic.code == sai_diagnostics::Code::TypeMismatch
+                            })
+                ),
+                "the `literal_condition` non-Bool literal condition is a recoverable type error"
+            );
+        }
+        for name in ["no_else", "sibling_scope_leak", "if_expression_statement"] {
             let owner = owner_named(&database, &resolved, name);
             assert!(
                 matches!(
@@ -102249,7 +102264,17 @@ property "shared"() {}
                 .expect("unit if result check succeeds"),
             FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
         ));
-        for index in [5, 6, 9, 12] {
+        // `if 1` — a non-`Bool` literal condition can never hold, so it
+        // is diagnosed rather than gated.
+        assert!(matches!(
+            owners[6]
+                .body_type_check()
+                .expect("a non-Bool literal condition is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        for index in [5, 9, 12] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -102313,7 +102338,17 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [2, 5, 7, 9] {
+        // `if 1` — a non-`Bool` literal condition can never hold (sai has
+        // no truthiness coercion), so it is diagnosed rather than gated.
+        assert!(matches!(
+            owners[7]
+                .body_type_check()
+                .expect("a non-Bool literal condition is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        for index in [2, 5, 9] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
