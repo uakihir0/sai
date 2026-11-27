@@ -15162,6 +15162,24 @@ struct StrShapeAdmissions {
     annotations: HashSet<HirId>,
 }
 
+/// A projection or indexing base is a plain path to a preceding local or
+/// a nested projection/index chain rooted at one.
+fn primitive_projection_base_shape_is_supported(
+    base: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    match base.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::TupleField { base, .. } | ExprKind::Index(base, _) => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+        }
+        _ => false,
+    }
+}
+
 fn primitive_value_expression_shape_is_supported(
     expression: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
@@ -15213,6 +15231,38 @@ fn primitive_value_expression_shape_is_supported(
                     primitive_types,
                 )
             });
+        }
+        // Tuple field projections and built-in indexing read composite
+        // locals (§6.6.2, §6.7.1): the base is a preceding local or a
+        // nested projection/index chain, and the index expression follows
+        // value admission. Non-composite bases and trait-based indexing
+        // fall back to the gate in the kernel.
+        ExprKind::TupleField { base, .. } => {
+            return primitive_projection_base_shape_is_supported(
+                base,
+                preceding_bindings,
+                locals,
+                inputs,
+            );
+        }
+        ExprKind::Index(base, index) => {
+            return primitive_projection_base_shape_is_supported(
+                base,
+                preceding_bindings,
+                locals,
+                inputs,
+            ) && primitive_value_expression_shape_is_supported(
+                index,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            );
         }
         // Value-producing `if`/`match` unify each branch/arm body against
         // the let annotation or the assign place type; unannotated
@@ -18536,6 +18586,15 @@ fn primitive_body_errors_to_diagnostics(
                     const_primitive_name(found)
                 ),
                 "type mismatch",
+            )?,
+            PrimitiveBodyErrorKind::TupleIndexOutOfRange => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TupleIndexOutOfRange,
+                "tuple index out of range".to_owned(),
+                "tuple index out of range",
             )?,
             PrimitiveBodyErrorKind::MissingBlockTail { expected } => const_literal_diagnostic(
                 owner.id,

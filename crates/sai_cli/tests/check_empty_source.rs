@@ -27114,6 +27114,16 @@ fn tuple_and_array_literal_construction_in_let_bindings() {
             "pub fn f(x: I32) -> I32 {\n    let a = [1, 2.5, x]\n    x\n}\n",
             &[("TYPE_MISMATCH", 1)],
         ),
+        // Elements check in source order: an anchor early in the array
+        // resolves a literal variable before its later uses are checked.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let n = 2 + 3\n    let a = [x, n, -n]\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = 1\n    let b = 2\n    let arr = [a, b, a]\n    x\n}\n",
+            &[],
+        ),
     ];
     for (source, code_counts) in cases {
         let output = run_check(source, "", &[], &[]);
