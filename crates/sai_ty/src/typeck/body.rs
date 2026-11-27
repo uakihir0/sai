@@ -1820,6 +1820,37 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // operator's own diagnostic (spec 6.8.2) — but only once the
             // right operand is known to carry the same type.
             if matches!(left_type, PrimTy::Byte | PrimTy::Char | PrimTy::Bool) {
+                if let ExprKind::Lit(literal) = right.kind
+                    && let Some(found) = primitive_literal_kind(literal)
+                {
+                    // A literal right operand checks against the left
+                    // operand's type first (spec 6.8.2): the same-primitive
+                    // literal forms the operation, so the operator's own
+                    // diagnostic reports; other literals mismatch — integer
+                    // literals do not check against `Byte`/`Char`.
+                    let same_primitive_literal = matches!(
+                        (left_type, found),
+                        (PrimTy::Byte, PrimitiveLiteralKind::Byte)
+                            | (PrimTy::Char, PrimitiveLiteralKind::Character)
+                            | (PrimTy::Bool, PrimitiveLiteralKind::Bool)
+                    );
+                    if same_primitive_literal {
+                        self.report_operator_not_supported(
+                            expression,
+                            BinOp::Rem,
+                            PrimitiveOperatorOperand::Concrete(left_type),
+                        );
+                    } else {
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected: left_type,
+                                found,
+                            },
+                        });
+                    }
+                    return Ok(LocalType::Concrete(left_type));
+                }
                 let right_type = self
                     .check_operand_local_type(right)
                     .ok()
@@ -2037,17 +2068,41 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .filter(|primitive| supports_primitive_literal(*primitive))
             .ok_or(())?;
         if let ExprKind::Lit(literal) = right.kind {
-            if !is_integer_primitive(left_type)
-                || primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer)
-            {
+            let Some(found) = primitive_literal_kind(literal) else {
+                return Err(());
+            };
+            if !is_integer_primitive(left_type) || found != PrimitiveLiteralKind::Integer {
+                // Wrapping arithmetic is integer-only (spec 6.8.3), so a
+                // non-integer left operand reaches the operator's own
+                // diagnostic once the literal right operand checks against
+                // its type — the same ordering as plain arithmetic.
+                if matches!(left_type, PrimTy::Byte | PrimTy::Char | PrimTy::Bool) {
+                    let same_primitive_literal = matches!(
+                        (left_type, found),
+                        (PrimTy::Byte, PrimitiveLiteralKind::Byte)
+                            | (PrimTy::Char, PrimitiveLiteralKind::Character)
+                            | (PrimTy::Bool, PrimitiveLiteralKind::Bool)
+                    );
+                    if same_primitive_literal {
+                        self.report_operator_not_supported(
+                            expression,
+                            operator,
+                            PrimitiveOperatorOperand::Concrete(left_type),
+                        );
+                    } else {
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected: left_type,
+                                found,
+                            },
+                        });
+                    }
+                    return Ok(LocalType::Concrete(left_type));
+                }
                 return Err(());
             }
-            self.check_annotated_literal(
-                left_type,
-                literal,
-                PrimitiveLiteralKind::Integer,
-                right.hir_id,
-            );
+            self.check_annotated_literal(left_type, literal, found, right.hir_id);
             return Ok(LocalType::Concrete(left_type));
         }
         // `p +% x` resolves an unresolved integer literal variable on the
