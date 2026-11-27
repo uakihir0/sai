@@ -11721,6 +11721,12 @@ fn public_unit_return_discards_tail_values() {
         "pub fn f(x: Str) { let y = x\ny }\n",
         "pub fn f(x: I32) { x + 1\nx }\n",
         "pub fn f(x: I32) { let y = x\n() }\n",
+        "pub fn f(x: I32) { if x < 10 { x + 1 } else { x } }\n",
+        "pub fn f(x: I32) { if x < 10 { x + 1 } }\n",
+        "pub fn f(x: I32) { if x < 10 { let y = x + 1\ny } else { x * 2 } }\n",
+        "pub fn f(x: I32) { if x < 10 { x + 1 } else if x > 20 { x * 2 } else { x } }\n",
+        "pub fn f(x: I32) { match x { 0 => x + 1, _ => x } }\n",
+        "pub fn f(x: U8) { match x { 0..=127 => x + 1, 128..=255 => x } }\n",
         "pub fn f() { let x = 1\n() }\n",
         "pub fn f(x: Bool, y: Bool) { if not (x or y) { 1 } else { 2 } }\n",
         "pub fn f(x: I32, y: I32) { if x < y { 1 } else { 2 } }\n",
@@ -11759,6 +11765,14 @@ fn public_unit_return_discard_errors_are_diagnosed() {
         ("pub fn f(x: I32) { x + 1.5 }\n", "TYPE_MISMATCH"),
         ("pub fn f(x: I32) { let y = x + 1.5\ny }\n", "TYPE_MISMATCH"),
         ("pub fn f(x: I32) { let y: I64 = x\ny }\n", "TYPE_MISMATCH"),
+        (
+            "pub fn f(x: I32) { if x < 10 { x + 1.5 } else { x } }\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub fn f(x: I32) { match x { 0 => x + 1.5, _ => x } }\n",
+            "TYPE_MISMATCH",
+        ),
     ] {
         let output = run_check(source, "", &[], &[]);
         let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
