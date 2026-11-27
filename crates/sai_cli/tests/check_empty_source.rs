@@ -10345,9 +10345,7 @@ fn primitive_arithmetic_local_literal_range_uses_the_selected_pointer_width() {
 #[test]
 fn unsupported_primitive_add_local_literal_shapes_remain_gated() {
     for source in [
-        "pub fn fixed_literal(value: I32) -> I32 {\n    let result = value + true\n    result\n}\n",
         "pub fn fixed_literal_left(value: I32) -> I32 {\n    let result = true + value\n    result\n}\n",
-        "pub fn byte_path(value: Byte) -> Byte {\n    let result = value + 1\n    result\n}\n",
         "pub fn forward(value: I32) -> I32 {\n    let result = later + 1\n    let later = value\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10524,9 +10522,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn float_mul() -> F64 {\n    let result = 1.0 * 2.0\n    result\n}\n",
         "pub fn mixed_mul() -> I64 {\n    let result = 1 * 2.0\n    result\n}\n",
         "type IntegerAlias = I32\npub fn remainder_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left % right\n    result\n}\n",
-        "pub fn remainder_byte(left: Byte, right: Byte) -> Byte {\n    let result = left % right\n    result\n}\n",
-        "pub fn remainder_bool(left: Bool, right: Bool) -> Bool {\n    let result = left % right\n    result\n}\n",
-        "pub fn remainder_char(left: Char, right: Char) -> Char {\n    let result = left % right\n    result\n}\n",
         "pub fn remainder_byte_rhs(left: I32, right: Byte) -> I32 {\n    let result = left % right\n    result\n}\n",
         "pub fn remainder_bool_rhs(left: I32, right: Bool) -> I32 {\n    let result = left % right\n    result\n}\n",
         "pub fn remainder_char_rhs(left: I32, right: Char) -> I32 {\n    let result = left % right\n    result\n}\n",
@@ -10556,11 +10551,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn wrapping_integer_literal_non_integer_path(left: F32) -> F32 {\n    let result = left +% 1\n    result\n}\n",
         "type IntegerAlias = I32\npub fn wrapping_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left +% right\n    result\n}\n",
         "type IntegerAlias = I32\npub fn wrapping_left_alias(right: IntegerAlias) -> IntegerAlias {\n    let result = 1 +% right\n    result\n}\n",
-        "pub fn byte(left: Byte, right: Byte) -> Byte {\n    let result = left - right\n    result\n}\n",
-        "pub fn char(left: Char, right: Char) -> Char {\n    let result = left * right\n    result\n}\n",
-        "pub fn bool(left: Bool, right: Bool) -> Bool {\n    let result = left - right\n    result\n}\n",
-        "pub fn byte_div(left: Byte, right: Byte) -> Byte {\n    let result = left / right\n    result\n}\n",
-        "pub fn bool_div(left: Bool, right: Bool) -> Bool {\n    let result = left / right\n    result\n}\n",
         "type IntegerAlias = I32\npub fn alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left * right\n    result\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let result = later * left\n    let later: I32 = 1\n    result\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let result = result - left\n    result\n}\n",
@@ -10569,15 +10559,7 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 
-    for source in [
-        "pub fn div_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left / right) / left\n    result\n}\n",
-        "pub fn div_nested_right(left: I32, right: I32) -> I32 {\n    let result = left / (right / 1)\n    result\n}\n",
-        "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
-        "pub fn remainder_nested_right(left: I32, right: I32) -> I32 {\n    let result = left % (right % 1)\n    result\n}\n",
-        "pub fn remainder_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left % right) % left\n    result\n}\n",
-        "pub fn wrapping_left_nested(right: I32) -> I32 {\n    let result = (1 +% right) +% right\n    result\n}\n",
-        "pub fn wrapping_nested(left: I32, right: I32) -> I32 {\n    let result = left +% (right +% left)\n    result\n}\n",
-    ] {
+    for source in [] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
 
@@ -10659,9 +10641,6 @@ fn primitive_add_diagnostics_follow_source_order_after_shadowed_binding_resoluti
 #[test]
 fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn add(left: Byte, right: Byte) -> Byte {\n    let sum = left + right\n    sum\n}\n",
-        "pub fn add(left: Char, right: Char) -> Char {\n    let sum = left + right\n    sum\n}\n",
-        "pub fn add(left: Bool, right: Bool) -> Bool {\n    let sum = left + right\n    sum\n}\n",
         "type IntegerAlias = I32\npub fn add(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let sum = left + right\n    sum\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let sum = later + left\n    let later: I32 = 1\n    sum\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let sum = sum + left\n    sum\n}\n",
@@ -11185,7 +11164,6 @@ fn primitive_logical_non_bool_annotation_reports_and_recovers_as_bool() {
 #[test]
 fn unsupported_primitive_logical_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and right + true\n    result\n}\n",
         "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = left and later\n    let later: Bool = right\n    result\n}\n",
         "pub fn logical(right: Bool) -> Bool {\n    let result = result and right\n    result\n}\n",
         "pub fn logical(right: Bool) -> Bool {\n    let result = missing and right\n    result\n}\n",
@@ -12226,7 +12204,6 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose(value: I32) -> I32 { match value { _ => 1 }\n 0 }\n",
         "pub fn choose(flag: Bool) -> I32 { var x = 1\n x += flag\n x }\n",
         "pub fn choose() -> I32 { var a = 1\n    var b = 2.5\n    let sum = a + b\n    sum\n }\n",
-        "pub fn choose() -> Bool { var a = true\n    var b = false\n    a + b\n }\n",
         "pub fn choose() -> F64 { var x = 0.5\n    var y = 0.25\n    x %= y\n    x\n }\n",
         "pub fn choose() -> I32 { var x = 0.5\n    let rem = 1 % x\n    rem\n }\n",
         "pub fn choose(value: I32) -> I32 { var c = 0.5\n    let r = value << c\n    r\n }\n",
@@ -26250,4 +26227,79 @@ fn const_reference_in_str_body_mismatch_reports() {
         !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
         "const type mismatches are diagnosed, not gated: {stdout}"
     );
+}
+
+#[test]
+fn non_numeric_primitive_arithmetic_is_an_operator_diagnostic() {
+    // `Byte`, `Char` and `Bool` have no arithmetic (spec 6.8.3): same-type
+    // operations are `OPERATOR_NOT_SUPPORTED`, and a differently typed or
+    // integer-literal right operand mismatches the left operand's type
+    // first (spec 6.8.2).
+    for (source, code) in [
+        (
+            "pub fn f(b: Byte, c: Byte) -> Byte { b + c }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(b: Byte, c: Byte) -> Byte { b - c }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(b: Byte, c: Byte) -> Byte { b * c }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(b: Byte, c: Byte) -> Byte { b / c }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(b: Byte, c: Byte) -> Byte { b % c }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(x: Bool, y: Bool) -> Bool { x + y }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(c: Char, d: Char) -> Char { c - d }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(b: Byte) -> Byte { b + b'a' }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(x: Bool) -> Bool { x + true }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        ("pub fn f(b: Byte) -> Byte { b + 1 }\n", "TYPE_MISMATCH"),
+        (
+            "pub fn f(b: Byte, x: I32) -> Byte { b + x }\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub fn f(b: Byte, x: I32) -> Byte { b % x }\n",
+            "TYPE_MISMATCH",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("FEATURE_NOT_IMPLEMENTED"),
+            "expected {code} without a result or feature gate:\n{stdout}"
+        );
+    }
+    // Byte bitwise operations and shifts are built-in (spec 6.8.4).
+    for source in [
+        "pub fn f(b: Byte, c: Byte) -> Byte { b & c }\n",
+        "pub fn f(b: Byte, c: Byte) -> Byte { b | c }\n",
+        "pub fn f(b: Byte, c: Byte) -> Byte { b ^ c }\n",
+        "pub fn f(b: Byte) -> Byte { b << 1 }\n",
+        "pub fn f(b: Byte) -> Byte { ~b }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
 }

@@ -1559,6 +1559,50 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let Some(expected) =
                 primitive_arithmetic_literal_expected_type(operator, left_type, found)
             else {
+                // A concrete non-arithmetic left operand (`Byte`/`Char`/
+                // `Bool`): a literal of that same primitive still forms the
+                // operation, so the operator's own diagnostic reports;
+                // other literals mismatch the operand type first — integer
+                // literals do not check against `Byte`/`Char` (spec 6.8.2).
+                if !is_arithmetic_primitive(left_type)
+                    && matches!(left_type, PrimTy::Byte | PrimTy::Char | PrimTy::Bool)
+                {
+                    let same_primitive_literal = matches!(
+                        (left_type, found),
+                        (PrimTy::Byte, PrimitiveLiteralKind::Byte)
+                            | (PrimTy::Char, PrimitiveLiteralKind::Character)
+                            | (PrimTy::Bool, PrimitiveLiteralKind::Bool)
+                    );
+                    if same_primitive_literal {
+                        self.report_operator_not_supported(
+                            expression,
+                            operator,
+                            PrimitiveOperatorOperand::Concrete(left_type),
+                        );
+                    } else {
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected: left_type,
+                                found,
+                            },
+                        });
+                    }
+                    return Ok(LocalType::Concrete(left_type));
+                }
+                if is_arithmetic_primitive(left_type) {
+                    // The literal kinds the operator family never accepts
+                    // (`Bool`/`Byte`/`Char` literals) mismatch the numeric
+                    // left operand's type directly.
+                    self.errors.push(PrimitiveBodyError {
+                        node: right.hir_id,
+                        kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                            expected: left_type,
+                            found,
+                        },
+                    });
+                    return Ok(LocalType::Concrete(left_type));
+                }
                 return Err(());
             };
             self.check_annotated_literal(expected, literal, found, right.hir_id);
@@ -1602,7 +1646,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // operand, so recover with that type after a right mismatch.
                 Ok(LocalType::Concrete(left_type))
             }
-            PrimitiveArithmeticResult::Unsupported => Err(()),
+            PrimitiveArithmeticResult::Unsupported => {
+                // Both operand types are concrete primitives, so the gate
+                // is only the operator's own definition (spec 6.8.2): the
+                // right operand first checks against the left operand's
+                // type, then arithmetic on the non-numeric primitives
+                // (`Byte`/`Char`/`Bool`) is the operator diagnostic.
+                if left_type != right_type {
+                    self.errors.push(PrimitiveBodyError {
+                        node: right.hir_id,
+                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                            expected: left_type,
+                            found: right_type,
+                        },
+                    });
+                } else {
+                    self.report_operator_not_supported(
+                        expression,
+                        operator,
+                        PrimitiveOperatorOperand::Concrete(left_type),
+                    );
+                }
+                Ok(LocalType::Concrete(left_type))
+            }
         }
     }
 
@@ -1750,6 +1816,33 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .and_then(|local_type| self.concrete_local_type(local_type))
             .ok_or(())?;
         if !is_arithmetic_primitive(left_type) {
+            // `%` is arithmetic, so the non-numeric primitives report the
+            // operator's own diagnostic (spec 6.8.2) — but only once the
+            // right operand is known to carry the same type.
+            if matches!(left_type, PrimTy::Byte | PrimTy::Char | PrimTy::Bool) {
+                let right_type = self
+                    .check_operand_local_type(right)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type));
+                if let Some(right_type) = right_type {
+                    if right_type != left_type {
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                expected: left_type,
+                                found: right_type,
+                            },
+                        });
+                    } else {
+                        self.report_operator_not_supported(
+                            expression,
+                            BinOp::Rem,
+                            PrimitiveOperatorOperand::Concrete(left_type),
+                        );
+                    }
+                    return Ok(LocalType::Concrete(left_type));
+                }
+            }
             return Err(());
         }
 

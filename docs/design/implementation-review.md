@@ -11227,3 +11227,22 @@ also learned `loop`/`break`/`continue`/`return` tails. The driver's
 statement-`if` shape mirror no longer gates branch contents — admission
 is a safe superset because the kernel's `Err` falls back to the
 validators — and unit-mode bodies admit non-`loop` loop tails.
+
+## IR-1201: Arithmetic on the non-numeric primitives is the operator diagnostic
+
+**Slice.** `Byte`, `Char` and `Bool` have no arithmetic (spec 6.8.3), so
+operations on them now report `OPERATOR_NOT_SUPPORTED` instead of gating:
+`b + c` on two `Byte` parameters, `x + true` on `Bool`, `c - d` on
+`Char`, and `%`/`+`/`-`/`*`/`/` in every combination. The spec's operand
+ordering (spec 6.8.2) is preserved: a differently typed right operand —
+including an integer literal, which cannot check against `Byte`/`Char` —
+reports `TYPE_MISMATCH` against the left operand's type first (`b + 1`
+and `b + x` with `x: I32`). `Byte` bitwise operations and shifts remain
+built-in per spec 6.8.4.
+
+**Implementation.** The kernel's concrete-concrete arithmetic result
+site no longer gates `Unsupported` type pairs: mismatched pairs report
+the right operand against the left, and same-type non-arithmetic pairs
+report the operator diagnostic. The same rule applies in the remainder
+and literal-operand paths. The driver's `OPERATOR_NOT_SUPPORTED`
+translation learned the arithmetic operators.
