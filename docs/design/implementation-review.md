@@ -11299,3 +11299,13 @@ counts and messages. CLI admission of package-private inherent
 methods is a separate follow-up slice: their shape gates expose a
 wide range of previously untested `self`-receiver forms that need
 their own rebaselining pass.
+
+Two boundary rules hold the slice sound. Mixed sources (functions
+plus `const` or type items) admit package-private functions on the
+same footing — visibility is irrelevant there too. And an exported
+`export fn` whose signature uses a non-scalar type (`Str` is the only
+one the supported slice can express) stays gated: spec 12.8 item 1
+requires `EXPORT_FN_NON_SCALAR` for boundary-violating export
+signatures in core-module builds, and that diagnostic is not
+implemented yet, so the conservative gate keeps the invalid program
+from passing silently. Scalar-only exports check like any function.
