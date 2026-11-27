@@ -18510,6 +18510,10 @@ fn primitive_body_errors_to_diagnostics(
             }
             PrimitiveBodyErrorKind::OperatorNotSupported { operator, operand } => {
                 let operator_text = match operator {
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::Div => "/",
                     BinOp::Rem => "%",
                     BinOp::WrapAdd => "+%",
                     BinOp::WrapSub => "-%",
@@ -18532,8 +18536,21 @@ fn primitive_body_errors_to_diagnostics(
                         )
                     }
                 };
+                let float_remainder = operator == BinOp::Rem
+                    && matches!(
+                        operand,
+                        PrimitiveOperatorOperand::FloatingPointLiteral
+                            | PrimitiveOperatorOperand::Concrete(
+                                sai_resolve::prelude::PrimTy::F32
+                                    | sai_resolve::prelude::PrimTy::F64
+                            )
+                    );
                 let label = match operator {
-                    BinOp::Rem => "floating-point remainder is not supported",
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        "arithmetic is not supported for this primitive"
+                    }
+                    BinOp::Rem if float_remainder => "floating-point remainder is not supported",
+                    BinOp::Rem => "remainder is not supported for this primitive",
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
                         "wrapping arithmetic is not supported for this primitive"
                     }
@@ -18552,7 +18569,7 @@ fn primitive_body_errors_to_diagnostics(
                     message,
                     label,
                 )?;
-                if operator == BinOp::Rem {
+                if float_remainder {
                     diagnostic
                         .push_child(Child {
                             kind: ChildKind::Help,
@@ -82179,6 +82196,19 @@ property "shared"() {}
             "float_mismatch",
             &[sai_diagnostics::Code::TypeMismatch],
         );
+        // `Bool`/`Byte`/`Char` have no remainder operation (spec 6.8.3):
+        // same-type primitive operand pairs diagnose the operator.
+        for name in [
+            "remainder_path_pair_bool_operands_unsupported",
+            "remainder_path_pair_byte_operands_unsupported",
+            "remainder_path_pair_char_operands_unsupported",
+        ] {
+            assert_supported(
+                &database,
+                name,
+                &[sai_diagnostics::Code::OperatorNotSupported],
+            );
+        }
         for name in [
             "generic_call",
             "shadowed_call",
@@ -82200,9 +82230,6 @@ property "shared"() {}
             "remainder_path_pair_unresolved_right_unsupported",
             "remainder_path_pair_self_right_unsupported",
             "remainder_path_pair_forward_right_unsupported",
-            "remainder_path_pair_bool_operands_unsupported",
-            "remainder_path_pair_byte_operands_unsupported",
-            "remainder_path_pair_char_operands_unsupported",
             "remainder_deep_nested_call_argument",
             "remainder_path_pair_deep_nested_unsupported",
             "remainder_generic_target_call_argument",
@@ -102880,7 +102907,7 @@ property "shared"() {}
         // Owner 57 (`a += b; b += a`) used to gate on the merge-cycle
         // check: root normalization makes the second merge a same-group
         // no-op, so it is genuinely supported now.
-        for index in [24, 32, 35, 42, 50, 53, 54, 56, 63, 67, 68, 72] {
+        for index in [24, 32, 35, 42, 50, 53, 56, 63, 67, 68, 72] {
             assert!(
                 matches!(
                     owners[index]
@@ -102891,6 +102918,17 @@ property "shared"() {}
                 "function owner {index} unexpectedly passed the literal-operand merge boundary"
             );
         }
+        // `var a = true; var b = false; a + b` infers both operands as
+        // `Bool`: arithmetic is not defined for `Bool` (spec 6.8.3), so
+        // the operation is diagnosed rather than gated.
+        assert!(matches!(
+            owners[54]
+                .body_type_check()
+                .expect("Bool arithmetic is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
+        ));
         // `x` merges under `y` at `y + x`, so the merge child precedes its
         // parent in declaration order — a per-index deferred pass would
         // skip the child's pending `-x` diagnostic.
@@ -103552,12 +103590,20 @@ property "shared"() {}
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
         ));
-        // `x += flag` gates exactly like `let t = x + flag`: a Bool operand
-        // is outside the admitted arithmetic shapes, so the desugared
-        // assignment is equivalently unsupported rather than diagnosed.
+        // `x += flag` desugars to `x = x + flag`: the Bool right operand
+        // mismatches the I32 left operand's type (spec 6.8.2 ordering),
+        // exactly like `let t = x + flag`.
+        assert!(matches!(
+            owners[6]
+                .body_type_check()
+                .expect("a Bool arithmetic operand is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
         // The nested-expression and unary right operands check through the
         // `let t = e` desugar like `let t = left + right`.
-        for index in [6, 8] {
+        for index in [8] {
             assert!(
                 matches!(
                     owners[index]
