@@ -8286,6 +8286,100 @@ fn collect_literal_unit_if_chain_tails<'a>(
     }
 }
 
+// `else if` chains in unit positions validate each link's condition
+// against whichever parameter it references (spec 6.14.1 chains nest to
+// the right): Bool literals need no validation, a Bool parameter path or
+// its negation is self-typed, and comparisons validate against the type
+// of the single parameter binding they reference through the shared
+// parameterized-condition machinery. Conditions referencing several
+// parameters or none gate.
+#[allow(clippy::too_many_arguments)]
+fn check_multi_param_unit_if_chain(
+    owner: &HirOwner<'_>,
+    tail: &HirExpr<'_>,
+    sig: sai_hir::body::FnSig<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let mut tails = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut current = tail;
+    loop {
+        let ExprKind::If { cond, then, els } = current.kind else {
+            return Ok(None);
+        };
+        if then.safety != sai_hir::Safety::Safe || !then.stmts.is_empty() {
+            return Ok(None);
+        }
+        let condition_diagnostics = if matches!(cond.kind, ExprKind::Lit(Lit::Bool(_))) {
+            Some(Vec::new())
+        } else {
+            let mut found = None;
+            for (parameter, body_parameter) in sig.params.iter().zip(body.params.iter()) {
+                if let Some(validated) = validate_parameterized_if_condition(
+                    owner,
+                    cond,
+                    parameter,
+                    body_parameter,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )? {
+                    found = Some(validated);
+                    break;
+                }
+            }
+            found
+        };
+        let Some(condition_diagnostics) = condition_diagnostics else {
+            return Ok(None);
+        };
+        diagnostics.extend(condition_diagnostics);
+        tails.push(then.tail);
+        match els {
+            None => break,
+            Some(else_expr) => match else_expr.kind {
+                ExprKind::Block(else_block)
+                    if else_block.safety == sai_hir::Safety::Safe
+                        && else_block.stmts.is_empty() =>
+                {
+                    tails.push(else_block.tail);
+                    break;
+                }
+                ExprKind::If { .. } => current = else_expr,
+                _ => return Ok(None),
+            },
+        }
+    }
+    let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
+        owner,
+        &tails,
+        sig,
+        body,
+        locals,
+        type_paths,
+        const_path_types,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )?
+    else {
+        return Ok(None);
+    };
+    diagnostics.extend(tail_diagnostics);
+    Ok(Some(diagnostics))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_unit_discard_if_branch_tails(
     owner: &HirOwner<'_>,
@@ -8513,31 +8607,30 @@ fn check_function_body_shape_dispatch(
                     .is_some()
         });
         if tail_unit_return && parameters_resolve {
-            // `if` tails validate their branch tails through the literal
-            // chain collector; parameter-based conditions in multi-parameter
-            // bodies stay with the single-parameter arm below or gate.
-            if matches!(tail.kind, ExprKind::If { .. }) {
-                let mut tails = Vec::new();
-                if collect_literal_unit_if_chain_tails(tail, &mut tails)
-                    && let Some(tail_diagnostics) = check_unit_discard_if_branch_tails(
-                        owner,
-                        &tails,
-                        sig,
-                        body,
-                        locals,
-                        type_paths,
-                        const_path_types,
-                        symbols,
-                        inputs,
-                        snapshot,
-                        target_cfg,
-                    )?
-                {
-                    return Ok(FunctionBodyTypeCheck::Supported {
-                        diagnostics: tail_diagnostics,
-                    });
-                }
-            } else if let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
+            // `if` tails validate each chain link's condition against
+            // whichever parameter it references; conditions referencing
+            // several parameters or none stay with the arms below or gate.
+            if matches!(tail.kind, ExprKind::If { .. })
+                && let Some(tail_diagnostics) = check_multi_param_unit_if_chain(
+                    owner,
+                    tail,
+                    sig,
+                    body,
+                    locals,
+                    type_paths,
+                    const_path_types,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+            {
+                return Ok(FunctionBodyTypeCheck::Supported {
+                    diagnostics: tail_diagnostics,
+                });
+            }
+            if !matches!(tail.kind, ExprKind::If { .. })
+                && let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
                 owner,
                 tail,
                 false,
