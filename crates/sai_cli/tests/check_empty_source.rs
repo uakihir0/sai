@@ -11694,6 +11694,12 @@ fn public_unit_return_discards_tail_values() {
         "pub fn f() { [1 + 2, 3] }\n",
         "pub fn f() { ~1 }\n",
         "pub fn f() { b'a' & b'b' }\n",
+        "pub fn f(x: I32) { 1 }\n",
+        "pub fn f(x: I32) { (1, true) }\n",
+        "pub fn f(x: I32) { (x, 1) }\n",
+        "pub fn f(x: I32) { 1 + 2 }\n",
+        "pub fn str_param_to_unit(value: Str) -> () { value }\n",
+        "pub fn str_param_without_return(value: Str) { value }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -13071,8 +13077,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet valueName = 42\nvalueName\n}\n",
         "pub fn local() -> I32 {\nlet r#value = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet value = 42\nr#value\n}\n",
-        "pub fn str_param_to_unit(value: Str) -> () { value }\n",
-        "pub fn str_param_without_return(value: Str) { value }\n",
         "pub fn self_str_identity(self: Str) -> Str { self }\n",
         "type Text = Str\npub fn alias_str_identity(value: Text) -> Text { value }\n",
         "pub fn raw_str_identity(value: r#Str) -> r#Str { value }\n",

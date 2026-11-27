@@ -8476,6 +8476,44 @@ fn check_function_body_shape_dispatch(
             diagnostics: array_diagnostics,
         });
     }
+    // Unit-returning bodies discard a non-`if` tail of any shape (spec
+    // 6.11.1/6.25.2) regardless of parameter count — but only once every
+    // parameter type resolves in the direct fragment, since unresolvable
+    // or ill-formed parameter types make the signature itself invalid and
+    // must not pass silently.
+    if !sig.params.is_empty()
+        && sig.params.len() == body.params.len()
+        && block.stmts.is_empty()
+        && let Some(tail) = block.tail
+        && !matches!(tail.kind, ExprKind::If { .. })
+    {
+        let tail_unit_return = match sig.ret {
+            Some(return_ty) => matches!(
+                resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+                Some(FunctionDirectType::Unit)
+            ),
+            None => true,
+        };
+        // `self` parameters belong to methods, not free functions; they
+        // fall through to the method paths instead of validating here.
+        let parameters_resolve = sig.params.iter().all(|parameter| {
+            !parameter.is_self
+                && resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+                    .is_some()
+        });
+        if tail_unit_return
+            && parameters_resolve
+            && let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
+                owner, tail, false, false, sig, body, locals, symbols, inputs, snapshot,
+                type_paths, target_cfg,
+            )?
+        {
+            return Ok(FunctionBodyTypeCheck::Supported {
+                diagnostics: tail_diagnostics,
+            });
+        }
+    }
+
     let (parameter, parameter_pair) = match (sig.params, body.params) {
         ([], []) => (None, None),
         ([parameter], [body_parameter])
@@ -9463,7 +9501,7 @@ fn check_function_discarded_unit_tail(
             return Ok(Some((shape, diagnostics)));
         }
         ExprKind::Path(path)
-            if !in_composite
+            if !in_array_element
                 && path.root == PathRoot::Plain
                 && path.segments.len() == 1
                 && path.segments[0].args.is_none()
@@ -9477,9 +9515,12 @@ fn check_function_discarded_unit_tail(
             // it is valid on its own — but only when the parameter's type
             // resolves in the direct fragment: nominal or otherwise
             // unsupported parameter types gate the whole function rather
-            // than passing on name resolution alone. Inside composites it
-            // gates for the inference slice: array unification needs the
-            // binding's type, which direct-fragment shapes cannot carry.
+            // than passing on name resolution alone. Tuples type each
+            // element independently (spec 5.3), so parameter references in
+            // tuple positions are self-typed there as well; array positions
+            // gate for the inference slice because element unification
+            // needs the binding's type, which direct-fragment shapes
+            // cannot carry.
             let Some(position) = body.params.iter().position(|p| p.binding == *binding) else {
                 return Ok(None);
             };
@@ -9496,8 +9537,18 @@ fn check_function_discarded_unit_tail(
             let mut shapes = Vec::new();
             for element in elements {
                 let Some((shape, element_diagnostics)) = check_function_discarded_unit_tail(
-                    owner, element, false, true, sig, body, locals, symbols, inputs, snapshot,
-                    type_paths, target_cfg,
+                    owner,
+                    element,
+                    in_array_element,
+                    true,
+                    sig,
+                    body,
+                    locals,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    type_paths,
+                    target_cfg,
                 )?
                 else {
                     let mut literals = Vec::new();
