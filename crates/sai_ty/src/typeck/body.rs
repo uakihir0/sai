@@ -674,43 +674,39 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.default_unresolved_literals(literal_floor);
             return Ok(());
         };
-        // The unit literal trivially checks against `()`; the initializer
-        // synthesis has no composite tuple representation for it.
-        if matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
-            self.default_unresolved_literals(literal_floor);
-            return Ok(());
-        }
-        // `match` tails check arm-wise like the primitive tail walk, but
-        // arm bodies discard against `()` (spec 6.25.2): block bodies are
-        // unit-mode blocks, bare bodies synthesize without an expectation.
-        if let ExprKind::Match {
-            scrutinee,
-            arms,
-            source,
-        } = tail.kind
-        {
-            self.check_unit_match_tail(scrutinee, arms, source)?;
-            self.default_unresolved_literals(literal_floor);
-            return Ok(());
-        }
-        // `if` tails check branch-wise: each branch is itself a unit-mode
-        // block whose tail discards independently (spec 6.25.2) — no
-        // cross-branch unification. An omitted `else` is `{}`, which is
-        // trivially unit.
-        if let ExprKind::If { cond, then, els } = tail.kind {
-            self.check_if_condition(cond)?;
-            self.check_block_unit(then)?;
-            match els {
-                None => {}
-                Some(els) => self.check_unit_if_else_tail(els)?,
-            }
-            self.default_unresolved_literals(literal_floor);
-            return Ok(());
-        }
-        let check = self.check_initializer_value(tail, None)?;
-        self.record_expression_type(tail.hir_id, check.local_type);
+        self.check_unit_tail_expression(tail)?;
         self.default_unresolved_literals(literal_floor);
         Ok(())
+    }
+
+    /// One discarding tail in unit mode: the unit literal trivially
+    /// checks, `if`/`match` expressions check branch-wise (spec 6.25.2 —
+    /// no cross-branch unification), and everything else synthesizes
+    /// without an expectation so any resulting type is accepted.
+    fn check_unit_tail_expression(&mut self, tail: &'hir Expr<'hir>) -> Result<(), ()> {
+        if matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
+            return Ok(());
+        }
+        match tail.kind {
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => self.check_unit_match_tail(scrutinee, arms, source),
+            ExprKind::If { cond, then, els } => {
+                self.check_if_condition(cond)?;
+                self.check_block_unit(then)?;
+                match els {
+                    None => Ok(()),
+                    Some(els) => self.check_unit_if_else_tail(els),
+                }
+            }
+            _ => {
+                let check = self.check_initializer_value(tail, None)?;
+                self.record_expression_type(tail.hir_id, check.local_type);
+                Ok(())
+            }
+        }
     }
 
     /// `else`/`else if` chains in a unit tail: `else if` nests the same
@@ -806,9 +802,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         if let ExprKind::Block(block) = body.kind {
             return self.check_block_unit(block);
         }
-        let check = self.check_initializer_value(body, None)?;
-        self.record_expression_type(body.hir_id, check.local_type);
-        Ok(())
+        // Bare arm bodies discard exactly like unit tails, so nested
+        // `if`/`match` expressions check branch-wise instead of gating in
+        // the initializer synthesis.
+        self.check_unit_tail_expression(body)
     }
 
     fn check_block_expected(&mut self, block: &Block<'hir>, expected: PrimTy) -> Result<(), ()> {
