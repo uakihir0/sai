@@ -11405,3 +11405,33 @@ are admitted only so the checker can diagnose them.
 (`pub fn f() -> I32 { if 1 { 1 } else { 2 }\n0 }`) remain behind the
 gate: that whole shape is unimplemented even for valid programs, so
 the condition inside it is not yet reachable.
+
+## IR-1207: Cross-family compound assignments diagnose like plain assignments
+
+**Slice.** `x op= literal` desugars to `x = x op literal`, whose right
+operand checks against `x`'s type. On a literal-inferred variable
+(`var x = 1`) a literal of another family can never hold — integer
+literals unify only with integer types, float literals only with
+`F32`/`F64` (spec 6.3) — so `x += 2.5`, `x += true` and `x += "a"`
+report `TYPE_MISMATCH` instead of gating, exactly as the plain
+assignment `x = literal` does since IR-1205:
+
+```sai
+pub fn f() -> I32 {
+    var x = 1
+    x += 2.5   // TYPE_MISMATCH: expected `I64`, found a floating-point literal
+    x
+}
+```
+
+**Implementation.** The kernel's compound-assignment literal arm gained
+the same cross-family check as the plain assignment: the literal's
+family is compared to the variable's before the literal joins the
+resolution group as a constraint site, and a mismatch names the family
+default as the expected type. Same-family literals keep the existing
+operator-aware behavior (`x %= 2.5` on a float variable still reports
+the missing `%` implementation).
+
+**Bounded slice.** Same as IR-1205: the expected type name can be
+imprecise when a later use would have resolved the variable to a
+non-default type; the error itself is resolution-independent.

@@ -5238,6 +5238,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let Some(variable) = self.literal_variables.get(id) else {
                 return Err(());
             };
+            if primitive_literal_kind(literal) != Some(variable.kind) {
+                // `x op= literal` desugars to `x = x op literal`, whose
+                // right operand checks against `x`'s type — and a literal
+                // of another family never unifies with the variable's
+                // family (spec 6.3), so the compound assignment mismatches
+                // no matter which type the variable later resolves to.
+                // The expected side names the family default like the
+                // plain-assignment recovery does.
+                self.errors.push(PrimitiveBodyError {
+                    node: rhs.hir_id,
+                    kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                        expected: ScalarType::Primitive(literal_variable_default_type(
+                            variable.kind,
+                        )),
+                        found: scalar_literal_kind(literal),
+                    },
+                });
+                self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+                self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                self.record_expression_type(stmt_id, LocalType::LiteralVariable(id));
+                return Ok(());
+            }
             match variable.kind {
                 PrimitiveLiteralKind::Integer => {
                     self.add_integer_literal_constraint(id, literal, rhs.hir_id)?;
