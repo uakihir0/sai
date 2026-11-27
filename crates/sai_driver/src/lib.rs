@@ -82331,9 +82331,6 @@ property "shared"() {}
             "shift_integer_literal_rhs_unary_computed_unsupported",
             "shift_integer_literal_rhs_string_unsupported",
             "shift_integer_literal_rhs_byte_string_unsupported",
-            "shift_integer_byte_rhs_local_initializer_unsupported",
-            "shift_path_byte_rhs_local_initializer_unsupported",
-            "shift_byte_literal_rhs_local_initializer_unsupported",
             "shift_byte_rhs_computed_left_unsupported",
             "shift_byte_rhs_computed_right_unsupported",
             "shift_byte_rhs_deep_nested_unsupported",
@@ -82342,7 +82339,6 @@ property "shared"() {}
             "shift_byte_rhs_byte_string_unsupported",
             "shift_byte_literal_lhs_string_rhs_unsupported",
             "shift_byte_literal_lhs_byte_string_rhs_unsupported",
-            "shift_scalar_literal_rhs_local_initializer_unsupported",
             "shift_integer_literal_lhs_path_rhs_computed_unsupported",
             "shift_integer_literal_lhs_computed_path_rhs_unsupported",
             "shift_integer_literal_lhs_deep_nested_unsupported",
@@ -82475,6 +82471,7 @@ property "shared"() {}
                 };
                 assert_supported(&database, name, &expected);
             }
+
             assert!(
                 matches!(
                     owner_named(&database, &resolved, name)
@@ -82499,6 +82496,38 @@ property "shared"() {}
         // Literal-variable shift operands now join: unresolved integer
         // literal-variable counts resolve to U32 and literal-variable left
         // operands keep the shift result unresolved.
+        // `1 << b'x'` in a local initializer — a byte literal count can
+        // never unify with the `U32` shift-count type (spec 6.8.5), so the
+        // shift reports its mismatch instead of gating.
+        // Non-integer literal shift counts in local initializers — byte,
+        // bool, char, and float literals never unify with the `U32` count
+        // type (spec 6.8.5), so each reports its mismatch.
+        for (name, count) in [
+            ("shift_path_byte_rhs_local_initializer_unsupported", 1),
+            ("shift_byte_literal_rhs_local_initializer_unsupported", 1),
+            ("shift_scalar_literal_rhs_local_initializer_unsupported", 3),
+        ] {
+            assert!(
+                matches!(
+                    owner_named(&database, &resolved, name)
+                        .body_type_check()
+                        .expect("a non-integer literal shift count is diagnosed"),
+                    FunctionBodyTypeCheck::Supported { diagnostics }
+                        if diagnostics.len() == count
+                            && diagnostics.iter().all(|diagnostic| diagnostic.code
+                                == sai_diagnostics::Code::TypeMismatch)
+                ),
+                "`{name}` should report its shift-count mismatch"
+            );
+        }
+        assert!(matches!(
+            owner_named(&database, &resolved, "shift_integer_byte_rhs_local_initializer_unsupported")
+                .body_type_check()
+                .expect("a non-integer literal shift count is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
         for name in [
             "shift_unresolved_local_unsupported",
             "shift_unresolved_left_local_unsupported",

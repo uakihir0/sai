@@ -4545,7 +4545,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     } else if matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
                         self.check_bitwise(operator, left, right, expression.hir_id)?
                     } else if matches!(operator, BinOp::Shl | BinOp::Shr) {
-                        self.check_shift(operator, left, right, expression.hir_id, false)?
+                        self.check_shift(operator, left, right, expression.hir_id, true)?
                     } else if matches!(operator, BinOp::And | BinOp::Or) {
                         self.check_logical(operator, left, right)?
                     } else {
@@ -5310,7 +5310,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                 self.check_bitwise(op, lhs, rhs, stmt_id)?
             }
-            BinOp::Shl | BinOp::Shr => self.check_shift(op, lhs, rhs, stmt_id, false)?,
+            BinOp::Shl | BinOp::Shr => self.check_shift(op, lhs, rhs, stmt_id, true)?,
             BinOp::And | BinOp::Or => self.check_logical(op, lhs, rhs)?,
             _ => self.check_comparison(op, lhs, rhs)?,
         };
@@ -6064,7 +6064,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             result
                         }
                     } else if matches!(operator, BinOp::Shl | BinOp::Shr) {
-                        let result = self.check_shift(operator, left, right, init.hir_id, false)?;
+                        let result = self.check_shift(operator, left, right, init.hir_id, true)?;
                         if let Some(expected) = annotation {
                             self.check_annotated_path(result, expected, init.hir_id)?;
                             LocalType::Concrete(expected)

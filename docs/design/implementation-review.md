@@ -11435,3 +11435,23 @@ the missing `%` implementation).
 **Bounded slice.** Same as IR-1205: the expected type name can be
 imprecise when a later use would have resolved the variable to a
 non-default type; the error itself is resolution-independent.
+
+## IR-1208: Non-integer shift count literals diagnose in every position
+
+**Slice.** A shift's right operand checks against `U32` (spec 6.8.5),
+so a non-integer literal count — `x << true`, `x << 2.5` — is always a
+type error: Bool/float/Char/Byte literals never unify with `U32`. The
+kernel already diagnosed this in call-argument position; the same
+check now applies in tail, initializer, and compound-assignment
+positions instead of gating:
+
+```sai
+pub fn f(x: I32) -> I32 {
+    x << true   // TYPE_MISMATCH: expected `U32`, found a Bool literal
+}
+```
+
+**Implementation.** `check_shift`'s non-integer-literal arm already
+produced the `U32` mismatch through `check_annotated_literal`; the
+three remaining call sites simply opt into it. Integer literal counts
+keep joining the inference group unchanged.
