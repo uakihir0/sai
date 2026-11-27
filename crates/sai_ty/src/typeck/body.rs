@@ -13,7 +13,7 @@ use sai_hir::expressions::{
     Arm, BinOp, Block, Expr, ExprKind, Label, LoopSource, MatchSource, Stmt, StmtKind, UnOp,
 };
 use sai_hir::literals::Lit;
-use sai_hir::patterns::{BindingMode, PatKind, PatRangeEnd};
+use sai_hir::patterns::{BindingMode, Pat, PatKind, PatRangeEnd};
 use sai_hir::types::PathRoot;
 use sai_hir::{BindingId, HirId, OwnerId, Safety, Symbol};
 use sai_intern::Interner;
@@ -3983,7 +3983,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
-        if !catch_all && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true)) {
+        if !catch_all
+            && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true))
+            && !integer_patterns_cover_domain(arms, scrutinee_type)
+        {
             self.errors.push(PrimitiveBodyError {
                 node: scrutinee.hir_id,
                 kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
@@ -5934,7 +5937,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
-        if !catch_all && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true)) {
+        if !catch_all
+            && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true))
+            && !integer_patterns_cover_domain(arms, scrutinee_type)
+        {
             self.errors.push(PrimitiveBodyError {
                 node: scrutinee.hir_id,
                 kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
@@ -6281,7 +6287,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.restore_arm_binding(&mut arm_binding);
             body_result?;
         }
-        if !catch_all && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true)) {
+        if !catch_all
+            && !(scrutinee_type == PrimTy::Bool && bool_cover == (true, true))
+            && !integer_patterns_cover_domain(arms, scrutinee_type)
+        {
             self.errors.push(PrimitiveBodyError {
                 node: scrutinee.hir_id,
                 kind: PrimitiveBodyErrorKind::NonExhaustiveMatch,
@@ -10588,4 +10597,138 @@ fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
         kind,
         PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::Byte
     )
+}
+
+/// Integer-domain exhaustiveness (§6.22.2): unguarded literal and range
+/// patterns cover the scrutinee type's whole domain when the union of
+/// their intervals spans every domain interval. Const-path patterns and
+/// bounds are opaque to this pass and contribute nothing — a match that
+/// needs them for coverage keeps the catch-all requirement. `USize` and
+/// `ISize` domains are unbounded by design (the analysis must not depend
+/// on pointer width, §6.22.2) and finite patterns can never cover them.
+fn integer_patterns_cover_domain(arms: &[Arm<'_>], scrutinee_type: PrimTy) -> bool {
+    let Some(domain) = integer_domain_intervals(scrutinee_type) else {
+        return false;
+    };
+    let mut covering = Vec::new();
+    for arm in arms {
+        if arm.guard.is_some() {
+            continue;
+        }
+        collect_pattern_intervals(&arm.pat, &mut covering);
+    }
+    intervals_cover_domain(&domain, &mut covering)
+}
+
+fn integer_domain_intervals(scrutinee_type: PrimTy) -> Option<Vec<(i128, i128)>> {
+    let interval = |lo: i128, hi: i128| Some(vec![(lo, hi)]);
+    match scrutinee_type {
+        PrimTy::I8 => interval(i8::MIN as i128, i8::MAX as i128),
+        PrimTy::I16 => interval(i16::MIN as i128, i16::MAX as i128),
+        PrimTy::I32 => interval(i32::MIN as i128, i32::MAX as i128),
+        PrimTy::I64 => interval(i64::MIN as i128, i64::MAX as i128),
+        PrimTy::U8 => interval(u8::MIN as i128, u8::MAX as i128),
+        PrimTy::U16 => interval(u16::MIN as i128, u16::MAX as i128),
+        PrimTy::U32 => interval(u32::MIN as i128, u32::MAX as i128),
+        PrimTy::U64 => interval(u64::MIN as i128, u64::MAX as i128),
+        PrimTy::Byte => interval(0, 255),
+        PrimTy::Char => Some(vec![(0, 0xD7FF), (0xE000, 0x10FFFF)]),
+        _ => None,
+    }
+}
+
+/// Collects the inclusive integer intervals a pattern covers, in no
+/// particular order. Open range ends use the `i128` extremes as sentinels;
+/// the coverage sweep only tests them against the scrutinee domain, so the
+/// sentinels never need arithmetic. Anything opaque (const paths, compound
+/// patterns, bindings) contributes nothing.
+fn collect_pattern_intervals(pattern: &Pat<'_>, covering: &mut Vec<(i128, i128)>) {
+    match pattern.kind {
+        PatKind::Lit(literal) => {
+            if let Some(value) = integer_literal_value(literal) {
+                covering.push((value, value));
+            }
+        }
+        PatKind::Or(alternatives) => {
+            for alternative in alternatives {
+                collect_pattern_intervals(alternative, covering);
+            }
+        }
+        PatKind::Range {
+            start,
+            end,
+            inclusive,
+        } => {
+            let lo = match start {
+                None => i128::MIN,
+                Some(PatRangeEnd::Lit(literal)) => match integer_literal_value(literal) {
+                    Some(value) => value,
+                    None => return,
+                },
+                Some(PatRangeEnd::Path(_)) => return,
+            };
+            let hi = match end {
+                None => i128::MAX,
+                Some(PatRangeEnd::Lit(literal)) => match integer_literal_value(literal) {
+                    // `a..b` excludes `b`; `a..=b` includes it. The
+                    // subtraction cannot overflow: a `b` of `i128::MIN`
+                    // would make the range empty, which covers nothing
+                    // either way.
+                    Some(value) if inclusive => value,
+                    Some(value) => value - 1,
+                    None => return,
+                },
+                Some(PatRangeEnd::Path(_)) => return,
+            };
+            if lo <= hi {
+                covering.push((lo, hi));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn integer_literal_value(literal: Lit<'_>) -> Option<i128> {
+    match literal {
+        Lit::Int {
+            value: Some(value),
+            negated,
+        } => {
+            let value = i128::try_from(value).ok()?;
+            Some(if negated { -value } else { value })
+        }
+        Lit::Char(c) => Some(c as i128),
+        Lit::Byte(b) => Some(b as i128),
+        _ => None,
+    }
+}
+
+/// `domain` is a sorted list of disjoint inclusive intervals. Returns
+/// whether `covering`'s union spans every one of them. Domain highs are at
+/// most `u64::MAX`/`0x10FFFF`, so `hi + 1` never overflows `i128` for an
+/// in-domain `hi`; a covering `hi` beyond the domain high short-circuits.
+fn intervals_cover_domain(domain: &[(i128, i128)], covering: &mut [(i128, i128)]) -> bool {
+    covering.sort_unstable();
+    for &(dlo, dhi) in domain {
+        // `cursor` is the lowest not-yet-covered point of this interval.
+        let mut cursor = dlo;
+        let mut covered = false;
+        for &(lo, hi) in covering.iter() {
+            if hi < cursor {
+                continue;
+            }
+            if lo > cursor {
+                break;
+            }
+            if hi >= dhi {
+                covered = true;
+                break;
+            }
+            cursor = hi + 1;
+        }
+        if !covered {
+            return false;
+        }
+    }
+    true
 }

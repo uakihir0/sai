@@ -24898,6 +24898,97 @@ fn imported_const_patterns_in_primitive_match_check() {
 }
 
 #[test]
+fn integer_domain_coverage_in_primitive_match_checks() {
+    // Literal and range patterns whose union spans the scrutinee type's
+    // whole domain are exhaustive without a catch-all (§6.22.2) — in
+    // tail, statement, and unit-discard positions alike. Partial coverage
+    // still diagnoses NON_EXHAUSTIVE_MATCH.
+    let source = concat!(
+        "pub fn ranged(x: U8) -> I32 {
+",
+        "    match x {
+",
+        "        0..=127 => 1,
+",
+        "        128..=255 => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn open_ended(x: U8) -> I32 {
+",
+        "    match x {
+",
+        "        0..=200 => 1,
+",
+        "        201.. => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn negative(x: I8) -> I32 {
+",
+        "    match x {
+",
+        "        -128..=127 => 1,
+",
+        "    }
+",
+        "}
+",
+        "pub fn exclusive(x: U8) -> I32 {
+",
+        "    match x {
+",
+        "        0..5 => 1,
+",
+        "        5..=255 => 2,
+",
+        "    }
+",
+        "}
+",
+        "pub fn unit_tail(x: U8) {
+",
+        "    match x {
+",
+        "        0..=127 => 1,
+",
+        "        128..=255 => 2,
+",
+        "    }
+",
+        "}
+",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+
+    let output = run_check(
+        "pub fn partial(x: U8) -> I32 {
+    match x {
+        0..=100 => 1,
+    }
+}
+",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "partial coverage must fail the check:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"NON_EXHAUSTIVE_MATCH\""),
+        "partial coverage must diagnose NON_EXHAUSTIVE_MATCH:\n{stdout}"
+    );
+}
+
+#[test]
 fn const_range_endpoints_in_primitive_match_check() {
     // Scalar const paths can close both ends of a primitive range
     // pattern, including module-member paths. Their values remain opaque

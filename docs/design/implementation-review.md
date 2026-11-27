@@ -11148,6 +11148,18 @@ no-effect warning, and must-use discard diagnostics.
 
 **Remaining scope.** Tail-less statement bodies; branch-wise unit checking in the kernel; array-position unification in discards.
 
+## IR-1197: Integer-domain exhaustiveness in primitive matches
+
+**Decision.** Literal and range patterns in primitive matches now count toward exhaustiveness over integer domains (§6.22.2): a match whose unguarded pattern intervals span the scrutinee type's whole domain — `match x: U8 { 0..=127 => …, 128..=255 => … }` — is exhaustive without a catch-all, in tail, statement, and initializer positions alike (all three sites share the final coverage test). Open range ends use `i128` sentinel bounds; exclusive upper bounds subtract one. Char's two-interval domain is supported.
+
+**Reason.** The bounded admission already type-checked literal and range patterns against the scrutinee type; only the coverage accounting was missing, so valid full-domain matches misdiagnosed NON_EXHAUSTIVE_MATCH in every position. The sweep is interval-based, so correctness does not depend on domain size — an I64 full-coverage match would be accepted in principle, though no practical program can write one.
+
+**Failure boundary.** Const paths in pattern positions or as range bounds are opaque to coverage — a match needing them for exhaustiveness keeps the catch-all requirement rather than gating. `USize`/`ISize` domains are unbounded by design (the analysis must not depend on pointer width) and finite patterns can never cover them; open-ended ranges over them stay bounded-admission catch-all cases. Bool keeps its dedicated two-value coverage. Guarded arms never count.
+
+**Verification.** Probes accept `0..=127/128..=255` over U8, `-128..=127` over I8, open-ended `201..`, exclusive `0..5` pairs, single-arm full ranges, and unit-discard tails; partial coverage (`0..=100` alone, `1`/`2` over I32) still diagnoses NON_EXHAUSTIVE_MATCH. CLI suite extended.
+
+**Remaining scope.** Const-valued pattern coverage; enum/variant exhaustiveness; slice patterns.
+
 ## IR-1194: Const references in composite return elements
 
 **Decision.** Const paths and member-access const references in composite return element positions validate as self-typed values: the element type must match the const's declared type exactly, since concrete types do not coerce (spec 6.1). Matching accepts; mismatching diagnoses TYPE_MISMATCH at the element; consts absent from the direct-fragment index gate.
