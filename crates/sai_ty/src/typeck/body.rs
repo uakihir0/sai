@@ -5949,10 +5949,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// group. Composite elements, `Str` mixes and cross-family literal
     /// pairs without a concrete anchor stay gated for a later slice.
     fn check_array_literal_elements(&mut self, elements: &[Expr<'hir>]) -> Result<LocalType, ()> {
-        let mut join: Option<LocalType> = None;
+        // Check every element first, then seed the fold with the first
+        // concrete-ish element: inference does not depend on source
+        // order, so `[1, 2.5, x]` with `x: I32` constrains the literals
+        // against the anchor exactly like `[x, 1, 2.5]` does.
+        let mut element_types = Vec::with_capacity(elements.len());
         for element in elements {
-            let element_type = self.check_initializer_value(element, None)?.local_type;
-            join = Some(self.unify_array_element_type(join, element_type, element.hir_id)?);
+            element_types.push((
+                self.check_initializer_value(element, None)?.local_type,
+                element.hir_id,
+            ));
+        }
+        let mut join: Option<LocalType> = element_types.iter().find_map(|(element_type, _)| {
+            matches!(element_type, LocalType::Concrete(_) | LocalType::Str).then_some(*element_type)
+        });
+        for (element_type, node) in element_types {
+            join = Some(self.unify_array_element_type(join, element_type, node)?);
         }
         join.ok_or(())
     }
@@ -6056,28 +6068,96 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             (LocalType::LiteralVariable(left), LocalType::LiteralVariable(right)) => {
-                let left_kind = self
+                if left == right {
+                    // `[n, n]` — the same variable appears twice; merging
+                    // it into itself would cycle the merge chain.
+                    return Ok(LocalType::LiteralVariable(right));
+                }
+                let left_resolved = self
                     .literal_variables
                     .get(left)
-                    .map(|variable| variable.kind);
-                let right_kind = self
+                    .and_then(|variable| variable.resolved);
+                let right_resolved = self
                     .literal_variables
                     .get(right)
-                    .map(|variable| variable.kind);
-                if left_kind.is_some() && left_kind == right_kind {
-                    // Same literal family: merge into one inference group so
-                    // a later constraint resolves every element together.
-                    if let Some(variable) = self.literal_variables.get_mut(left) {
-                        if variable.merged_with.is_none() {
-                            variable.merged_with = Some(right);
+                    .and_then(|variable| variable.resolved);
+                match (left_resolved, right_resolved) {
+                    (Some(left_type), Some(right_type)) => {
+                        if left_type != right_type {
+                            self.errors.push(PrimitiveBodyError {
+                                node,
+                                kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                                    expected: ScalarType::Primitive(left_type),
+                                    found: ScalarType::Primitive(right_type),
+                                },
+                            });
+                        }
+                        Ok(LocalType::LiteralVariable(right))
+                    }
+                    // A resolved variable anchors the group like a concrete
+                    // element: the other side resolves against it so its
+                    // literal still range-checks (`[300, n]` at `U8`).
+                    (Some(left_type), None) => {
+                        if self.resolve_literal_variable(right, left_type).is_err() {
+                            let kind = self
+                                .literal_variables
+                                .get(right)
+                                .map(|variable| variable.kind)
+                                .unwrap_or(PrimitiveLiteralKind::Integer);
+                            self.errors.push(PrimitiveBodyError {
+                                node,
+                                kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                    expected: ScalarType::Primitive(left_type),
+                                    found: ScalarLiteralKind::Primitive(kind),
+                                },
+                            });
+                        }
+                        Ok(LocalType::LiteralVariable(right))
+                    }
+                    (None, Some(right_type)) => {
+                        if self.resolve_literal_variable(left, right_type).is_err() {
+                            let kind = self
+                                .literal_variables
+                                .get(left)
+                                .map(|variable| variable.kind)
+                                .unwrap_or(PrimitiveLiteralKind::Integer);
+                            self.errors.push(PrimitiveBodyError {
+                                node,
+                                kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                    expected: ScalarType::Primitive(right_type),
+                                    found: ScalarLiteralKind::Primitive(kind),
+                                },
+                            });
+                        }
+                        Ok(LocalType::LiteralVariable(right))
+                    }
+                    (None, None) => {
+                        let left_kind = self
+                            .literal_variables
+                            .get(left)
+                            .map(|variable| variable.kind);
+                        let right_kind = self
+                            .literal_variables
+                            .get(right)
+                            .map(|variable| variable.kind);
+                        if left_kind.is_some() && left_kind == right_kind {
+                            // Same literal family: merge into one inference
+                            // group so a later constraint resolves every
+                            // element together.
+                            if let Some(variable) = self.literal_variables.get_mut(left) {
+                                if variable.merged_with.is_none() {
+                                    variable.merged_with = Some(right);
+                                }
+                            }
+                            Ok(LocalType::LiteralVariable(right))
+                        } else {
+                            // Cross-family literal pairs can never hold;
+                            // without a concrete anchor there is no type to
+                            // name in the diagnostic yet, so the shape
+                            // stays gated.
+                            Err(())
                         }
                     }
-                    Ok(LocalType::LiteralVariable(right))
-                } else {
-                    // Cross-family literal pairs can never hold; without a
-                    // concrete anchor there is no type to name in the
-                    // diagnostic yet, so the shape stays gated.
-                    Err(())
                 }
             }
             // Composite elements (nested arrays, tuple elements) stay gated

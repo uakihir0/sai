@@ -27099,6 +27099,21 @@ fn tuple_and_array_literal_construction_in_let_bindings() {
             "pub fn f(x: I32) -> I32 {\n    let t = (x + 1.5, 2)\n    x\n}\n",
             &[("TYPE_MISMATCH", 1)],
         ),
+        // Repeated variables never self-merge; resolved variables anchor
+        // the group so their literals still range-check; anchors later in
+        // source order constrain earlier literals the same way.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let n = 5\n    let a = [n, n]\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn g(v: U8) -> U8 {\n    v\n}\npub fn f(x: I32) -> I32 {\n    let n = 5\n    let z = g(n)\n    let a = [300, n]\n    x\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [1, 2.5, x]\n    x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
     ];
     for (source, code_counts) in cases {
         let output = run_check(source, "", &[], &[]);
