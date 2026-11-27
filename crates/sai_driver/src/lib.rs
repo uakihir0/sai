@@ -8182,6 +8182,28 @@ fn check_function_body_type(
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
+    // An exported `export fn` of the root package in a core-module build
+    // must have a boundary-scalar signature (spec 12.8 item 1,
+    // `EXPORT_FN_NON_SCALAR`). That diagnostic is not implemented yet, so
+    // an export whose signature uses a non-scalar type — `Str` is the
+    // only one the supported slice can express — stays gated rather than
+    // passing silently. Scalar-only exports check like any function.
+    if item.vis == Visibility::Export {
+        let non_scalar = sig.params.iter().any(|parameter| {
+            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+                .is_some_and(|direct| !matches!(direct, FunctionDirectType::Primitive(_)))
+        }) || sig.ret.is_some_and(|ret| {
+            resolve_function_direct_type(*ret, type_paths, symbols, inputs).is_some_and(|direct| {
+                !matches!(
+                    direct,
+                    FunctionDirectType::Primitive(_) | FunctionDirectType::Unit
+                )
+            })
+        });
+        if non_scalar {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
+    }
     check_function_body_shape_dispatch(
         owner,
         sig,
