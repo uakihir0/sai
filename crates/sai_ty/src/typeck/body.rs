@@ -5057,9 +5057,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let Some(kind) = primitive_literal_kind(literal) else {
                         return Err(());
                     };
-                    if kind != PrimitiveLiteralKind::Integer {
-                        return Err(());
-                    }
+                    // A non-integer literal count can never unify with the
+                    // `U32` count type (spec 6.8.5), so
+                    // `check_annotated_literal` reports the mismatch rather
+                    // than the shape gating — same rule as `x << true`.
                     self.check_annotated_literal(PrimTy::U32, literal, kind, rhs.hir_id);
                 } else {
                     // A non-literal count checks as the desugared `let t =

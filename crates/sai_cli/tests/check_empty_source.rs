@@ -26746,6 +26746,26 @@ fn non_integer_shift_counts_are_diagnosed() {
             ),
             &[("TYPE_MISMATCH", 1)],
         ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x <<= true\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x >>= 2.5\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
         ("pub fn f(x: I32) -> I32 {\n    x << 2\n}\n", &[]),
         (
             concat!(
