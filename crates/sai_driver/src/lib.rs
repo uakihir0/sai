@@ -8338,6 +8338,52 @@ fn check_multi_param_unit_if_chain(
                     break;
                 }
             }
+            if found.is_none() && sig.params.len() == 2 && body.params.len() == 2 {
+                // Two-parameter conditions are self-typed when both operands
+                // are parameter paths of compatible types: logical operators
+                // need two `Bool` parameters, comparisons need two parameters
+                // of the same primitive type. Mixed-type comparisons gate
+                // rather than passing silently.
+                let comparison_condition = match cond.kind {
+                    ExprKind::Unary(UnOp::Not, operand) => operand,
+                    _ => cond,
+                };
+                let first_type =
+                    resolve_function_direct_type(*sig.params[0].ty, type_paths, symbols, inputs);
+                let second_type =
+                    resolve_function_direct_type(*sig.params[1].ty, type_paths, symbols, inputs);
+                let bool_type = Some(FunctionDirectType::Primitive(
+                    sai_resolve::prelude::PrimTy::Bool,
+                ));
+                let types_supported = match comparison_condition.kind {
+                    ExprKind::Binary(BinOp::And | BinOp::Or, _, _) => {
+                        first_type == bool_type && second_type == bool_type
+                    }
+                    ExprKind::Binary(
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+                        _,
+                        _,
+                    ) => matches!(
+                        (first_type, second_type),
+                        (
+                            Some(FunctionDirectType::Primitive(first)),
+                            Some(FunctionDirectType::Primitive(second))
+                        ) if first == second
+                    ),
+                    _ => false,
+                };
+                if types_supported
+                    && function_if_binary_condition_uses_parameter_bindings(
+                        comparison_condition,
+                        &body.params[0],
+                        &body.params[1],
+                        locals,
+                        inputs,
+                    )
+                {
+                    found = Some(Vec::new());
+                }
+            }
             found
         };
         let Some(condition_diagnostics) = condition_diagnostics else {

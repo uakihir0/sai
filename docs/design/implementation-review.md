@@ -11110,4 +11110,16 @@ no-effect warning, and must-use discard diagnostics.
 
 **Verification.** Probes accept `pub fn f(x: Bool, y: Bool) { if x { 1 } else { 2 } }`, negations, comparisons, `else if` chains across different parameters, and three-parameter bodies; `pub fn f(x: Str, y: I32) { if x < 10 { 1 } else { 2 } }` diagnoses TYPE_MISMATCH; `x and y` and `x < y` gate. CLI suite extended with the multi-parameter forms.
 
-**Remaining scope.** Pair-parameter conditions; array-position const/parameter unification; parameter operators in discard positions; local bindings.
+**Remaining scope.** array-position const/parameter unification; parameter operators in discard positions; local bindings.
+
+## IR-1193: Pair-parameter conditions in unit discards
+
+**Decision.** Two-parameter `if` conditions in unit positions are self-typed when both operands are parameter paths of compatible types: logical operators need two `Bool` parameters, comparisons need two parameters of the same primitive type, and negations unwrap to the same forms. Mixed-type comparisons gate rather than passing silently, consistent with the primitive-return pair arm.
+
+**Reason.** The operands are concrete-typed parameter paths, so compatibility is fully determined in the direct fragment — no inference is involved. The same type compatibility rule already governs the primitive-return pair arm; applying it in discard positions only required the binding-use check the shared helper already provides.
+
+**Failure boundary.** Mixed-type pair conditions gate (matching the primitive-return arm); pair conditions in bodies with three or more parameters gate; nested logical/comparison combinations (`x < y and y < z`) gate for the mixed-condition slice.
+
+**Verification.** Probes accept `x and y`, `not (x or y)`, and `x < y` in two-parameter unit bodies; mixed-type and three-parameter forms gate. CLI suite extended.
+
+**Remaining scope.** Mixed-type pair diagnostics; array-position const/parameter unification; parameter operators in discard positions; local bindings.
