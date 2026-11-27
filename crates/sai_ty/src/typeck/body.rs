@@ -5968,10 +5968,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let Some(CompositeType::Tuple(elements)) = self.composite_types.get(composite) else {
             return Err(());
         };
-        let Some(index) = index else {
-            return Err(());
-        };
-        let Some(element_type) = elements.get(index as usize) else {
+        // An index that does not fit `u32` lowers to `None` and exceeds
+        // every possible tuple arity, so it is out of range (spec 6.6.2);
+        // malformed digits are rejected by earlier stages instead.
+        let Some(element_type) = index.and_then(|index| elements.get(index as usize)) else {
             self.errors.push(PrimitiveBodyError {
                 node,
                 kind: PrimitiveBodyErrorKind::TupleIndexOutOfRange,
@@ -6498,9 +6498,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // must be a composite built by this body — scalar bases
                 // and trait-based indexing stay gated.
                 ExprKind::TupleField { base, index } => {
-                    self.check_tuple_field_projection(base, index, init.hir_id)?
+                    let projected = self.check_tuple_field_projection(base, index, init.hir_id)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(projected, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        projected
+                    }
                 }
-                ExprKind::Index(base, index) => self.check_builtin_index(base, index)?,
+                ExprKind::Index(base, index) => {
+                    let element = self.check_builtin_index(base, index)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(element, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        element
+                    }
+                }
                 ExprKind::Lit(Lit::Str(_)) => {
                     // A `Str` literal is a concrete `Str` value — never a
                     // literal variable. An annotated primitive coercion

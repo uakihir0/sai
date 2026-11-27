@@ -18948,6 +18948,10 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
         ExprKind::Binary(_, left, right) => {
             primitive_body_error_span(left, node).or_else(|| primitive_body_error_span(right, node))
         }
+        ExprKind::TupleField { base, .. } => primitive_body_error_span(base, node),
+        ExprKind::Index(base, index) => {
+            primitive_body_error_span(base, node).or_else(|| primitive_body_error_span(index, node))
+        }
         ExprKind::Tuple(elements) | ExprKind::Array(elements) => elements
             .iter()
             .find_map(|element| primitive_body_error_span(element, node)),
