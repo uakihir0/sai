@@ -9894,6 +9894,34 @@ fn check_function_composite_literal_element(
         diagnostics.append(&mut else_diagnostics);
         return Ok(Some(diagnostics));
     }
+    // Const references in element positions are self-typed values whose
+    // declared type must match the element type exactly — concrete types
+    // do not coerce (spec 6.1). Consts whose type does not resolve in the
+    // direct fragment are absent from the index and gate.
+    if matches!(element.kind, ExprKind::Path(_) | ExprKind::Field { .. })
+        && let Some(types) = const_path_types
+        && let Some(const_type) = types.get(&element.hir_id)
+    {
+        let Some(expected) = resolve_function_direct_type(ty, type_paths, symbols, inputs) else {
+            return Ok(None);
+        };
+        if expected == *const_type {
+            return Ok(Some(Vec::new()));
+        }
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            element.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found `{}`",
+                function_direct_type_name(expected),
+                function_direct_type_name(*const_type)
+            ),
+            "type mismatch",
+        )?]));
+    }
     if let TyKind::Tuple(type_elements) = ty.kind
         && type_elements.is_empty()
         && let ExprKind::Tuple(tail_elements) = element.kind

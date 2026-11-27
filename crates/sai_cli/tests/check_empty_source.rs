@@ -11776,6 +11776,9 @@ fn public_parameterized_composite_literal_returns_emit_check_result() {
     for source in [
         "pub fn f(x: I32) -> (I32, Bool) { (1, true) }\n",
         "pub fn f(x: I32, y: I32) -> Array<I32, 2> { [1, 2] }\n",
+        "const N: I64 = 1\npub fn f() -> (I64, I64) { (N, 1) }\n",
+        "const N: I32 = 1\npub fn f() -> Array<I32, 2> { [N, 1] }\n",
+        "const S: Str = \"a\"\npub fn f() -> (Str, I64) { (S, 1) }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
