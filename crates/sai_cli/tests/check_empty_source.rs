@@ -11761,6 +11761,10 @@ fn public_unit_return_discards_tail_values() {
         "pub fn f(x: I32) { loop { match x { 1 => 1, _ => x + 1 } }\n1 }\n",
         "pub fn f(x: I32) { loop { match x { 1 => { x + 1 }, _ => {} } }\n1 }\n",
         "pub fn f(x: I32) -> I32 { x + 1\n0 }\n",
+        // A diverging first branch is `Never`-typed, so a plain `else`
+        // block needs no unification — it checks like any unit block.
+        "pub fn f(x: I32) -> Bool { if x < 10 { return true } else { }\ntrue }\n",
+        "pub fn f(x: I32) -> Bool { if x < 10 { return true } else { 5 }\ntrue }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }

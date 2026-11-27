@@ -4038,15 +4038,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // tail. Value-carrying first branches need cross-branch
                 // unification and stay gated.
                 self.check_stmt_block(then)?;
-                // A first branch ending in `return`/`break`/`continue`
-                // diverges, so its type is `Never` rather than `()` — the
-                // rest of the chain synthesizes with cross-branch
-                // unification (spec 6.14.1 rule 2), which stays gated.
                 if matches!(
                     then.tail.map(|tail| tail.kind),
                     Some(ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. })
                 ) {
-                    return Err(());
+                    // A first branch ending in `return`/`break`/`continue`
+                    // diverges, so its type is `Never` rather than `()` —
+                    // the rest of the chain synthesizes on its own (spec
+                    // 6.14.1 rule 2). Plain `else` blocks need no
+                    // unification, so they check against `()` like any
+                    // unit block; `else if` chains and branching `else`
+                    // tails do, and stay gated.
+                    return match els.kind {
+                        ExprKind::Block(block) if !block_branches_on_value_tail(block) => {
+                            self.check_block_unit(block)
+                        }
+                        _ => Err(()),
+                    };
                 }
                 self.check_unit_if_else_tail(els)
             }
@@ -10761,6 +10769,23 @@ fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
 /// needs them for coverage keeps the catch-all requirement. `USize` and
 /// `ISize` domains are unbounded by design (the analysis must not depend
 /// on pointer width, §6.22.2) and finite patterns can never cover them.
+
+/// Whether a block's tail is a nested `if`/`match` — the shapes whose
+/// branch types would need unification when the block is synthesized.
+fn block_branches_on_value_tail(block: &Block<'_>) -> bool {
+    let mut current = block;
+    loop {
+        let Some(tail) = current.tail else {
+            return false;
+        };
+        match tail.kind {
+            ExprKind::If { .. } | ExprKind::Match { .. } => return true,
+            ExprKind::Block(inner) => current = inner,
+            _ => return false,
+        }
+    }
+}
+
 fn integer_patterns_cover_domain(arms: &[Arm<'_>], scrutinee_type: PrimTy) -> bool {
     let Some(domain) = integer_domain_intervals(scrutinee_type) else {
         return false;
