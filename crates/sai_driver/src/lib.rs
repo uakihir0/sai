@@ -8651,20 +8651,21 @@ fn check_function_body_shape_dispatch(
             }
             if !matches!(tail.kind, ExprKind::If { .. })
                 && let Some((_, tail_diagnostics)) = check_function_discarded_unit_tail(
-                owner,
-                tail,
-                false,
-                false,
-                sig,
-                body,
-                locals,
-                symbols,
-                inputs,
-                snapshot,
-                type_paths,
-                const_path_types,
-                target_cfg,
-            )? {
+                    owner,
+                    tail,
+                    false,
+                    false,
+                    sig,
+                    body,
+                    locals,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    type_paths,
+                    const_path_types,
+                    target_cfg,
+                )?
+            {
                 return Ok(FunctionBodyTypeCheck::Supported {
                     diagnostics: tail_diagnostics,
                 });

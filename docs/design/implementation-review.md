@@ -11099,3 +11099,15 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Probes accept `const N: I64 = 1` discarded directly, in tuples, in `if` branch tails, with parameters present, through chained const references, and through `use`-imported and member-access (`helper.LIMIT`) paths; `[N, 1]` gates. CLI suite extended with the single-file forms.
 
 **Remaining scope.** Array-position const/parameter unification; parameter operators in discard positions; local bindings.
+
+## IR-1192: Multi-parameter if conditions in unit discards
+
+**Decision.** `if` chains in unit positions validate each link's condition against whichever parameter it references, regardless of arity: Bool literals need no validation, a Bool parameter path or its negation is self-typed, and comparisons validate against the type of the single parameter binding they reference through the shared parameterized-condition machinery. The hoisted multi-parameter validation walks the whole chain itself instead of only collecting Bool-literal links.
+
+**Reason.** Spec 6.11.1/6.25.2 discard branch tails in unit positions independent of how many parameters the function takes, and the comparison condition machinery never depended on the parameter being the only one — it verifies the operand binding directly. Trying each parameter in turn is sound because the comparison validation returns `None` for conditions that do not reference the binding under test, so a condition is always validated against the parameter it actually uses.
+
+**Failure boundary.** Conditions referencing several parameters (`x and y`, `x < y`) gate for the pair-condition slice; conditions referencing no parameter beyond Bool literals gate for the literal-operator slice.
+
+**Verification.** Probes accept `pub fn f(x: Bool, y: Bool) { if x { 1 } else { 2 } }`, negations, comparisons, `else if` chains across different parameters, and three-parameter bodies; `pub fn f(x: Str, y: I32) { if x < 10 { 1 } else { 2 } }` diagnoses TYPE_MISMATCH; `x and y` and `x < y` gate. CLI suite extended with the multi-parameter forms.
+
+**Remaining scope.** Pair-parameter conditions; array-position const/parameter unification; parameter operators in discard positions; local bindings.

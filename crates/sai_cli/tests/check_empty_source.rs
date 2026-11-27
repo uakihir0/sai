@@ -11703,6 +11703,11 @@ fn public_unit_return_discards_tail_values() {
         "pub fn str_param_without_return(value: Str) { value }\n",
         "pub fn f(x: I32, y: I32) { 1 }\n",
         "pub fn f(x: Bool, y: Bool) { if true { 1 } else { 2 } }\n",
+        "pub fn f(x: Bool, y: Bool) { if x { 1 } else { 2 } }\n",
+        "pub fn f(x: Bool, y: Bool) { if not x { 1 } else { 2 } }\n",
+        "pub fn f(x: I32, y: I32) { if x < 10 { 1 } else { 2 } }\n",
+        "pub fn f(x: Bool, y: Bool) { if x { 1 } else if y { 2 } else { 3 } }\n",
+        "pub fn f(x: Bool, y: Bool, z: Bool) { if x { 1 } else { 2 } }\n",
         "const N: I64 = 1\npub fn f() { N }\n",
         "const N: I64 = 1\npub fn f(x: I32) { N }\n",
         "const N: I64 = 1\npub fn f() { (N, true) }\n",
@@ -11729,6 +11734,10 @@ fn public_unit_return_discard_errors_are_diagnosed() {
         ),
         (
             "pub fn f(flag: Bool) { if flag { [1, true] } else { [1] } }\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub fn f(x: Str, y: I32) { if x < 10 { 1 } else { 2 } }\n",
             "TYPE_MISMATCH",
         ),
     ] {
