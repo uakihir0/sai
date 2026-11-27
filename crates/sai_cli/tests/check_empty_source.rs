@@ -9904,16 +9904,6 @@ fn primitive_integer_other_remainder_origins_stay_gated_for_char_bitwise_aliases
             "    value\n",
             "}\n",
         ),
-        concat!(
-            "type CharRemainderPairOwner { marker: Char }\n",
-            "impl CharRemainderPairOwner {\n",
-            "    fn char_remainder_pair_method(self: borrow Self) -> Char {\n",
-            "        let pair = 1 % 2\n",
-            "        let value = 'a' & pair\n",
-            "        value\n",
-            "    }\n",
-            "}\n",
-        ),
     ];
     for source in cases {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -10537,15 +10527,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn wrapping_bool_literal_pair() -> Bool {\n    let result = true -% false\n    result\n}\n",
         "pub fn wrapping_char_literal_pair() -> Char {\n    let result = 'a' *% 'b'\n    result\n}\n",
         "pub fn wrapping_generic_literal_pair<T>() -> I64 {\n    let result = 1 +% 2\n    result\n}\n",
-        concat!(
-            "type WrappingPairOwner { marker: I32 }\n",
-            "impl WrappingPairOwner {\n",
-            "    fn wrapping_literal_pair(self: borrow Self) -> I32 {\n",
-            "        let result = 1 -% 2\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        ),
         "pub fn wrapping_float_left_literal(right: I32) -> I32 {\n    let result = 1.0 +% right\n    result\n}\n",
         "pub fn wrapping_float_literal_right(left: I32) -> I32 {\n    let result = left +% 1.0\n    result\n}\n",
         "pub fn wrapping_integer_literal_non_integer_path(left: F32) -> F32 {\n    let result = left +% 1\n    result\n}\n",
@@ -13237,12 +13218,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn raw_str_return() -> r#Str { \"text\" }\n",
         "type Text = Str\npub fn alias_str_return() -> Text { \"text\" }\n",
         "type Str = I32\npub fn shadowed_str_return() -> Str { \"text\" }\n",
-        concat!(
-            "type StringOwner { marker: Bool }\n",
-            "impl StringOwner {\n",
-            "    fn string_method(self: borrow Self) -> Str { \"text\" }\n",
-            "}\n",
-        ),
         "pub fn local() -> I32 {\nlet (first, second): (I32, I32) = (1, 2)\nfirst\n}\n",
         "pub fn local() -> I32 { let 0: I32 = 42 else { return 0 }\n1\n}\n",
         "pub fn local() -> I32 {\nlet value: Missing = 42\nvalue\n}\n",
@@ -13258,12 +13233,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn raw_tail(value: I32) -> I32 { r#value }\n",
         "pub fn raw_type(value: r#I32) -> r#I32 { value }\n",
         "type Str = I32\npub fn shadowed_str_identity(value: Str) -> Str { value }\n",
-        concat!(
-            "type StrOwner { marker: Bool }\n",
-            "impl StrOwner {\n",
-            "    fn string_identity(self: borrow Self) -> Str { \"text\" }\n",
-            "}\n",
-        ),
         concat!(
             "@target(\"wasm64-core\")\n",
             "pub fn filtered(value: I32) -> I32 { value }\n",
@@ -18790,16 +18759,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_bool_literal_pair<T>() -> Bool",
             "let result = true ^ false",
         ),
-        concat!(
-            "type BoolLiteralPairOwner { marker: Bool }\n",
-            "impl BoolLiteralPairOwner {\n",
-            "    fn bool_literal_pair(self: borrow Self) -> Bool {\n",
-            "        let result = true ^ false\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
         fixture(
             "pub fn char_computed_float_literal_rhs() -> Char",
             "let result = 'a' & (1.0 + 1.0)",
@@ -18867,50 +18826,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_char_literal_division_pair_path_rhs<T>() -> Char",
             "let right = 1 / 2\n    let result = 'a' & right",
         ),
-        concat!(
-            "type CharAdditionPairOwner { marker: Char }\n",
-            "impl CharAdditionPairOwner {\n",
-            "    fn char_addition_pair_method(self: borrow Self) -> Char {\n",
-            "        let right = 1 + 2\n",
-            "        let result = 'a' & right\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type CharDivisionPairOwner { marker: Char }\n",
-            "impl CharDivisionPairOwner {\n",
-            "    fn char_division_pair_method(self: borrow Self) -> Char {\n",
-            "        let right = 1 / 2\n",
-            "        let result = 'a' & right\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type CharSubtractionPairOwner { marker: Char }\n",
-            "impl CharSubtractionPairOwner {\n",
-            "    fn char_subtraction_pair_method(self: borrow Self) -> Char {\n",
-            "        let right = 1 - 2\n",
-            "        let result = 'a' & right\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type CharMultiplicationPairOwner { marker: Char }\n",
-            "impl CharMultiplicationPairOwner {\n",
-            "    fn char_multiplication_pair_method(self: borrow Self) -> Char {\n",
-            "        let right = 1 * 2\n",
-            "        let result = 'a' & right\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
         fixture(
             "pub fn char_literal_direct_wrapping_pair_rhs() -> Char",
             "let result = 'a' & (1 +% 2)",
@@ -18931,45 +18846,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_char_literal_wrapping_pair_path_rhs<T>() -> Char",
             "let right = 1 +% 2\n    let result = 'a' & right",
         ),
-        concat!(
-            "type CharWrappingPairOwner { marker: Char }\n",
-            "impl CharWrappingPairOwner {\n",
-            "    fn char_wrapping_pair_method(self: borrow Self) -> Char {\n",
-            "        let right = 1 +% 2\n",
-            "        let result = 'a' & right\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type CharUntypedIntegerPathOwner { marker: Char }\n",
-            "impl CharUntypedIntegerPathOwner {\n",
-            "    fn char_untyped_integer_path_method(self: borrow Self) -> Char {\n",
-            "        let right = 1\n",
-            "        let alias1 = right\n",
-            "        let alias2 = alias1\n",
-            "        let alias3 = alias2\n",
-            "        let result = 'a' & alias3\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type CharUntypedFloatPathOwner { marker: Char }\n",
-            "impl CharUntypedFloatPathOwner {\n",
-            "    fn char_untyped_float_path_method(self: borrow Self) -> Char {\n",
-            "        let right = 1.0\n",
-            "        let alias1 = right\n",
-            "        let alias2 = alias1\n",
-            "        let alias3 = alias2\n",
-            "        let result = 'a' & alias3\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
         fixture(
             "pub fn char_literal_self_reference_path_rhs() -> Char",
             "let result = 'a' & result",
@@ -19046,46 +18922,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_char_negative_float_literal_pair<T>() -> Char",
             "let result = 'a' ^ -1.0",
         ),
-        concat!(
-            "type CharLiteralPairOwner { marker: Char }\n",
-            "impl CharLiteralPairOwner {\n",
-            "    fn char_literal_pair(self: borrow Self) -> Char {\n",
-            "        let result = 'a' ^ 'b'\n",
-            "        result\n",
-            "    }\n",
-            "    fn char_bool_literal_pair(self: borrow Self) -> Char {\n",
-            "        let result = 'a' ^ false\n",
-            "        result\n",
-            "    }\n",
-            "    fn char_byte_literal_pair(self: borrow Self) -> Char {\n",
-            "        let result = 'a' ^ b'b'\n",
-            "        result\n",
-            "    }\n",
-            "    fn char_integer_literal_pair(self: borrow Self) -> Char {\n",
-            "        let result = 'a' ^ -2\n",
-            "        result\n",
-            "    }\n",
-            "    fn char_float_literal_pair(self: borrow Self) -> Char {\n",
-            "        let result = 'a' ^ 1.0\n",
-            "        result\n",
-            "    }\n",
-            "    fn char_negative_float_literal_pair(self: borrow Self) -> Char {\n",
-            "        let result = 'a' ^ -1.0\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type CharLiteralPathOwner { marker: Char }\n",
-            "impl CharLiteralPathOwner {\n",
-            "    fn char_literal_path_method(self: borrow Self, right: Byte) -> Char {\n",
-            "        let result = 'a' ^ right\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
         fixture(
             "pub fn float_integer_literal_pair() -> F32",
             "let result = 1.0 ^ 2",
@@ -19109,16 +18945,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
                 "let result: Word = 1 ^ 2",
             )
         ),
-        concat!(
-            "type IntegerPairOwner { marker: I32 }\n",
-            "impl IntegerPairOwner {\n",
-            "    fn integer_literal_pair(self: borrow Self) -> I32 {\n",
-            "        let result = 1 ^ 2\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
         fixture(
             "pub fn byte_string_left(right: Byte) -> Byte",
             "let result = b\"text\" & right",
@@ -19303,74 +19129,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_f32_path_scalar_rhs<T>(left: F32) -> F32",
             "let result = left & 1.0",
         ),
-        concat!(
-            "type BitOwner { marker: Byte }\n",
-            "impl BitOwner {\n",
-            "    fn method(self: borrow Self) -> Byte {\n",
-            "        let result = b'a' & b'b'\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type ScalarBitOwner { marker: Byte }\n",
-            "impl ScalarBitOwner {\n",
-            "    fn scalar_method(self: borrow Self) -> Byte {\n",
-            "        let result = b'a' & true\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type PathScalarBitOwner { marker: Byte }\n",
-            "impl PathScalarBitOwner {\n",
-            "    fn path_scalar_method(self: borrow Self, left: Bool) -> Bool {\n",
-            "        let prior: Bool = left\n",
-            "        let result = prior ^ 1.0\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type CharPathScalarBitOwner { marker: Char }\n",
-            "impl CharPathScalarBitOwner {\n",
-            "    fn char_path_scalar_method(self: borrow Self, left: Char) -> Char {\n",
-            "        let prior: Char = left\n",
-            "        let result = prior | 1\n",
-            "        result\n",
-            "    }\n",
-            "    fn char_path_float_method(self: borrow Self, left: Char) -> Char {\n",
-            "        let prior: Char = left\n",
-            "        let result = prior | 1.0\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type FloatPathBitOwner { marker: F64 }\n",
-            "impl FloatPathBitOwner {\n",
-            "    fn float_path_scalar_method(self: borrow Self, left: F64) -> F64 {\n",
-            "        let prior: F64 = left\n",
-            "        let result = prior ^ 1.0\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
-        concat!(
-            "type IntegerBitOwner { marker: Byte }\n",
-            "impl IntegerBitOwner {\n",
-            "    fn integer_method(self: borrow Self) -> Byte {\n",
-            "        let result = b'a' & 1\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        )
-        .to_owned(),
     ] {
         assert_check_stays_gated_without_syntax_errors(&run_check(&source, "", &[], &[]), &source);
     }
@@ -19496,15 +19254,6 @@ fn unsupported_primitive_shift_shapes_and_owners_remain_gated() {
         "pub fn nested_left(left: I32, amount: U32) -> I32 { let result = (left << amount) >> amount; result }\n",
         "pub fn nested_right(left: I32, amount: U32, extra: U32) -> I32 { let result = left << (amount >> extra); result }\n",
         "pub fn generic<T>(left: I32, amount: U32) -> I32 { let result = left << amount; result }\n",
-        concat!(
-            "type ShiftOwner { marker: I32 }\n",
-            "impl ShiftOwner {\n",
-            "    fn method(self: borrow Self, left: I32, amount: U32) -> I32 {\n",
-            "        let result = left << amount\n",
-            "        result\n",
-            "    }\n",
-            "}\n",
-        ),
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -26340,5 +26089,335 @@ fn non_numeric_primitive_arithmetic_is_an_operator_diagnostic() {
         "pub fn f(b: Byte) -> Byte { ~b }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+// Package-private inherent method bodies check exactly like `pub` ones
+// (spec 4.6.1 has no module-private level): valid forms pass, invalid
+// forms report their operator and type errors instead of gating.
+#[test]
+fn private_inherent_method_bodies_are_checked() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            concat!(
+                "type ShiftOwner { marker: I32 }\n",
+                "impl ShiftOwner {\n",
+                "    fn method(self: borrow Self, left: I32, amount: U32) -> I32 {\n",
+                "        let result = left << amount\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[],
+        ),
+        (
+            concat!(
+                "type WrappingPairOwner { marker: I32 }\n",
+                "impl WrappingPairOwner {\n",
+                "    fn wrapping_literal_pair(self: borrow Self) -> I32 {\n",
+                "        let result = 1 -% 2\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[],
+        ),
+        (
+            concat!(
+                "type BoolLiteralPairOwner { marker: Bool }\n",
+                "impl BoolLiteralPairOwner {\n",
+                "    fn bool_literal_pair(self: borrow Self) -> Bool {\n",
+                "        let result = true ^ false\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type CharAdditionPairOwner { marker: Char }\n",
+                "impl CharAdditionPairOwner {\n",
+                "    fn char_addition_pair_method(self: borrow Self) -> Char {\n",
+                "        let right = 1 + 2\n",
+                "        let result = 'a' & right\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type CharDivisionPairOwner { marker: Char }\n",
+                "impl CharDivisionPairOwner {\n",
+                "    fn char_division_pair_method(self: borrow Self) -> Char {\n",
+                "        let right = 1 / 2\n",
+                "        let result = 'a' & right\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type CharSubtractionPairOwner { marker: Char }\n",
+                "impl CharSubtractionPairOwner {\n",
+                "    fn char_subtraction_pair_method(self: borrow Self) -> Char {\n",
+                "        let right = 1 - 2\n",
+                "        let result = 'a' & right\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type CharMultiplicationPairOwner { marker: Char }\n",
+                "impl CharMultiplicationPairOwner {\n",
+                "    fn char_multiplication_pair_method(self: borrow Self) -> Char {\n",
+                "        let right = 1 * 2\n",
+                "        let result = 'a' & right\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type CharWrappingPairOwner { marker: Char }\n",
+                "impl CharWrappingPairOwner {\n",
+                "    fn char_wrapping_pair_method(self: borrow Self) -> Char {\n",
+                "        let right = 1 +% 2\n",
+                "        let result = 'a' & right\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type CharUntypedIntegerPathOwner { marker: Char }\n",
+                "impl CharUntypedIntegerPathOwner {\n",
+                "    fn char_untyped_integer_path_method(self: borrow Self) -> Char {\n",
+                "        let right = 1\n",
+                "        let alias1 = right\n",
+                "        let alias2 = alias1\n",
+                "        let alias3 = alias2\n",
+                "        let result = 'a' & alias3\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type CharUntypedFloatPathOwner { marker: Char }\n",
+                "impl CharUntypedFloatPathOwner {\n",
+                "    fn char_untyped_float_path_method(self: borrow Self) -> Char {\n",
+                "        let right = 1.0\n",
+                "        let alias1 = right\n",
+                "        let alias2 = alias1\n",
+                "        let alias3 = alias2\n",
+                "        let result = 'a' & alias3\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type CharLiteralPairOwner { marker: Char }\n",
+                "impl CharLiteralPairOwner {\n",
+                "    fn char_literal_pair(self: borrow Self) -> Char {\n",
+                "        let result = 'a' ^ 'b'\n",
+                "        result\n",
+                "    }\n",
+                "    fn char_bool_literal_pair(self: borrow Self) -> Char {\n",
+                "        let result = 'a' ^ false\n",
+                "        result\n",
+                "    }\n",
+                "    fn char_byte_literal_pair(self: borrow Self) -> Char {\n",
+                "        let result = 'a' ^ b'b'\n",
+                "        result\n",
+                "    }\n",
+                "    fn char_integer_literal_pair(self: borrow Self) -> Char {\n",
+                "        let result = 'a' ^ -2\n",
+                "        result\n",
+                "    }\n",
+                "    fn char_float_literal_pair(self: borrow Self) -> Char {\n",
+                "        let result = 'a' ^ 1.0\n",
+                "        result\n",
+                "    }\n",
+                "    fn char_negative_float_literal_pair(self: borrow Self) -> Char {\n",
+                "        let result = 'a' ^ -1.0\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 6)],
+        ),
+        (
+            concat!(
+                "type CharLiteralPathOwner { marker: Char }\n",
+                "impl CharLiteralPathOwner {\n",
+                "    fn char_literal_path_method(self: borrow Self, right: Byte) -> Char {\n",
+                "        let result = 'a' ^ right\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type IntegerPairOwner { marker: I32 }\n",
+                "impl IntegerPairOwner {\n",
+                "    fn integer_literal_pair(self: borrow Self) -> I32 {\n",
+                "        let result = 1 ^ 2\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[],
+        ),
+        (
+            concat!(
+                "type BitOwner { marker: Byte }\n",
+                "impl BitOwner {\n",
+                "    fn method(self: borrow Self) -> Byte {\n",
+                "        let result = b'a' & b'b'\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[],
+        ),
+        (
+            concat!(
+                "type ScalarBitOwner { marker: Byte }\n",
+                "impl ScalarBitOwner {\n",
+                "    fn scalar_method(self: borrow Self) -> Byte {\n",
+                "        let result = b'a' & true\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "type PathScalarBitOwner { marker: Byte }\n",
+                "impl PathScalarBitOwner {\n",
+                "    fn path_scalar_method(self: borrow Self, left: Bool) -> Bool {\n",
+                "        let prior: Bool = left\n",
+                "        let result = prior ^ 1.0\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1), ("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "type CharPathScalarBitOwner { marker: Char }\n",
+                "impl CharPathScalarBitOwner {\n",
+                "    fn char_path_scalar_method(self: borrow Self, left: Char) -> Char {\n",
+                "        let prior: Char = left\n",
+                "        let result = prior | 1\n",
+                "        result\n",
+                "    }\n",
+                "    fn char_path_float_method(self: borrow Self, left: Char) -> Char {\n",
+                "        let prior: Char = left\n",
+                "        let result = prior | 1.0\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 2)],
+        ),
+        (
+            concat!(
+                "type FloatPathBitOwner { marker: F64 }\n",
+                "impl FloatPathBitOwner {\n",
+                "    fn float_path_scalar_method(self: borrow Self, left: F64) -> F64 {\n",
+                "        let prior: F64 = left\n",
+                "        let result = prior ^ 1.0\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type IntegerBitOwner { marker: Byte }\n",
+                "impl IntegerBitOwner {\n",
+                "    fn integer_method(self: borrow Self) -> Byte {\n",
+                "        let result = b'a' & 1\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "type CharRemainderPairOwner { marker: Char }\n",
+                "impl CharRemainderPairOwner {\n",
+                "    fn char_remainder_pair_method(self: borrow Self) -> Char {\n",
+                "        let pair = 1 % 2\n",
+                "        let value = 'a' & pair\n",
+                "        value\n",
+                "    }\n",
+                "}\n",
+            ),
+            &[("OPERATOR_NOT_SUPPORTED", 1)],
+        ),
+        (
+            concat!(
+                "type StringOwner { marker: Bool }\n",
+                "impl StringOwner {\n",
+                "    fn string_method(self: borrow Self) -> Str { \"text\" }\n",
+                "}\n",
+            ),
+            &[],
+        ),
+        (
+            concat!(
+                "type StrOwner { marker: Bool }\n",
+                "impl StrOwner {\n",
+                "    fn string_identity(self: borrow Self) -> Str { \"text\" }\n",
+                "}\n",
+            ),
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "private method bodies should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
     }
 }
