@@ -205,6 +205,8 @@ pub enum PrimitiveBodyErrorKind {
     MissingBlockTail {
         expected: PrimTy,
     },
+    /// `t.N` with `N` not less than the tuple's arity (spec 6.6.2).
+    TupleIndexOutOfRange,
     ConstPatternType {
         found: ScalarType,
     },
@@ -330,6 +332,19 @@ enum LocalType {
     LiteralVariable(usize),
     ErrorLiteralVariable(usize),
     Error(Option<PrimTy>),
+    /// A tuple or array type — the index keys the `composite_types` arena
+    /// on the context, keeping `LocalType` itself `Copy`.
+    Composite(usize),
+}
+
+/// Composite type storage for tuple and array literals in `let`
+/// initializers. Element types keep the kernel's inference representation,
+/// so `[1, x]` at a later `U8` constraint still range-checks the literal
+/// element.
+#[derive(Clone, Debug)]
+enum CompositeType {
+    Tuple(Vec<LocalType>),
+    Array { elem: LocalType, len: usize },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -454,6 +469,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         deferred_bitnot_result_bindings: HashSet::new(),
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
+        composite_types: Vec::new(),
         loop_stack: Vec::new(),
         errors: Vec::new(),
     };
@@ -506,6 +522,7 @@ struct FnCtxt<'a, 'hir> {
     deferred_bitnot_result_bindings: HashSet<BindingId>,
     pending_operator_trait_count: usize,
     literal_variables: Vec<LiteralVariable<'hir>>,
+    composite_types: Vec<CompositeType>,
     loop_stack: Vec<LoopFrame>,
     errors: Vec<PrimitiveBodyError>,
 }
@@ -2922,6 +2939,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                     _ => {
                         let found = match self.check_operand_local_type(right)? {
+                            LocalType::Composite(_) => return Err(()),
                             LocalType::Concrete(found) => ScalarType::Primitive(found),
                             LocalType::Str => ScalarType::Str,
                             LocalType::LiteralVariable(id)
@@ -3410,8 +3428,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     Ok(LocalType::Str)
                 }
                 LocalType::LiteralVariable(_) | LocalType::ErrorLiteralVariable(_) => Err(()),
+                LocalType::Composite(_) => Err(()),
             },
             _ => match self.check_local_path(init)? {
+                LocalType::Composite(_) => return Err(()),
                 LocalType::Str => Ok(LocalType::Str),
                 LocalType::Concrete(found) => {
                     self.errors.push(PrimitiveBodyError {
@@ -3472,6 +3492,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok(ScalarType::Primitive(expected));
         }
         match self.check_operand_local_type(operand)? {
+            LocalType::Composite(_) => return Err(()),
             LocalType::Concrete(found) => Ok(ScalarType::Primitive(found)),
             LocalType::Str => Ok(ScalarType::Str),
             LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
@@ -3513,7 +3534,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                 self.literal_variables.get(id)?.resolved?
             }
-            LocalType::Str | LocalType::Error(_) => return None,
+            LocalType::Str | LocalType::Error(_) | LocalType::Composite(_) => return None,
         };
         supports_primitive_literal(primitive).then_some(primitive)
     }
@@ -3585,6 +3606,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         node: HirId,
     ) -> Result<(), ()> {
         match source_type {
+            // Composite sources and composite annotations are a later
+            // slice — the primitive coercion positions stay gated.
+            LocalType::Composite(_) => return Err(()),
             LocalType::Concrete(found) if found != expected => {
                 self.errors.push(PrimitiveBodyError {
                     node,
@@ -3654,6 +3678,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         match source_type {
             LocalType::Str | LocalType::Error(_) => {}
+            LocalType::Composite(_) => return Err(()),
             LocalType::Concrete(found) => {
                 self.errors.push(PrimitiveBodyError {
                     node,
@@ -4007,6 +4032,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match self.loop_stack[index].break_state {
             LoopBreakState::Unfixed => {
                 self.loop_stack[index].break_state = match local_type {
+                    LocalType::Composite(_) => return Err(()),
                     LocalType::Concrete(found) => LoopBreakState::Concrete(found),
                     LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                         // A break value may carry an already-resolved
@@ -4029,6 +4055,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 kind: PrimitiveBodyErrorKind::InvalidBreakValue,
             }),
             LoopBreakState::Concrete(expected) => match local_type {
+                LocalType::Composite(_) => return Err(()),
                 LocalType::Concrete(found) => {
                     if found != expected {
                         self.errors.push(PrimitiveBodyError {
@@ -4082,6 +4109,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // error type stays inert, and anything else reports the
             // `Str` mismatch.
             LoopBreakState::Str => match local_type {
+                LocalType::Composite(_) => return Err(()),
                 LocalType::Str | LocalType::Error(_) => {}
                 LocalType::Concrete(found) => {
                     self.errors.push(PrimitiveBodyError {
@@ -4741,6 +4769,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     )?;
                     LocalType::Concrete(expected)
                 }
+                // Tuple field projections and built-in indexing read
+                // composite locals — the scalar result unifies with the
+                // expectation like a path tail.
+                ExprKind::TupleField { base, index } => {
+                    self.check_tuple_field_projection(base, index, expression.hir_id)?
+                }
+                ExprKind::Index(base, index) => self.check_builtin_index(base, index)?,
                 _ => self.check_local_path(expression)?,
             }
         };
@@ -4750,6 +4785,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn check_expr_expected(&mut self, expression: &Expr<'hir>, expected: PrimTy) -> Result<(), ()> {
         let local_type = self.check_expr_value(expression, expected)?;
         match local_type {
+            // Composite tails against primitive expectations are a later
+            // slice — composite return types need their own rendering.
+            LocalType::Composite(_) => return Err(()),
             LocalType::Error(found) => {
                 if let Some(found) = found {
                     self.check_concrete_tail_type(found, expected, expression.hir_id);
@@ -5531,6 +5569,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Ok(());
                 }
                 match self.check_local_path(expression)? {
+                    LocalType::Composite(_) => return Err(()),
                     LocalType::Str => Ok(()),
                     LocalType::Concrete(found) => {
                         self.errors.push(PrimitiveBodyError {
@@ -5642,6 +5681,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             },
         };
         match local_type {
+            LocalType::Composite(_) => return Err(()),
             LocalType::Concrete(found) => self.errors.push(PrimitiveBodyError {
                 node: expression.hir_id,
                 kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
@@ -5911,6 +5951,426 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
+    /// `t.N` resolves at the first tuple type of arity `> N` (spec
+    /// 6.6.2). Out-of-range indices report `TUPLE_INDEX_OUT_OF_RANGE`;
+    /// non-tuple bases stay gated with the reference chain the spec
+    /// resolves through.
+    fn check_tuple_field_projection(
+        &mut self,
+        base: &'hir Expr<'hir>,
+        index: Option<u32>,
+        node: HirId,
+    ) -> Result<LocalType, ()> {
+        let base_type = self.check_operand_local_type(base)?;
+        // An error base already reported its diagnostic — propagate it
+        // instead of gating, so `t.5.0` keeps the out-of-range error.
+        if let LocalType::Error(_) = base_type {
+            return Ok(base_type);
+        }
+        let LocalType::Composite(composite) = base_type else {
+            return Err(());
+        };
+        let Some(CompositeType::Tuple(elements)) = self.composite_types.get(composite) else {
+            return Err(());
+        };
+        // An index that does not fit `u32` lowers to `None` and exceeds
+        // every possible tuple arity, so it is out of range (spec 6.6.2);
+        // malformed digits are rejected by earlier stages instead.
+        let Some(element_type) = index.and_then(|index| elements.get(index as usize)) else {
+            self.errors.push(PrimitiveBodyError {
+                node,
+                kind: PrimitiveBodyErrorKind::TupleIndexOutOfRange,
+            });
+            return Ok(LocalType::Error(None));
+        };
+        let element_type = *element_type;
+        self.record_expression_type(node, element_type);
+        Ok(element_type)
+    }
+
+    /// Built-in indexing (spec 6.7.1): the container must be an array
+    /// composite and the index `USize` or an unresolved integer-literal
+    /// variable, which unifies with `USize`. The bounds check is a
+    /// runtime panic, so a constant out-of-bounds index is not a
+    /// compile-time error. Trait-based indexing stays gated.
+    fn check_builtin_index(
+        &mut self,
+        base: &'hir Expr<'hir>,
+        index: &'hir Expr<'hir>,
+    ) -> Result<LocalType, ()> {
+        let base_type = self.check_operand_local_type(base)?;
+        if let LocalType::Error(_) = base_type {
+            return Ok(base_type);
+        }
+        let LocalType::Composite(composite) = base_type else {
+            return Err(());
+        };
+        let Some(CompositeType::Array { elem, .. }) = self.composite_types.get(composite) else {
+            return Err(());
+        };
+        let elem = *elem;
+        // The index synthesizes separately (spec 6.7.1 step 2): integer
+        // literals unify with `USize`; concrete `USize` operands fit;
+        // anything else is trait-based and stays gated.
+        if let ExprKind::Lit(literal) = index.kind {
+            if primitive_literal_kind(literal) == Some(PrimitiveLiteralKind::Integer) {
+                let local_type = self.local_type_for_unannotated_literal(
+                    literal,
+                    PrimitiveLiteralKind::Integer,
+                    index.hir_id,
+                );
+                if let LocalType::LiteralVariable(id) = local_type {
+                    self.resolve_literal_variable(id, PrimTy::USize)?;
+                }
+                self.record_expression_type(index.hir_id, LocalType::Concrete(PrimTy::USize));
+                return Ok(elem);
+            }
+            return Err(());
+        }
+        match self.check_operand_local_type(index)? {
+            LocalType::Concrete(PrimTy::USize) => Ok(elem),
+            LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                self.resolve_literal_variable(id, PrimTy::USize)?;
+                Ok(elem)
+            }
+            _ => Err(()),
+        }
+    }
+
+    /// Unify the element types of an array literal (spec 6.3.1): every
+    /// element coerces to one shared type. Elements check in source
+    /// order — so `[x, n, -n]` resolves `n` against the anchor before
+    /// `-n` is checked — while literals seen before the anchor wait in
+    /// a pending list and resolve against it when it arrives, keeping
+    /// unification independent of source order (`[1, 2.5, x]` and
+    /// `[x, 1, 2.5]` diagnose identically). A concrete element anchors
+    /// the join — literal elements resolve against it with the usual
+    /// range check — and same-family literal elements merge into one
+    /// inference group. Composite elements, `Str` mixes and
+    /// cross-family literal pairs without a concrete anchor stay gated
+    /// for a later slice.
+    fn check_array_literal_elements(&mut self, elements: &[Expr<'hir>]) -> Result<LocalType, ()> {
+        let mut join: Option<LocalType> = None;
+        // Literal variables checked before any anchor, with the node
+        // their mismatch belongs to. Same-family variables share the
+        // join's merge group; cross-family ones wait here too — the
+        // anchor's arrival decides whether they resolve or mismatch.
+        let mut pending_literals: Vec<(usize, HirId)> = Vec::new();
+        for element in elements {
+            let element_type = self.check_initializer_value(element, None)?.local_type;
+            join = Some(self.unify_array_element_type(
+                join,
+                element_type,
+                element.hir_id,
+                &mut pending_literals,
+            )?);
+        }
+        // Literals still pending never met an anchor: same-family groups
+        // default like any unresolved literal; cross-family stragglers
+        // have no type to name in a diagnostic yet and stay gated.
+        if pending_literals.is_empty() {
+            return join.ok_or(());
+        }
+        if matches!(join, Some(LocalType::LiteralVariable(_))) {
+            let join_kind = match join {
+                Some(LocalType::LiteralVariable(id)) => {
+                    self.literal_variables.get(id).map(|variable| variable.kind)
+                }
+                _ => None,
+            };
+            let all_same_family = pending_literals.iter().all(|(id, _)| {
+                self.literal_variables
+                    .get(*id)
+                    .map(|variable| Some(variable.kind) == join_kind)
+                    .unwrap_or(false)
+            });
+            if all_same_family {
+                return join.ok_or(());
+            }
+        }
+        Err(())
+    }
+
+    fn unify_array_element_type(
+        &mut self,
+        join: Option<LocalType>,
+        element_type: LocalType,
+        node: HirId,
+        pending_literals: &mut Vec<(usize, HirId)>,
+    ) -> Result<LocalType, ()> {
+        let Some(join) = join else {
+            if let LocalType::LiteralVariable(id) = element_type {
+                pending_literals.push((id, node));
+            }
+            return Ok(element_type);
+        };
+        // Errors already reported on either side keep inference going on
+        // the healthy side instead of cascading.
+        if matches!(
+            join,
+            LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
+        ) {
+            return Ok(element_type);
+        }
+        if matches!(
+            element_type,
+            LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
+        ) {
+            return Ok(join);
+        }
+        // A concrete or `Str` element anchors the group wherever it
+        // appears: every pending literal resolves against it in place.
+        let anchor = match element_type {
+            LocalType::Concrete(primitive) => Some(ScalarType::Primitive(primitive)),
+            LocalType::Str => Some(ScalarType::Str),
+            _ => None,
+        };
+        let result = match (join, element_type) {
+            (LocalType::Concrete(left), LocalType::Concrete(right)) => {
+                if left == right {
+                    Ok(join)
+                } else {
+                    self.errors.push(PrimitiveBodyError {
+                        node,
+                        kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                            expected: ScalarType::Primitive(left),
+                            found: ScalarType::Primitive(right),
+                        },
+                    });
+                    Ok(join)
+                }
+            }
+            (LocalType::Str, LocalType::Str) => Ok(LocalType::Str),
+            // `expected` is the established join type — an element added
+            // later must fit it, so the mismatch names the join on the
+            // expected side whichever concrete-ish side it is on.
+            (LocalType::Str, LocalType::Concrete(found)) => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                        expected: ScalarType::Str,
+                        found: ScalarType::Primitive(found),
+                    },
+                });
+                Ok(LocalType::Str)
+            }
+            (LocalType::Concrete(expected), LocalType::Str) => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                        expected: ScalarType::Primitive(expected),
+                        found: ScalarType::Str,
+                    },
+                });
+                Ok(LocalType::Concrete(expected))
+            }
+            (LocalType::Str, LocalType::LiteralVariable(id))
+            | (LocalType::LiteralVariable(id), LocalType::Str) => {
+                let kind = self
+                    .literal_variables
+                    .get(id)
+                    .map(|variable| variable.kind)
+                    .unwrap_or(PrimitiveLiteralKind::Integer);
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                        expected: ScalarType::Str,
+                        found: ScalarLiteralKind::Primitive(kind),
+                    },
+                });
+                Ok(LocalType::Str)
+            }
+            (LocalType::Concrete(expected), LocalType::LiteralVariable(id))
+            | (LocalType::LiteralVariable(id), LocalType::Concrete(expected)) => {
+                if self.resolve_literal_variable(id, expected).is_ok() {
+                    Ok(LocalType::Concrete(expected))
+                } else {
+                    let kind = self
+                        .literal_variables
+                        .get(id)
+                        .map(|variable| variable.kind)
+                        .unwrap_or(PrimitiveLiteralKind::Integer);
+                    self.errors.push(PrimitiveBodyError {
+                        node,
+                        kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                            expected: ScalarType::Primitive(expected),
+                            found: ScalarLiteralKind::Primitive(kind),
+                        },
+                    });
+                    Ok(LocalType::Concrete(expected))
+                }
+            }
+            (LocalType::LiteralVariable(left), LocalType::LiteralVariable(right)) => {
+                if left == right {
+                    // `[n, n]` — the same variable appears twice; merging
+                    // it into itself would cycle the merge chain.
+                    return Ok(LocalType::LiteralVariable(right));
+                }
+                let left_resolved = self
+                    .literal_variables
+                    .get(left)
+                    .and_then(|variable| variable.resolved);
+                let right_resolved = self
+                    .literal_variables
+                    .get(right)
+                    .and_then(|variable| variable.resolved);
+                match (left_resolved, right_resolved) {
+                    (Some(left_type), Some(right_type)) => {
+                        if left_type != right_type {
+                            self.errors.push(PrimitiveBodyError {
+                                node,
+                                kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                                    expected: ScalarType::Primitive(left_type),
+                                    found: ScalarType::Primitive(right_type),
+                                },
+                            });
+                        }
+                        Ok(LocalType::LiteralVariable(right))
+                    }
+                    // A resolved variable anchors the group like a concrete
+                    // element: the other side resolves against it so its
+                    // literal still range-checks (`[300, n]` at `U8`).
+                    (Some(left_type), None) => {
+                        if self.resolve_literal_variable(right, left_type).is_err() {
+                            let kind = self
+                                .literal_variables
+                                .get(right)
+                                .map(|variable| variable.kind)
+                                .unwrap_or(PrimitiveLiteralKind::Integer);
+                            self.errors.push(PrimitiveBodyError {
+                                node,
+                                kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                    expected: ScalarType::Primitive(left_type),
+                                    found: ScalarLiteralKind::Primitive(kind),
+                                },
+                            });
+                        }
+                        Ok(LocalType::LiteralVariable(right))
+                    }
+                    (None, Some(right_type)) => {
+                        if self.resolve_literal_variable(left, right_type).is_err() {
+                            let kind = self
+                                .literal_variables
+                                .get(left)
+                                .map(|variable| variable.kind)
+                                .unwrap_or(PrimitiveLiteralKind::Integer);
+                            self.errors.push(PrimitiveBodyError {
+                                node,
+                                kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                    expected: ScalarType::Primitive(right_type),
+                                    found: ScalarLiteralKind::Primitive(kind),
+                                },
+                            });
+                        }
+                        Ok(LocalType::LiteralVariable(right))
+                    }
+                    (None, None) => {
+                        let left_kind = self
+                            .literal_variables
+                            .get(left)
+                            .map(|variable| variable.kind);
+                        let right_kind = self
+                            .literal_variables
+                            .get(right)
+                            .map(|variable| variable.kind);
+                        if left_kind.is_some() && left_kind == right_kind {
+                            // Same literal family: merge into one inference
+                            // group so a later constraint resolves every
+                            // element together. The merge links group
+                            // roots and never cycles.
+                            // The shared kernel merge normalizes both
+                            // sides to their group roots and refuses
+                            // links that would close a cycle.
+                            let _ = self.merge_literal_variables(left, right);
+                            pending_literals.push((right, node));
+                            Ok(LocalType::LiteralVariable(left))
+                        } else {
+                            // Cross-family literal pairs cannot merge, but
+                            // a concrete anchor later in the array still
+                            // decides them — the element waits in the
+                            // pending list instead of gating the shape.
+                            pending_literals.push((right, node));
+                            Ok(LocalType::LiteralVariable(left))
+                        }
+                    }
+                }
+            }
+            // Composite elements (nested arrays, tuple elements) stay gated
+            // in array positions for this slice.
+            _ => Err(()),
+        };
+        // An anchor constrains every literal that was checked before it
+        // arrived — in place, so later elements see the resolved types.
+        if anchor.is_some() {
+            if let Some(anchor) = anchor {
+                let pending = std::mem::take(pending_literals);
+                for (id, literal_node) in pending {
+                    self.resolve_pending_array_literal(id, literal_node, anchor)?;
+                }
+            }
+        }
+        return result;
+    }
+
+    /// A literal element that was checked before the array's anchor
+    /// resolve against it now: resolution performs the usual range
+    /// check, and a family mismatch reports the anchor on the expected
+    /// side.
+    fn resolve_pending_array_literal(
+        &mut self,
+        id: usize,
+        node: HirId,
+        anchor: ScalarType,
+    ) -> Result<(), ()> {
+        let already_resolved = self
+            .literal_variables
+            .get(id)
+            .and_then(|variable| variable.resolved);
+        match (anchor, already_resolved) {
+            (ScalarType::Primitive(primitive), None) => {
+                if self.resolve_literal_variable(id, primitive).is_err() {
+                    let kind = self
+                        .literal_variables
+                        .get(id)
+                        .map(|variable| variable.kind)
+                        .unwrap_or(PrimitiveLiteralKind::Integer);
+                    self.errors.push(PrimitiveBodyError {
+                        node,
+                        kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                            expected: anchor,
+                            found: ScalarLiteralKind::Primitive(kind),
+                        },
+                    });
+                }
+            }
+            (ScalarType::Primitive(primitive), Some(resolved)) if resolved != primitive => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
+                        expected: anchor,
+                        found: ScalarType::Primitive(resolved),
+                    },
+                });
+            }
+            (ScalarType::Str, _) => {
+                let kind = self
+                    .literal_variables
+                    .get(id)
+                    .map(|variable| variable.kind)
+                    .unwrap_or(PrimitiveLiteralKind::Integer);
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                        expected: anchor,
+                        found: ScalarLiteralKind::Primitive(kind),
+                    },
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn check_initializer_value(
         &mut self,
         init: &Expr<'hir>,
@@ -6010,6 +6470,59 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         } else {
             match init.kind {
+                // Tuple and array literals in initializer positions build
+                // composite locals (spec 6.3.1): every element sits in an
+                // inference position, so elements check through the same
+                // initializer path and keep their literal variables.
+                // Annotated composite coercions and composite element uses
+                // are later slices and stay gated.
+                ExprKind::Tuple(elements) => {
+                    if annotation.is_some() || elements.len() < 2 {
+                        return Err(());
+                    }
+                    let mut element_types = Vec::with_capacity(elements.len());
+                    for element in elements.iter() {
+                        element_types.push(self.check_initializer_value(element, None)?.local_type);
+                    }
+                    let index = self.composite_types.len();
+                    self.composite_types
+                        .push(CompositeType::Tuple(element_types));
+                    LocalType::Composite(index)
+                }
+                ExprKind::Array(elements) => {
+                    if annotation.is_some() || elements.is_empty() {
+                        return Err(());
+                    }
+                    let elem = self.check_array_literal_elements(elements)?;
+                    let index = self.composite_types.len();
+                    self.composite_types.push(CompositeType::Array {
+                        elem,
+                        len: elements.len(),
+                    });
+                    LocalType::Composite(index)
+                }
+                // Tuple field projections and built-in indexing read
+                // through composite locals (spec 6.6.2, 6.7.1): the base
+                // must be a composite built by this body — scalar bases
+                // and trait-based indexing stay gated.
+                ExprKind::TupleField { base, index } => {
+                    let projected = self.check_tuple_field_projection(base, index, init.hir_id)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(projected, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        projected
+                    }
+                }
+                ExprKind::Index(base, index) => {
+                    let element = self.check_builtin_index(base, index)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(element, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        element
+                    }
+                }
                 ExprKind::Lit(Lit::Str(_)) => {
                     // A `Str` literal is a concrete `Str` value — never a
                     // literal variable. An annotated primitive coercion
@@ -7844,7 +8357,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             LocalType::Concrete(_)
             | LocalType::Str
             | LocalType::Error(_)
-            | LocalType::ErrorLiteralVariable(_) => None,
+            | LocalType::ErrorLiteralVariable(_)
+            | LocalType::Composite(_) => None,
         }
     }
 

@@ -27051,3 +27051,167 @@ fn else_if_chains_and_nested_ifs_in_initializers_join_literals() {
         }
     }
 }
+
+#[test]
+fn tuple_and_array_literal_construction_in_let_bindings() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Tuple and array literals in `let` initializers build composite
+        // locals; every element sits in an inference position.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, 1)\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, (1, 2))\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x + 1, if x > 0 { 1 } else { 2 })\n    x\n}\n",
+            &[],
+        ),
+        // Composite locals copy through plain paths.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, 1)\n    let u = t\n    x\n}\n",
+            &[],
+        ),
+        // Statement-only unit bodies check composite constructions too.
+        ("pub fn f(x: I32) {\n    let t = (x, 1)\n}\n", &[]),
+        // Array elements unify: mismatched concrete elements, out-of-range
+        // literals against a concrete anchor and `Str` mixes all diagnose
+        // instead of gating.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, true]\n    x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: U8) -> U8 {\n    let a = [x, 300]\n    x\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, \"a\"]\n    x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x + 1.5, 2)\n    x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        // Repeated variables never self-merge; resolved variables anchor
+        // the group so their literals still range-check; anchors later in
+        // source order constrain earlier literals the same way.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let n = 5\n    let a = [n, n]\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn g(v: U8) -> U8 {\n    v\n}\npub fn f(x: I32) -> I32 {\n    let n = 5\n    let z = g(n)\n    let a = [300, n]\n    x\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [1, 2.5, x]\n    x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        // Elements check in source order: an anchor early in the array
+        // resolves a literal variable before its later uses are checked.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let n = 2 + 3\n    let a = [x, n, -n]\n    x\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = 1\n    let b = 2\n    let arr = [a, b, a]\n    x\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "tuple/array construction in let bindings should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn tuple_projections_and_array_indexing_read_composite_locals() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Tuple fields and built-in indexing read composite locals in
+        // tail, initializer and operand positions (spec 6.6.2, 6.7.1).
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, 1)\n    t.0\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    a[0]\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, (1, 2))\n    t.1.0\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    a[0] + a[1]\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> Bool {\n    let t = (x, 1)\n    t.0 > t.1\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    let i = 0\n    a[i]\n}\n",
+            &[],
+        ),
+        // The projected element type unifies with the expectation.
+        (
+            "pub fn f(x: I32) -> Bool {\n    let t = (x, true)\n    t.0\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        // Out-of-range tuple indices diagnose; constant array indices
+        // are a runtime bounds check, never a compile error.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let t = (x, 1)\n    t.5\n}\n",
+            &[("TUPLE_INDEX_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let a = [x, 1]\n    a[7]\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "projections and indexing should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}

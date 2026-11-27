@@ -11573,3 +11573,67 @@ variable, and the arm-site join recurses into nested branch `if`s. An
 `if` without `else` is `()`-typed (spec 6.14.1) and still gates — it
 can never join a literal group. Divergent branches contribute no site
 as before.
+
+## IR-1214: Tuple and array literal construction in `let` bindings
+
+**Slice.** Composite literals only checked in return positions through
+the bespoke validators — `let t = (x, 1)` and `let a = [x, 1]` gated in
+every body because the kernel's `LocalType` had no composite
+representation:
+
+```sai
+pub fn f(x: I32) -> I32 {
+    let t = (x, (1, 2))   // nested tuples, operator and `if` elements
+    let a = [x, 1]        // literal elements join the element type
+    x
+}
+```
+
+**Implementation.** `LocalType` gained a `Composite(usize)` variant
+keying a `composite_types` arena on the function context, keeping the
+type `Copy` across the kernel. Tuple initializers check every element
+through the shared initializer path — elements are inference positions
+(spec 6.3.1), so literals keep their variables and mismatches inside
+them (`(x + 1.5, 2)`) diagnose as usual. Array initializers unify the
+element types: a concrete element anchors the join, literal elements
+resolve against it with the usual range check (`[x, 300]` at `U8`
+reports `LITERAL_OUT_OF_RANGE`), mismatched concrete elements report
+`TYPE_MISMATCH` naming the join type on the expected side, and
+same-family literal elements merge into one inference group so a later
+constraint resolves the whole array. Unannotated composite locals copy
+through plain paths. Composite *uses* — projections, indexing,
+destructuring, annotated composite coercions and composite tails —
+stay gated for their own slices, as do nested arrays, cross-family
+literal arrays without a concrete anchor (`[1, 2.5]`), empty
+composites, and composite assignment. The driver admits tuple and
+array shapes element-wise through the value walker, and error spans
+now recurse into composite elements so element errors surface instead
+of falling back to the gate.
+
+## IR-1215: Tuple projections and built-in array indexing read composite locals
+
+**Slice.** Composite construction (IR-1214) built tuple and array
+locals, but reading them gated — `t.0`, `t.1.0`, `a[0]` and `a[i]`
+stayed behind the gate in every position:
+
+```sai
+pub fn f(x: I32) -> I32 {
+    let t = (x, (1, 2))
+    let a = [x, 1]
+    t.1.0 + a[0]   // projections and indexing in operand positions
+}
+```
+
+**Implementation.** The kernel type-checks `t.N` against the tuple's
+element types (spec 6.6.2): an in-range index yields the element type
+with its inference state — `t.0` at a `-> Bool` return reports the
+`I32` mismatch — and an out-of-range index reports
+`TUPLE_INDEX_OUT_OF_RANGE`. Built-in indexing (spec 6.7.1) requires an
+array composite base and a `USize` index: integer literal indices and
+unresolved integer variables unify with `USize`, and the bounds check
+stays a runtime panic, so `a[7]` on a two-element array is not a
+compile error. Both forms work in tail, initializer and operand
+positions through the shared operand funnel, and chains like `t.1.0`
+recurse. Trait-based indexing, projections of scalar bases
+(`UNKNOWN_FIELD`), tuple indexing and malformed index digits
+(`INVALID_TUPLE_INDEX`) stay gated for their own slices.

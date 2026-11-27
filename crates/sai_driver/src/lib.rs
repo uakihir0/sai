@@ -13814,6 +13814,30 @@ fn check_function_body_primitive_local_block(
         ),
         _ => false,
     };
+    // Projection/index tails read composite locals built in the body —
+    // the base must chain to a block binding, and the index expression
+    // follows value admission like any other operand.
+    let is_supported_projection_tail = tail.is_some_and(|tail| match tail.kind {
+        ExprKind::TupleField { base, .. } => {
+            primitive_projection_base_shape_is_supported(base, &block_bindings, locals, inputs)
+        }
+        ExprKind::Index(base, index) => {
+            primitive_projection_base_shape_is_supported(base, &block_bindings, locals, inputs)
+                && primitive_value_expression_shape_is_supported(
+                    index,
+                    &block_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    &mut primitive_types,
+                )
+        }
+        _ => false,
+    });
     let tail_binding = match tail_kind {
         Some(ExprKind::Path(tail_path)) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -13849,6 +13873,9 @@ fn check_function_body_primitive_local_block(
         Some(ExprKind::Return(..)) if is_supported_return_tail => None,
         Some(ExprKind::Loop { .. }) if is_supported_loop_tail => None,
         Some(ExprKind::Block(_)) if is_supported_block_tail => None,
+        Some(ExprKind::TupleField { .. } | ExprKind::Index(..)) if is_supported_projection_tail => {
+            None
+        }
         Some(ExprKind::Tuple(_)) if is_supported_unit_tail => None,
         // A statement-only unit body carries no tail binding.
         None => None,
@@ -13870,6 +13897,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_loop_tail
         && !is_supported_block_tail
         && !is_supported_unit_tail
+        && !is_supported_projection_tail
     {
         return Ok(None);
     }
@@ -15001,6 +15029,27 @@ fn primitive_nested_operand_shape_is_supported(
         ExprKind::Lit(_) => is_direct_function_scalar_literal(operand),
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        // Projections and indexing in operand positions read composite
+        // locals — the kernel resolves the element type through the same
+        // funnel it uses for paths.
+        ExprKind::TupleField { base, .. } => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+        }
+        ExprKind::Index(base, index) => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+                && primitive_nested_operand_shape_is_supported(
+                    index,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+        }
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&operand.hir_id))
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&operand.hir_id))
@@ -15162,6 +15211,24 @@ struct StrShapeAdmissions {
     annotations: HashSet<HirId>,
 }
 
+/// A projection or indexing base is a plain path to a preceding local or
+/// a nested projection/index chain rooted at one.
+fn primitive_projection_base_shape_is_supported(
+    base: &HirExpr<'_>,
+    preceding_bindings: &HashSet<sai_hir::BindingId>,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    match base.kind {
+        ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+            .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        ExprKind::TupleField { base, .. } | ExprKind::Index(base, _) => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+        }
+        _ => false,
+    }
+}
+
 fn primitive_value_expression_shape_is_supported(
     expression: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
@@ -15177,6 +15244,75 @@ fn primitive_value_expression_shape_is_supported(
     let init = expression;
     match init.kind {
         ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
+        // Tuple and array literals admit element-wise (§6.3.1): every
+        // element sits in an inference position, so each element follows
+        // the same value admission. The kernel builds the composite type
+        // from the elements; element shapes it cannot check yet (nested
+        // arrays, cross-family literal joins) fall back to the gate.
+        ExprKind::Tuple(elements) if elements.len() >= 2 => {
+            return elements.iter().all(|element| {
+                primitive_value_expression_shape_is_supported(
+                    element,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            });
+        }
+        ExprKind::Array(elements) if !elements.is_empty() => {
+            return elements.iter().all(|element| {
+                primitive_value_expression_shape_is_supported(
+                    element,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+            });
+        }
+        // Tuple field projections and built-in indexing read composite
+        // locals (§6.6.2, §6.7.1): the base is a preceding local or a
+        // nested projection/index chain, and the index expression follows
+        // value admission. Non-composite bases and trait-based indexing
+        // fall back to the gate in the kernel.
+        ExprKind::TupleField { base, .. } => {
+            return primitive_projection_base_shape_is_supported(
+                base,
+                preceding_bindings,
+                locals,
+                inputs,
+            );
+        }
+        ExprKind::Index(base, index) => {
+            return primitive_projection_base_shape_is_supported(
+                base,
+                preceding_bindings,
+                locals,
+                inputs,
+            ) && primitive_value_expression_shape_is_supported(
+                index,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            );
+        }
         // Value-producing `if`/`match` unify each branch/arm body against
         // the let annotation or the assign place type; unannotated
         // initializers join the branch literal tails through the checker's
@@ -17214,6 +17350,24 @@ fn primitive_if_branch_tail_shape_is_supported(
             primitive_types,
         ),
         ExprKind::Binary(..) | ExprKind::Lit(_) => true,
+        ExprKind::TupleField { base, .. } => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+        }
+        ExprKind::Index(base, index) => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+                && primitive_value_expression_shape_is_supported(
+                    index,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+        }
         ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
             tail,
             preceding_bindings,
@@ -18500,6 +18654,15 @@ fn primitive_body_errors_to_diagnostics(
                 ),
                 "type mismatch",
             )?,
+            PrimitiveBodyErrorKind::TupleIndexOutOfRange => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TupleIndexOutOfRange,
+                "tuple index out of range".to_owned(),
+                "tuple index out of range",
+            )?,
             PrimitiveBodyErrorKind::MissingBlockTail { expected } => const_literal_diagnostic(
                 owner.id,
                 inputs,
@@ -18803,6 +18966,13 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
         ExprKind::Binary(_, left, right) => {
             primitive_body_error_span(left, node).or_else(|| primitive_body_error_span(right, node))
         }
+        ExprKind::TupleField { base, .. } => primitive_body_error_span(base, node),
+        ExprKind::Index(base, index) => {
+            primitive_body_error_span(base, node).or_else(|| primitive_body_error_span(index, node))
+        }
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => elements
+            .iter()
+            .find_map(|element| primitive_body_error_span(element, node)),
         ExprKind::Call { callee, args, base } => primitive_body_error_span(callee, node)
             .or_else(|| {
                 args.iter()
