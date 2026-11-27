@@ -9367,21 +9367,35 @@ fn discard_operator_expression_type(expr: &HirExpr<'_>) -> Option<ConstLiteralTy
     let mut has_float = false;
     let mut has_byte = false;
     let mut has_other_numeric = false;
-    let mut stack = vec![expr];
-    while let Some(current) = stack.pop() {
+    // Shift amounts do not participate in the result type (spec 6.8), so
+    // right operands of `<<`/`>>` are scanned for literal-ness but do not
+    // count toward the type determination.
+    let mut stack = vec![(expr, true)];
+    while let Some((current, counted)) = stack.pop() {
         match current.kind {
             ExprKind::Lit(Lit::Float { .. }) => {
-                has_float = true;
-                has_other_numeric = true;
+                if counted {
+                    has_float = true;
+                    has_other_numeric = true;
+                }
             }
-            ExprKind::Lit(Lit::Byte(_)) => has_byte = true,
-            ExprKind::Lit(Lit::Int { .. }) => has_other_numeric = true,
+            ExprKind::Lit(Lit::Byte(_)) => {
+                if counted {
+                    has_byte = true;
+                }
+            }
+            ExprKind::Lit(Lit::Int { .. }) => {
+                if counted {
+                    has_other_numeric = true;
+                }
+            }
             ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Str(_)) => {}
-            ExprKind::Binary(_, left, right) => {
-                stack.push(left);
-                stack.push(right);
+            ExprKind::Binary(operator, left, right) => {
+                let shift = matches!(operator, BinOp::Shl | BinOp::Shr);
+                stack.push((left, counted));
+                stack.push((right, counted && !shift));
             }
-            ExprKind::Unary(_, operand) => stack.push(operand),
+            ExprKind::Unary(_, operand) => stack.push((operand, counted)),
             _ => return None,
         }
     }

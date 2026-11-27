@@ -11694,6 +11694,7 @@ fn public_unit_return_discards_tail_values() {
         "pub fn f() { [1 + 2, 3] }\n",
         "pub fn f() { ~1 }\n",
         "pub fn f() { b'a' & b'b' }\n",
+        "pub fn f() { b'a' << 1 }\n",
         "pub fn f(x: I32) { 1 }\n",
         "pub fn f(x: I32) { (1, true) }\n",
         "pub fn f(x: I32) { (x, 1) }\n",
