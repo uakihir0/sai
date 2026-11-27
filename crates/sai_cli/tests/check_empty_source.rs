@@ -11720,6 +11720,8 @@ fn public_unit_return_discards_tail_values() {
         "pub fn f(x: I32) { let y = x\nlet z = y + 1\nz }\n",
         "pub fn f(x: Str) { let y = x\ny }\n",
         "pub fn f(x: I32) { x + 1\nx }\n",
+        "pub fn f(x: I32) { let y = x\n() }\n",
+        "pub fn f() { let x = 1\n() }\n",
         "pub fn f(x: Bool, y: Bool) { if not (x or y) { 1 } else { 2 } }\n",
         "pub fn f(x: I32, y: I32) { if x < y { 1 } else { 2 } }\n",
         "const N: I64 = 1\npub fn f() { N }\n",

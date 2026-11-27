@@ -674,6 +674,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.default_unresolved_literals(literal_floor);
             return Ok(());
         };
+        // The unit literal trivially checks against `()`; the initializer
+        // synthesis has no composite tuple representation for it.
+        if matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
+            self.default_unresolved_literals(literal_floor);
+            return Ok(());
+        }
         let check = self.check_initializer_value(tail, None)?;
         self.record_expression_type(tail.hir_id, check.local_type);
         self.default_unresolved_literals(literal_floor);
