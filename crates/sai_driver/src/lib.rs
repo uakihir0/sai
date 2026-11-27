@@ -13106,6 +13106,11 @@ fn check_function_body_primitive_local_block(
         && direct_call_signatures.is_some_and(|signatures| signatures.contains_key(&tail.hir_id));
     let is_supported_binary_tail = matches!(tail.kind, ExprKind::Binary(..));
     let is_supported_literal_tail = matches!(tail.kind, ExprKind::Lit(_));
+    // In unit mode the unit-literal tail trivially discards (spec 6.11.1);
+    // the kernel's initializer synthesis has no composite representation
+    // for it, so admission skips the shape whitelist below.
+    let is_supported_unit_tail = return_type.is_none()
+        && matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty());
     let is_supported_if_tail = matches!(tail.kind, ExprKind::If { els: Some(_), .. });
     let is_supported_match_tail = matches!(
         tail.kind,
@@ -13210,6 +13215,7 @@ fn check_function_body_primitive_local_block(
         ExprKind::Return(..) if is_supported_return_tail => None,
         ExprKind::Loop { .. } if is_supported_loop_tail => None,
         ExprKind::Block(_) if is_supported_block_tail => None,
+        ExprKind::Tuple(_) if is_supported_unit_tail => None,
         _ => return Ok(None),
     };
     if block.stmts.is_empty()
@@ -13224,6 +13230,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_return_tail
         && !is_supported_loop_tail
         && !is_supported_block_tail
+        && !is_supported_unit_tail
     {
         return Ok(None);
     }
