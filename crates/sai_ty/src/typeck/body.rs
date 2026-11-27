@@ -846,6 +846,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // wrong mismatch on a valid body.
             let mut diverges = false;
             let mut maybe_diverges = false;
+            let error_floor = self.errors.len();
             for stmt in block.stmts {
                 self.check_stmt(stmt)?;
                 if let StmtKind::Expr(expression) = stmt.kind {
@@ -869,17 +870,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             if !diverges {
-                if maybe_diverges {
+                // Errors the statements produced are real regardless of
+                // the divergence question — they must surface instead of
+                // hiding behind the uncertainty gate.
+                if maybe_diverges && self.errors.len() == error_floor {
                     return Err(());
                 }
-                self.errors.push(PrimitiveBodyError {
-                    node: block
-                        .stmts
-                        .last()
-                        .map(|stmt| stmt.hir_id)
-                        .unwrap_or(block.hir_id),
-                    kind: PrimitiveBodyErrorKind::MissingBlockTail { expected },
-                });
+                if !maybe_diverges {
+                    self.errors.push(PrimitiveBodyError {
+                        node: block
+                            .stmts
+                            .last()
+                            .map(|stmt| stmt.hir_id)
+                            .unwrap_or(block.hir_id),
+                        kind: PrimitiveBodyErrorKind::MissingBlockTail { expected },
+                    });
+                }
             }
             self.default_unresolved_literals(literal_floor);
             return Ok(());
