@@ -14255,14 +14255,37 @@ fn resolved_plain_local_path_binding(
 
 // Match scrutinees admit local/const paths and primitive member leaves
 // (consts or record-field projections). Other receivers stay outside.
+#[allow(clippy::too_many_arguments)]
 fn primitive_match_scrutinee_shape_is_supported(
     scrutinee: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
+    symbols: &Interner,
+    type_paths: Option<&TypeOwnerPathResolution>,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
+    direct_call_signatures: Option<&HashMap<HirId, sai_ty::typeck::body::PrimitiveCallSignature>>,
+    primitive_types: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
 ) -> bool {
     match scrutinee.kind {
+        // Operator expressions admit like any value expression — the
+        // kernel's operand funnel types them, so over-admission falls
+        // back to the gate rather than misdiagnosing.
+        ExprKind::Binary(..) | ExprKind::Unary(..) => {
+            primitive_value_expression_shape_is_supported(
+                scrutinee,
+                preceding_bindings,
+                locals,
+                inputs,
+                symbols,
+                type_paths,
+                self_field_projections,
+                unknown_self_fields,
+                direct_call_signatures,
+                primitive_types,
+            )
+        }
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
         ExprKind::Field { .. } => {
@@ -17494,7 +17517,12 @@ fn primitive_match_tail_shape_is_supported(
         preceding_bindings,
         locals,
         inputs,
+        symbols,
+        type_paths,
         self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+        primitive_types,
     ) {
         return false;
     }
@@ -17968,7 +17996,12 @@ fn primitive_match_stmt_shape_is_supported(
         preceding_bindings,
         locals,
         inputs,
+        symbols,
+        type_paths,
         self_field_projections,
+        unknown_self_fields,
+        direct_call_signatures,
+        primitive_types,
     ) {
         return false;
     }

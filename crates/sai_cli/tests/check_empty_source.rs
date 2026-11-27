@@ -27215,3 +27215,53 @@ fn tuple_projections_and_array_indexing_read_composite_locals() {
         }
     }
 }
+
+#[test]
+fn operator_expressions_serve_as_match_scrutinees() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Operator expressions synthesize a concrete scrutinee type that
+        // drives pattern checking (spec 6.27, 6.12).
+        (
+            "pub fn f(x: I32) -> I32 {\n    match x > 5 {\n        true => 1,\n        false => 2,\n    }\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    match x + 1 {\n        1 => 10,\n        _ => 20,\n    }\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: Bool) -> I32 {\n    match not x {\n        true => 1,\n        false => 2,\n    }\n}\n",
+            &[],
+        ),
+        // Exhaustiveness and arm-body checking still apply.
+        (
+            "pub fn f(x: I32) -> I32 {\n    match x + 1 {\n        1 => 10,\n    }\n}\n",
+            &[("NON_EXHAUSTIVE_MATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    match x > 5 {\n        true => 1,\n        false => true,\n    }\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "operator scrutinees should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
