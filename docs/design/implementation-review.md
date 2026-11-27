@@ -11484,3 +11484,22 @@ family names its default — the error itself is resolution-independent.
 **Bounded slice.** As in IR-1205: the expected type name can be
 imprecise when a later use would have resolved the variable to a
 non-default type; the error itself is always correct.
+
+## IR-1210: Non-`Bool` literals in logical operand positions diagnose
+
+**Slice.** `and`/`or`/`not` require `Bool` operands, so a literal of
+any other type in operand position — `flag and 1`, `x or "a"`,
+`not 2.5` — is always a type error. These report `TYPE_MISMATCH`
+instead of gating:
+
+```sai
+pub fn f(x: Bool) -> Bool {
+    x and 1   // TYPE_MISMATCH: expected `Bool`, found an integer literal
+}
+```
+
+**Implementation.** `check_logical_operand` gained the non-`Bool`
+literal arm, mirroring the condition-position rule of IR-1206:
+primitive literal families report `LiteralTypeMismatch` against
+`Bool`, `Str`/`Slice<Byte>` literals the scalar form. `not` operands
+inherit the rule through the shared operand recursion.

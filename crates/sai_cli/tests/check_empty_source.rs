@@ -26867,3 +26867,52 @@ fn incomparable_literal_inferred_pairs_are_diagnosed() {
         }
     }
 }
+
+#[test]
+fn non_bool_literal_logical_operands_are_diagnosed() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            "pub fn f(x: Bool) -> Bool {\n    x and 1\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: Bool) -> Bool {\n    1 and x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: Bool) -> Bool {\n    x or \"a\"\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: Bool) -> Bool {\n    x and 2.5\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f() -> Bool {\n    not 1\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        ("pub fn f(x: Bool) -> Bool {\n    x and true\n}\n", &[]),
+        ("pub fn f() -> Bool {\n    not true\n}\n", &[]),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "non-Bool literal logical operands should be diagnosed, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}

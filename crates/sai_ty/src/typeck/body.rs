@@ -3157,6 +3157,30 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
                 Ok(PrimTy::Bool)
             }
+            // A non-`Bool` literal in a logical operand position can
+            // never hold — `and`/`or`/`not` require `Bool` operands — so
+            // `flag and 1` reports the mismatch instead of gating.
+            ExprKind::Lit(literal) => {
+                if let Some(found) = primitive_literal_kind(literal) {
+                    self.errors.push(PrimitiveBodyError {
+                        node: operand.hir_id,
+                        kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                            expected: PrimTy::Bool,
+                            found,
+                        },
+                    });
+                } else {
+                    self.errors.push(PrimitiveBodyError {
+                        node: operand.hir_id,
+                        kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                            expected: ScalarType::Primitive(PrimTy::Bool),
+                            found: scalar_literal_kind(literal),
+                        },
+                    });
+                }
+                self.record_expression_type(operand.hir_id, LocalType::Concrete(PrimTy::Bool));
+                Ok(PrimTy::Bool)
+            }
             // `not` operands recurse into the same operand gate so
             // `enabled and not (value >= 18)` and `not (enabled and value >= 18)`
             // stay in source order; `not not` and other unary operators still
