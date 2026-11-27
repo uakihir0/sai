@@ -11261,3 +11261,41 @@ shape, so its diagnostics now surface wherever the body itself checks:
 the coverage conjunct is dropped and the function-owner emission loops
 collect them, exactly like the inherent-method path already did.
 Shadowing a name of an enclosing block remains allowed per spec.
+
+## IR-1203: Package-private and export function bodies check like public ones
+
+**Slice.** Spec 4.6.1 defines no module-private visibility level: a
+function without a visibility marker is package-private and `visible(e,
+M)` holds everywhere in its package, so its body type-checks exactly
+like a `pub` or `export` one. The whole multi-function program slice
+opens up:
+
+```sai
+fn helper(x: I32) -> I32 { x + 1 }
+pub fn f() -> I32 {
+    helper(41)
+}
+```
+
+Direct calls to package-private functions resolve and check —
+`helper(true)` is `TYPE_MISMATCH`, `helper()` on a one-parameter callee
+is `WRONG_ARGUMENT_COUNT` — and errors inside private bodies surface in
+place (`fn helper() -> I32 { "str" }` is `TYPE_MISMATCH`). `export`
+functions, call chains through private helpers, and mutually recursive
+pairs check the same way. Operator expressions as call arguments, which
+the kernel already typed for `pub` callees, reach the same behavior for
+private callees: valid shapes pass, operand type errors report
+`TYPE_MISMATCH` — integer literals never check against `Byte` (spec
+6.3.1) and shift amounts check against `U32` (spec 6.8.5) — while
+genuinely unsupported operand shapes stay conservatively gated.
+
+**Implementation.** The driver's body-check gate dropped its
+`Visibility::Pub` requirement (visibility never changes how a body
+checks), and the CLI's single-source shape gate admits functions
+without a `pub` token. Twenty-eight gated-expectation tests were
+re-baselined: shapes that are valid programs now assert success, and
+shapes carrying operand type errors assert their `TYPE_MISMATCH`
+counts and messages. CLI admission of package-private inherent
+methods is a separate follow-up slice: their shape gates expose a
+wide range of previously untested `self`-receiver forms that need
+their own rebaselining pass.
