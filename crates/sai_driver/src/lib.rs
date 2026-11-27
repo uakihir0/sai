@@ -14532,6 +14532,9 @@ fn primitive_logical_init_operand_shape_is_supported(
     match operand.kind {
         ExprKind::Path(_) | ExprKind::Field { .. } => is_preceding_or_field(operand),
         ExprKind::Lit(Lit::Bool(_)) => true,
+        // Non-`Bool` literals can never hold in a logical operand — the
+        // shape is admitted only so the checker diagnoses it.
+        ExprKind::Lit(_) => true,
         ExprKind::Call { .. } => primitive_direct_call_operand_shape_is_supported(
             operand,
             preceding_bindings,
