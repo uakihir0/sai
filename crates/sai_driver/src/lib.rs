@@ -13017,13 +13017,19 @@ fn check_function_body_primitive_local_block(
         }
     }
 
-    let Some(return_ty) = sig.ret else {
-        return Ok(None);
-    };
-    let Some(FunctionDirectType::Primitive(return_type)) =
-        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs)
-    else {
-        return Ok(None);
+    // A missing return type is the implicit `-> ()` (spec 6.5.1). Unit
+    // returns check the tail as a discard — synthesized without an
+    // expectation, any type accepted (spec 6.11.1/6.25.2) — so the
+    // kernel input carries no primitive expectation for them.
+    let return_type = match sig.ret {
+        Some(return_ty) => {
+            match resolve_function_direct_type(*return_ty, type_paths, symbols, inputs) {
+                Some(FunctionDirectType::Primitive(primitive)) => Some(primitive),
+                Some(FunctionDirectType::Unit) => None,
+                _ => return Ok(None),
+            }
+        }
+        None => None,
     };
     let ExprKind::Block(block) = body.value.kind else {
         return Ok(None);
@@ -74769,7 +74775,7 @@ property "shared"() {}
         let diagnostic_order_check = sai_ty::typeck::body::check_primitive_local_block_body(
             sai_ty::typeck::body::PrimitiveBodyInput {
                 body: diagnostic_order_body,
-                return_type: PrimTy::Bool,
+                return_type: Some(PrimTy::Bool),
                 initial_bindings: &std::collections::HashMap::new(),
                 str_bindings: None,
                 str_annotations: None,

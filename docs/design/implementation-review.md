@@ -11123,3 +11123,15 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Probes accept `x and y`, `not (x or y)`, and `x < y` in two-parameter unit bodies; mixed-type and three-parameter forms gate. CLI suite extended.
 
 **Remaining scope.** Mixed-type pair diagnostics; array-position const/parameter unification; parameter operators in discard positions; local bindings.
+
+## IR-1195: Kernel unit-return mode for operator discards
+
+**Decision.** The primitive body kernel's input return type becomes `Option<PrimTy>`: `None` checks the body against `()`, where a value tail discards its result (spec 6.11.1/6.25.2) and is therefore synthesized without an expectation through the existing `check_initializer_value` machinery — any resulting type is accepted. The driver admits implicit and explicit unit returns into the primitive walk instead of requiring a primitive annotation, so parameter operators, unary operators, shifts, and multi-parameter arithmetic in unit discards type through the kernel's full inference rather than a hand-rolled validator.
+
+**Reason.** The kernel already synthesized expectation-free initializer types for unannotated `let` bindings; unit-position discards need exactly that semantics. Because the dispatch tries the kernel before the discard validators, composite and `if`-shaped tails the kernel cannot synthesize fall back to the existing validators unchanged — the integration is additive. Statement positions, `return`, and break values keep their primitive expectations and defensively gate in unit mode for their own slices.
+
+**Failure boundary.** `if`/`match` tails in unit bodies gate in the kernel and fall back to the validators (which do not type parameter operators in branch positions — the branch-wise unit-checking slice); statements including `let` bindings gate; bool-literal arithmetic operands gate exactly as in primitive return positions (a pre-existing kernel-wide boundary).
+
+**Verification.** Probes accept `pub fn f(x: I32) { x + 1 }`, `x + y`, `not x`, `x << 1`, `x - 1 * 2`, and float arithmetic; `x + 1.5` with `x: I32` diagnoses TYPE_MISMATCH; out-of-range literals still diagnose; every pre-existing CLI and driver test passes unchanged.
+
+**Remaining scope.** Branch-wise unit checking in the kernel (`if` tails with operator branches); statements and `let` bindings in unit bodies; array-position unification in discards.
