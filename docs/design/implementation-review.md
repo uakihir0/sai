@@ -11087,3 +11087,15 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** CLI suite green including `pub fn f(x: I32, y: I32) { 1 }` and literal-condition chains in two-parameter bodies; probes confirm `x: I32<Bool>`, `x: Missing`, `self` parameters, and `[(x, 1), (true, 2)]` gate.
 
 **Remaining scope.** Multi-parameter `if` conditions; const item paths in discards; array-position parameter unification; local bindings.
+
+## IR-1191: Const item paths in unit discards
+
+**Decision.** Plain and member-access const references validate as self-typed discard values anywhere a parameter reference does: non-array positions accept them with no further checks, since the const initializer validates at its own definition and the indexed sites carry only consts whose type resolved in the direct fragment. Tuple positions accept element-wise; array positions gate for the element-unification inference slice, matching the parameter-reference boundary.
+
+**Reason.** Spec 6.11.1/6.25.2 discard any value in unit positions. The const-path site index (`const_literal_path_sites`) already maps every const path and member-access occurrence in a body to its direct type for the primitive walk, so the discard validator only needed to consult it — resolution failures and non-direct const types are absent from the index and therefore gate rather than passing silently.
+
+**Failure boundary.** Const paths in array positions gate (`[N, 1]`); consts whose types do not resolve in the direct fragment gate; unit-typed consts are not indexed and gate; cyclic consts still diagnose at their own definitions.
+
+**Verification.** Probes accept `const N: I64 = 1` discarded directly, in tuples, in `if` branch tails, with parameters present, through chained const references, and through `use`-imported and member-access (`helper.LIMIT`) paths; `[N, 1]` gates. CLI suite extended with the single-file forms.
+
+**Remaining scope.** Array-position const/parameter unification; parameter operators in discard positions; local bindings.
