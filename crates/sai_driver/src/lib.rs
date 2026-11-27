@@ -13688,13 +13688,9 @@ fn check_function_body_primitive_local_block(
     if block.safety != sai_hir::Safety::Safe {
         return Ok(None);
     }
-    // A statement-only unit body (no tail expression) evaluates to `()`
-    // (spec 6.25.2), so a unit-returning body admits it — the kernel
-    // checks the statements and the implicit unit result. A missing tail
-    // in a primitive-returning body stays gated.
-    if block.tail.is_none() && return_type.is_some() {
-        return Ok(None);
-    }
+    // A statement-only body (no tail expression) evaluates to `()`
+    // (spec 6.25.2): unit returns accept it, primitive returns diagnose
+    // the missing tail — the kernel checks both.
     let tail = block.tail;
     let tail_kind = tail.map(|tail| tail.kind);
     // `s.len()`/`s.is_empty()` calls on `Str` receivers check as
@@ -13858,7 +13854,10 @@ fn check_function_body_primitive_local_block(
         None => None,
         _ => return Ok(None),
     };
+    // A tailless body never depends on tail admission: the kernel types
+    // the statements and diagnoses the missing primitive tail itself.
     if block.stmts.is_empty()
+        && tail.is_some()
         && tail_binding.is_none()
         && !is_supported_field_tail
         && !is_supported_call_tail
@@ -18393,7 +18392,8 @@ fn primitive_body_errors_to_diagnostics(
                         .iter()
                         .find_map(|stmt| (stmt.hir_id == error.node).then_some(stmt.span))
                 })
-                .or_else(|| tail.and_then(|tail| primitive_body_error_span(tail, error.node))),
+                .or_else(|| tail.and_then(|tail| primitive_body_error_span(tail, error.node)))
+                .or_else(|| (block.hir_id == error.node).then_some(block.span)),
         };
         let Some(span) = span else {
             return Ok(None);
@@ -18498,6 +18498,15 @@ fn primitive_body_errors_to_diagnostics(
                     const_primitive_name(expected),
                     const_primitive_name(found)
                 ),
+                "type mismatch",
+            )?,
+            PrimitiveBodyErrorKind::MissingBlockTail { expected } => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `{}`, found `()`", const_primitive_name(expected)),
                 "type mismatch",
             )?,
             PrimitiveBodyErrorKind::ConstPatternType { found } => const_literal_diagnostic(

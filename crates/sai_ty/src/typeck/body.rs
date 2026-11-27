@@ -200,6 +200,11 @@ pub enum PrimitiveBodyErrorKind {
         expected: PrimTy,
         found: PrimTy,
     },
+    /// A statement-only block evaluates to `()`, which never coerces to
+    /// the primitive expectation — the body is missing its value tail.
+    MissingBlockTail {
+        expected: PrimTy,
+    },
     ConstPatternType {
         found: ScalarType,
     },
@@ -830,7 +835,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let literal_floor = self.literal_variables.len();
 
         let Some(tail) = block.tail else {
-            return Err(());
+            // A statement-only block evaluates to `()` (spec 6.25.2),
+            // which never coerces to the primitive expectation — the
+            // body is missing its value tail. The statements still
+            // check so their own errors surface alongside the mismatch.
+            for stmt in block.stmts {
+                self.check_stmt(stmt)?;
+            }
+            self.errors.push(PrimitiveBodyError {
+                node: block
+                    .stmts
+                    .last()
+                    .map(|stmt| stmt.hir_id)
+                    .unwrap_or(block.hir_id),
+                kind: PrimitiveBodyErrorKind::MissingBlockTail { expected },
+            });
+            self.default_unresolved_literals(literal_floor);
+            return Ok(());
         };
         let is_supported_field_tail = matches!(tail.kind, ExprKind::Field { .. })
             && self
