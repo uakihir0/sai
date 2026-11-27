@@ -9406,6 +9406,561 @@ fn direct_composite_type_display(
 // shift overflow are runtime panics (spec 6.8 / D-TYPE-06), not compile
 // errors — `CONST_EVAL_PANIC` applies to const initializers only.
 #[allow(clippy::too_many_arguments)]
+/// The type of an operator subexpression in composite element positions,
+/// where integer and float literals stay undetermined until they unify
+/// with a concrete type — the expectation-driven fragment of spec 6.3
+/// inference, since the element type is always known here.
+enum StructuralOperandType {
+    Concrete(ConstLiteralType),
+    /// An undetermined integer literal: `(value, negated, span)` feeding
+    /// the range check when it meets a concrete integer type.
+    IntLiteral(u128, bool, sai_hir::Span),
+    /// An undetermined float literal: `(text, negated, span)` feeding the
+    /// finite-range check when it meets a concrete float type.
+    FloatLiteral(Symbol, bool, sai_hir::Span),
+}
+
+impl StructuralOperandType {
+    fn is_numeric_or_literal(&self) -> bool {
+        match self {
+            StructuralOperandType::Concrete(ConstLiteralType::Primitive(primitive)) => {
+                sai_ty::typeck::literal::is_integer_primitive(*primitive)
+                    || matches!(
+                        primitive,
+                        sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64
+                    )
+            }
+            StructuralOperandType::IntLiteral(..) | StructuralOperandType::FloatLiteral(..) => true,
+            _ => false,
+        }
+    }
+
+    fn is_integer_or_literal(&self) -> bool {
+        match self {
+            StructuralOperandType::Concrete(ConstLiteralType::Primitive(primitive)) => {
+                sai_ty::typeck::literal::is_integer_primitive(*primitive)
+            }
+            StructuralOperandType::IntLiteral(..) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Synthesizes the type of an operator subexpression whose leaves are
+/// literals, parameter paths, or const references, validating operand
+/// compatibility as it goes. `Err(diagnostics)` inside the `Some` carries
+/// the first type failure; `None` gates shapes outside the bounded slice
+/// (calls, composite operands, non-numeric arithmetic like the kernel's
+/// Bool boundary).
+#[allow(clippy::too_many_arguments)]
+fn synthesize_structural_operator_type(
+    owner: &HirOwner<'_>,
+    expr: &HirExpr<'_>,
+    sig: sai_hir::body::FnSig<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    const_path_types: Option<&HashMap<HirId, FunctionDirectType>>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Result<StructuralOperandType, Vec<Diagnostic>>>, OwnerControlFlowResolutionError>
+{
+    macro_rules! synth {
+        ($e:expr) => {
+            match synthesize_structural_operator_type(
+                owner,
+                $e,
+                sig,
+                body,
+                locals,
+                type_paths,
+                const_path_types,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )? {
+                Some(Ok(ty)) => ty,
+                Some(Err(diagnostics)) => return Ok(Some(Err(diagnostics))),
+                None => return Ok(None),
+            }
+        };
+    }
+    let result = match expr.kind {
+        ExprKind::Lit(Lit::Int { value, negated }) => {
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            Ok(StructuralOperandType::IntLiteral(value, negated, expr.span))
+        }
+        ExprKind::Lit(Lit::Float { text, negated }) => Ok(StructuralOperandType::FloatLiteral(
+            text, negated, expr.span,
+        )),
+        ExprKind::Lit(Lit::Bool(_)) => Ok(StructuralOperandType::Concrete(
+            ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool),
+        )),
+        ExprKind::Lit(Lit::Char(_)) => Ok(StructuralOperandType::Concrete(
+            ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Char),
+        )),
+        ExprKind::Lit(Lit::Byte(_)) => Ok(StructuralOperandType::Concrete(
+            ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Byte),
+        )),
+        ExprKind::Lit(Lit::Str(_)) => Ok(StructuralOperandType::Concrete(ConstLiteralType::Str)),
+        ExprKind::Lit(Lit::ByteStr(_)) => return Ok(None),
+        ExprKind::Path(_) | ExprKind::Field { .. } => {
+            // Const references resolve through the const-site index first;
+            // plain parameter paths resolve through the signature.
+            if let Some(const_type) = const_path_types.and_then(|types| types.get(&expr.hir_id)) {
+                let direct = match const_type {
+                    FunctionDirectType::Primitive(primitive) => {
+                        ConstLiteralType::Primitive(*primitive)
+                    }
+                    FunctionDirectType::Str => ConstLiteralType::Str,
+                    FunctionDirectType::Unit => return Ok(None),
+                };
+                Ok(StructuralOperandType::Concrete(direct))
+            } else if let ExprKind::Path(path) = expr.kind {
+                if !(path.root == PathRoot::Plain
+                    && path.segments.len() == 1
+                    && path.segments[0].args.is_none())
+                {
+                    return Ok(None);
+                }
+                let Some(PathRes {
+                    base: Res::Local(binding),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                }) = locals.paths.get(&path.hir_id)
+                else {
+                    return Ok(None);
+                };
+                let Some(position) = body
+                    .params
+                    .iter()
+                    .position(|parameter| parameter.binding == *binding)
+                else {
+                    return Ok(None);
+                };
+                let Some(sig_parameter) = sig.params.get(position) else {
+                    return Ok(None);
+                };
+                let Some(parameter_type) =
+                    resolve_const_literal_type(*sig_parameter.ty, type_paths, symbols, inputs)
+                else {
+                    return Ok(None);
+                };
+                Ok(StructuralOperandType::Concrete(parameter_type))
+            } else {
+                return Ok(None);
+            }
+        }
+        ExprKind::Unary(operator, operand) => {
+            let operand_type = synth!(operand);
+            match operator {
+                UnOp::Neg => {
+                    if !operand_type.is_numeric_or_literal() {
+                        return Ok(None);
+                    }
+                    // Negation is not defined for the unsigned integer
+                    // primitives — the operator trait diagnostic matches
+                    // the kernel's.
+                    if let StructuralOperandType::Concrete(ConstLiteralType::Primitive(
+                        primitive @ (sai_resolve::prelude::PrimTy::U8
+                        | sai_resolve::prelude::PrimTy::U16
+                        | sai_resolve::prelude::PrimTy::U32
+                        | sai_resolve::prelude::PrimTy::U64
+                        | sai_resolve::prelude::PrimTy::USize),
+                    )) = operand_type
+                    {
+                        return Ok(Some(Err(vec![const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            expr.span,
+                            sai_diagnostics::Code::OperatorNotSupported,
+                            format!(
+                                "operator `-` has no `Neg` implementation for `{}`",
+                                const_primitive_name(primitive)
+                            ),
+                            "operator trait implementation is not available",
+                        )?])));
+                    }
+                    Ok(operand_type)
+                }
+                UnOp::BitNot => {
+                    if !operand_type.is_integer_or_literal() {
+                        return Ok(None);
+                    }
+                    Ok(operand_type)
+                }
+                UnOp::Deref => return Ok(None),
+                UnOp::Not => {
+                    let bool_type = StructuralOperandType::Concrete(ConstLiteralType::Primitive(
+                        sai_resolve::prelude::PrimTy::Bool,
+                    ));
+                    match unify_structural_operand_types(
+                        operand_type,
+                        bool_type,
+                        owner,
+                        operand.span,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )? {
+                        Ok(_) => Ok(StructuralOperandType::Concrete(
+                            ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool),
+                        )),
+                        Err(diagnostics) => Err(diagnostics),
+                    }
+                }
+            }
+        }
+        ExprKind::Binary(operator, left, right) => {
+            let left_type = synth!(left);
+            let right_type = synth!(right);
+            let bool_result = || {
+                Ok(StructuralOperandType::Concrete(
+                    ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::Bool),
+                ))
+            };
+            match operator {
+                BinOp::Rem | BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
+                    // Remainder and wrapping arithmetic are integer-only
+                    // (spec 6.8): float operands are the operator's own
+                    // diagnostic, other non-numerics keep the kernel-wide
+                    // gate.
+                    for (operand_type, operand_span) in
+                        [(&left_type, left.span), (&right_type, right.span)]
+                    {
+                        let float_operand = match operand_type {
+                            StructuralOperandType::Concrete(ConstLiteralType::Primitive(
+                                primitive @ (sai_resolve::prelude::PrimTy::F32
+                                | sai_resolve::prelude::PrimTy::F64),
+                            )) => Some(const_primitive_name(*primitive)),
+                            StructuralOperandType::FloatLiteral(..) => None,
+                            _ => continue,
+                        };
+                        let operator_text = match operator {
+                            BinOp::Rem => "%",
+                            BinOp::WrapAdd => "+%",
+                            BinOp::WrapSub => "-%",
+                            _ => "*%",
+                        };
+                        let (message, label) = match float_operand {
+                            Some(name) => (
+                                format!("operator `{operator_text}` is not defined for `{name}`"),
+                                if operator == BinOp::Rem {
+                                    "floating-point remainder is not supported"
+                                } else {
+                                    "wrapping arithmetic is not supported for this primitive"
+                                },
+                            ),
+                            None => (
+                                format!(
+                                    "operator `{operator_text}` is not defined for floating-point values"
+                                ),
+                                if operator == BinOp::Rem {
+                                    "floating-point remainder is not supported"
+                                } else {
+                                    "wrapping arithmetic is not supported for this primitive"
+                                },
+                            ),
+                        };
+                        return Ok(Some(Err(vec![const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            operand_span,
+                            sai_diagnostics::Code::OperatorNotSupported,
+                            message,
+                            label,
+                        )?])));
+                    }
+                    if !left_type.is_integer_or_literal() || !right_type.is_integer_or_literal() {
+                        return Ok(None);
+                    }
+                    match unify_structural_operand_types(
+                        left_type, right_type, owner, right.span, symbols, inputs, snapshot,
+                        target_cfg,
+                    )? {
+                        Ok(unified) => Ok(unified),
+                        Err(diagnostics) => Err(diagnostics),
+                    }
+                }
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    if !left_type.is_numeric_or_literal() || !right_type.is_numeric_or_literal() {
+                        return Ok(None);
+                    }
+                    unify_structural_operand_types(
+                        left_type, right_type, owner, right.span, symbols, inputs, snapshot,
+                        target_cfg,
+                    )?
+                }
+                BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                    if !left_type.is_integer_or_literal() || !right_type.is_integer_or_literal() {
+                        return Ok(None);
+                    }
+                    unify_structural_operand_types(
+                        left_type, right_type, owner, right.span, symbols, inputs, snapshot,
+                        target_cfg,
+                    )?
+                }
+                BinOp::Shl | BinOp::Shr => {
+                    // Shift results carry the left operand's type. The
+                    // shift count must be `U32` (spec 6.8): literals adopt
+                    // it with a range check — negative counts are out of
+                    // range — and other integer types mismatch.
+                    if !left_type.is_integer_or_literal() || !right_type.is_integer_or_literal() {
+                        return Ok(None);
+                    }
+                    match unify_structural_operand_types(
+                        right_type,
+                        StructuralOperandType::Concrete(ConstLiteralType::Primitive(
+                            sai_resolve::prelude::PrimTy::U32,
+                        )),
+                        owner,
+                        right.span,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )? {
+                        Ok(_) => Ok(left_type),
+                        Err(diagnostics) => Err(diagnostics),
+                    }
+                }
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    if !left_type.is_numeric_or_literal() || !right_type.is_numeric_or_literal() {
+                        return Ok(None);
+                    }
+                    match unify_structural_operand_types(
+                        left_type, right_type, owner, right.span, symbols, inputs, snapshot,
+                        target_cfg,
+                    )? {
+                        Ok(_) => bool_result(),
+                        Err(diagnostics) => Err(diagnostics),
+                    }
+                }
+                BinOp::Eq | BinOp::Ne => {
+                    match unify_structural_operand_types(
+                        left_type, right_type, owner, right.span, symbols, inputs, snapshot,
+                        target_cfg,
+                    )? {
+                        Ok(_) => bool_result(),
+                        Err(diagnostics) => Err(diagnostics),
+                    }
+                }
+                BinOp::And | BinOp::Or => {
+                    let bool_type = || {
+                        StructuralOperandType::Concrete(ConstLiteralType::Primitive(
+                            sai_resolve::prelude::PrimTy::Bool,
+                        ))
+                    };
+                    if let Err(diagnostics) = unify_structural_operand_types(
+                        left_type,
+                        bool_type(),
+                        owner,
+                        left.span,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )? {
+                        return Ok(Some(Err(diagnostics)));
+                    }
+                    if let Err(diagnostics) = unify_structural_operand_types(
+                        right_type,
+                        bool_type(),
+                        owner,
+                        right.span,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )? {
+                        return Ok(Some(Err(diagnostics)));
+                    }
+                    bool_result()
+                }
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(result))
+}
+
+/// Unifies two operand types: concrete types must match exactly (spec 6.1
+/// — no coercions), integer literals adopt the concrete integer type they
+/// meet with a range check, and two undetermined literals of the same
+/// kind stay undetermined. Mismatches produce TYPE_MISMATCH at `span`.
+#[allow(clippy::too_many_arguments)]
+fn unify_structural_operand_types(
+    left: StructuralOperandType,
+    right: StructuralOperandType,
+    owner: &HirOwner<'_>,
+    span: sai_hir::Span,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Result<StructuralOperandType, Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let diagnostic = |expected: ConstLiteralType, found: ConstLiteralType| {
+        const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found `{}`",
+                function_direct_type_name(match expected {
+                    ConstLiteralType::Primitive(p) => FunctionDirectType::Primitive(p),
+                    ConstLiteralType::Str => FunctionDirectType::Str,
+                    ConstLiteralType::Unit => FunctionDirectType::Unit,
+                }),
+                function_direct_type_name(match found {
+                    ConstLiteralType::Primitive(p) => FunctionDirectType::Primitive(p),
+                    ConstLiteralType::Str => FunctionDirectType::Str,
+                    ConstLiteralType::Unit => FunctionDirectType::Unit,
+                })
+            ),
+            "type mismatch",
+        )
+    };
+    // An undetermined integer literal meeting a concrete type adopts it
+    // when the type is integer and the value fits; anything else is the
+    // literal's TYPE_MISMATCH or LITERAL_OUT_OF_RANGE at its own span.
+    let adopt_int = |value: u128,
+                     negated: bool,
+                     literal_span: sai_hir::Span,
+                     concrete: ConstLiteralType|
+     -> Result<
+        Result<StructuralOperandType, Vec<Diagnostic>>,
+        OwnerControlFlowResolutionError,
+    > {
+        Ok(match concrete {
+            ConstLiteralType::Primitive(primitive)
+                if sai_ty::typeck::literal::is_integer_primitive(primitive) =>
+            {
+                match sai_ty::typeck::literal::check_primitive_literal(
+                    primitive,
+                    Lit::Int {
+                        value: Some(value),
+                        negated,
+                    },
+                    symbols,
+                    target_cfg.pointer_width(),
+                ) {
+                    sai_ty::typeck::literal::PrimitiveLiteralResult::Match => {
+                        Ok(StructuralOperandType::Concrete(concrete))
+                    }
+                    _ => Err(vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        literal_span,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        format!(
+                            "integer literal out of range for `{}`",
+                            function_direct_type_name(FunctionDirectType::Primitive(primitive))
+                        ),
+                        "integer literal out of range",
+                    )?]),
+                }
+            }
+            other => Err(vec![diagnostic(
+                other,
+                ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::I64),
+            )?]),
+        })
+    };
+    let adopt_float = |text: Symbol,
+                       negated: bool,
+                       literal_span: sai_hir::Span,
+                       concrete: ConstLiteralType,
+                       float_first: bool|
+     -> Result<
+        Result<StructuralOperandType, Vec<Diagnostic>>,
+        OwnerControlFlowResolutionError,
+    > {
+        Ok(match concrete {
+            ConstLiteralType::Primitive(
+                primitive @ (sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64),
+            ) => {
+                match sai_ty::typeck::literal::check_primitive_literal(
+                    primitive,
+                    Lit::Float { text, negated },
+                    symbols,
+                    target_cfg.pointer_width(),
+                ) {
+                    sai_ty::typeck::literal::PrimitiveLiteralResult::Match => Ok(
+                        StructuralOperandType::Concrete(ConstLiteralType::Primitive(primitive)),
+                    ),
+                    _ => Err(vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        literal_span,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        format!(
+                            "float literal out of range for `{}`",
+                            function_direct_type_name(FunctionDirectType::Primitive(primitive))
+                        ),
+                        "float literal out of range",
+                    )?]),
+                }
+            }
+            other => {
+                let float_type = ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::F64);
+                if float_first {
+                    Err(vec![diagnostic(float_type, other)?])
+                } else {
+                    Err(vec![diagnostic(other, float_type)?])
+                }
+            }
+        })
+    };
+    Ok(match (&left, &right) {
+        (StructuralOperandType::Concrete(a), StructuralOperandType::Concrete(b)) => {
+            if a == b {
+                Ok(StructuralOperandType::Concrete(*a))
+            } else {
+                Err(vec![diagnostic(*a, *b)?])
+            }
+        }
+        (StructuralOperandType::IntLiteral(..), StructuralOperandType::IntLiteral(..)) => Ok(left),
+        (StructuralOperandType::FloatLiteral(..), StructuralOperandType::FloatLiteral(..)) => {
+            Ok(left)
+        }
+        (
+            StructuralOperandType::IntLiteral(value, negated, literal_span),
+            StructuralOperandType::Concrete(concrete),
+        ) => adopt_int(*value, *negated, *literal_span, *concrete)?,
+        (
+            StructuralOperandType::Concrete(concrete),
+            StructuralOperandType::IntLiteral(value, negated, literal_span),
+        ) => adopt_int(*value, *negated, *literal_span, *concrete)?,
+        (
+            StructuralOperandType::FloatLiteral(text, negated, literal_span),
+            StructuralOperandType::Concrete(concrete),
+        ) => adopt_float(*text, *negated, *literal_span, *concrete, true)?,
+        (
+            StructuralOperandType::Concrete(concrete),
+            StructuralOperandType::FloatLiteral(text, negated, literal_span),
+        ) => adopt_float(*text, *negated, *literal_span, *concrete, false)?,
+        (StructuralOperandType::IntLiteral(..), StructuralOperandType::FloatLiteral(..))
+        | (StructuralOperandType::FloatLiteral(..), StructuralOperandType::IntLiteral(..)) => {
+            Err(vec![diagnostic(
+                ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::I64),
+                ConstLiteralType::Primitive(sai_resolve::prelude::PrimTy::F64),
+            )?])
+        }
+    })
+}
+
 fn check_function_operator_expression_against_type(
     owner: OwnerId,
     literal_type: ConstLiteralType,
@@ -10296,7 +10851,7 @@ fn check_function_composite_literal_element(
     let Some(literal_type) = resolve_const_literal_type(ty, type_paths, symbols, inputs) else {
         return Ok(None);
     };
-    check_function_operator_expression_against_type(
+    if let Some(diagnostics) = check_function_operator_expression_against_type(
         owner.id,
         literal_type,
         element,
@@ -10304,7 +10859,53 @@ fn check_function_composite_literal_element(
         inputs,
         snapshot,
         target_cfg,
-    )
+    )? {
+        return Ok(Some(diagnostics));
+    }
+    // Operator expressions over parameters and const references check
+    // structurally: the element type is known, so the expectation-driven
+    // fragment of inference suffices — concrete operands must match
+    // exactly, literals adopt the type they unify with (spec 6.3).
+    if matches!(element.kind, ExprKind::Binary(..) | ExprKind::Unary(..)) {
+        let Some(result) = synthesize_structural_operator_type(
+            owner,
+            element,
+            sig,
+            body,
+            locals,
+            type_paths,
+            const_path_types,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        let result_type = match result {
+            Ok(ty) => ty,
+            Err(diagnostics) => return Ok(Some(diagnostics)),
+        };
+        let expected = match literal_type {
+            ConstLiteralType::Primitive(primitive) => primitive,
+            _ => return Ok(None),
+        };
+        return match unify_structural_operand_types(
+            result_type,
+            StructuralOperandType::Concrete(ConstLiteralType::Primitive(expected)),
+            owner,
+            element.span,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )? {
+            Ok(_) => Ok(Some(Vec::new())),
+            Err(diagnostics) => Ok(Some(diagnostics)),
+        };
+    }
+    Ok(None)
 }
 
 fn check_inherent_method_body_type<'a>(
