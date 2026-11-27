@@ -26980,6 +26980,11 @@ fn primitive_bodies_missing_value_tails_are_diagnosed() {
         ("pub fn f() -> I32 {\n    1\n}\n", &[]),
         ("pub fn f() {\n}\n", &[]),
         ("pub fn f(x: I32) {\n    let y = x + 1\n}\n", &[]),
+        ("pub fn f() -> I32 {\n    return 1\n    let y = 2\n}\n", &[]),
+        (
+            "pub fn f(x: I32) -> I32 {\n    while x < 10 { x + 1 }\n    let y = 1\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
     ];
     for (source, code_counts) in cases {
         let output = run_check(source, "", &[], &[]);

@@ -839,17 +839,48 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // which never coerces to the primitive expectation — the
             // body is missing its value tail. The statements still
             // check so their own errors surface alongside the mismatch.
+            // A direct `return` statement diverges first, so the block
+            // is `Never` and coerces instead; other possibly-diverging
+            // statements (`if`/`match`/`loop`/`break`/`continue`) need
+            // divergence analysis and stay gated rather than risking a
+            // wrong mismatch on a valid body.
+            let mut diverges = false;
+            let mut maybe_diverges = false;
             for stmt in block.stmts {
                 self.check_stmt(stmt)?;
+                if let StmtKind::Expr(expression) = stmt.kind {
+                    match expression.kind {
+                        ExprKind::Return(_) => diverges = true,
+                        // `while` loops and `if`s without `else` always
+                        // fall through, so they never diverge; only
+                        // two-sided `if`s, `match`es, bare `loop`s and
+                        // direct `break`/`continue` can.
+                        ExprKind::If { els: Some(_), .. } | ExprKind::Match { .. } => {
+                            maybe_diverges = true
+                        }
+                        ExprKind::Loop {
+                            source: LoopSource::Loop,
+                            ..
+                        }
+                        | ExprKind::Break { .. }
+                        | ExprKind::Continue { .. } => maybe_diverges = true,
+                        _ => {}
+                    }
+                }
             }
-            self.errors.push(PrimitiveBodyError {
-                node: block
-                    .stmts
-                    .last()
-                    .map(|stmt| stmt.hir_id)
-                    .unwrap_or(block.hir_id),
-                kind: PrimitiveBodyErrorKind::MissingBlockTail { expected },
-            });
+            if !diverges {
+                if maybe_diverges {
+                    return Err(());
+                }
+                self.errors.push(PrimitiveBodyError {
+                    node: block
+                        .stmts
+                        .last()
+                        .map(|stmt| stmt.hir_id)
+                        .unwrap_or(block.hir_id),
+                    kind: PrimitiveBodyErrorKind::MissingBlockTail { expected },
+                });
+            }
             self.default_unresolved_literals(literal_floor);
             return Ok(());
         };
