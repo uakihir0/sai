@@ -5962,6 +5962,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         node: HirId,
     ) -> Result<LocalType, ()> {
         let base_type = self.check_operand_local_type(base)?;
+        // An error base already reported its diagnostic — propagate it
+        // instead of gating, so `t.5.0` keeps the out-of-range error.
+        if let LocalType::Error(_) = base_type {
+            return Ok(base_type);
+        }
         let LocalType::Composite(composite) = base_type else {
             return Err(());
         };
@@ -5994,6 +5999,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         index: &'hir Expr<'hir>,
     ) -> Result<LocalType, ()> {
         let base_type = self.check_operand_local_type(base)?;
+        if let LocalType::Error(_) = base_type {
+            return Ok(base_type);
+        }
         let LocalType::Composite(composite) = base_type else {
             return Err(());
         };

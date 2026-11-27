@@ -17350,6 +17350,24 @@ fn primitive_if_branch_tail_shape_is_supported(
             primitive_types,
         ),
         ExprKind::Binary(..) | ExprKind::Lit(_) => true,
+        ExprKind::TupleField { base, .. } => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+        }
+        ExprKind::Index(base, index) => {
+            primitive_projection_base_shape_is_supported(base, preceding_bindings, locals, inputs)
+                && primitive_value_expression_shape_is_supported(
+                    index,
+                    preceding_bindings,
+                    locals,
+                    inputs,
+                    symbols,
+                    type_paths,
+                    self_field_projections,
+                    unknown_self_fields,
+                    direct_call_signatures,
+                    primitive_types,
+                )
+        }
         ExprKind::If { .. } => primitive_if_tail_shape_is_supported(
             tail,
             preceding_bindings,
