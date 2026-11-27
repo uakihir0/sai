@@ -2930,6 +2930,39 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 {
                     match primitive_comparison_result(operator, path_type, path_type) {
                         PrimitiveComparisonResult::Bool => {
+                            // A comparison against a concretely typed
+                            // operand the variable's family never unifies
+                            // with (spec 6.3) can never hold — `x == b`
+                            // with `let x = 1` and a `Bool` `b` mismatches
+                            // no matter which integer type `x` later takes.
+                            if !literal_family_accepts(variable_kind, path_type) {
+                                // The right operand checks against the
+                                // left operand's type (N-C-2), so the
+                                // mismatch always lands on the right.
+                                if literal_expression.hir_id == right.hir_id {
+                                    // The variable is on the left: the
+                                    // concrete right operand never unifies
+                                    // with its family.
+                                    self.errors.push(PrimitiveBodyError {
+                                        node: right.hir_id,
+                                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                            expected: literal_variable_default_type(variable_kind),
+                                            found: path_type,
+                                        },
+                                    });
+                                } else {
+                                    // The variable is on the right: it
+                                    // checks against the concrete left type.
+                                    self.errors.push(PrimitiveBodyError {
+                                        node: right.hir_id,
+                                        kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                            expected: path_type,
+                                            found: variable_kind,
+                                        },
+                                    });
+                                }
+                                return Ok(LocalType::Concrete(PrimTy::Bool));
+                            }
                             self.resolve_literal_variable(id, path_type)?;
                             return Ok(LocalType::Concrete(PrimTy::Bool));
                         }
@@ -2951,6 +2984,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         .get(other)
                         .is_some_and(|v| v.resolved.is_none())
                 {
+                    // Cross-family pairs never unify (spec 6.3): an integer
+                    // variable only takes integer types, a float variable
+                    // only `F32`/`F64` — `x == y` on `let x = 1` /
+                    // `let y = 2.5` mismatches no matter the resolutions.
+                    let other_kind = self.literal_variables.get(other).map(|v| v.kind);
+                    if let Some(other_kind) = other_kind
+                        && other_kind != variable_kind
+                    {
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected: literal_variable_default_type(variable_kind),
+                                found: other_kind,
+                            },
+                        });
+                        return Ok(LocalType::Concrete(PrimTy::Bool));
+                    }
                     self.merge_literal_variables(id, other)?;
                     return Ok(LocalType::Concrete(PrimTy::Bool));
                 }

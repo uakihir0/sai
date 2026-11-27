@@ -11455,3 +11455,32 @@ pub fn f(x: I32) -> I32 {
 produced the `U32` mismatch through `check_annotated_literal`; the
 three remaining call sites simply opt into it. Integer literal counts
 keep joining the inference group unchanged.
+
+## IR-1209: Incomparable literal-inference pairs diagnose in comparisons
+
+**Slice.** A comparison whose operands can never share a type is a
+type error no matter how inference later resolves them: an integer
+literal variable unifies only with integer types and a float variable
+only with `F32`/`F64` (spec 6.3), so `x == b` with `let x = 1` and a
+`Bool` `b`, or `x == y` with `let y = 2.5`, can never hold. Both now
+report `TYPE_MISMATCH` instead of gating:
+
+```sai
+pub fn f() -> Bool {
+    let x = 1
+    let y = 2.5
+    x == y   // TYPE_MISMATCH: expected `I64`, found a floating-point literal
+}
+```
+
+**Implementation.** `check_comparison`'s literal-variable paths gained
+the two family checks: a variable compared against a concretely typed
+operand the family never accepts reports instead of resolving, and an
+integer-variable/float-variable pair reports instead of merging. The
+diagnostic direction follows N-C-2 (the right operand checks against
+the left operand's type), and the expected side of a still-unresolved
+family names its default — the error itself is resolution-independent.
+
+**Bounded slice.** As in IR-1205: the expected type name can be
+imprecise when a later use would have resolved the variable to a
+non-default type; the error itself is always correct.

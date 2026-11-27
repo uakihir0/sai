@@ -26800,3 +26800,70 @@ fn non_integer_shift_counts_are_diagnosed() {
         }
     }
 }
+
+#[test]
+fn incomparable_literal_inferred_pairs_are_diagnosed() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            concat!(
+                "pub fn f() -> Bool {\n",
+                "    let x = 1\n",
+                "    let b = true\n",
+                "    x == b\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> Bool {\n",
+                "    let x = 1\n",
+                "    let b = true\n",
+                "    b == x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> Bool {\n",
+                "    let x = 1\n",
+                "    let y = 2.5\n",
+                "    x == y\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> Bool {\n",
+                "    let x = 1\n",
+                "    let y = 2\n",
+                "    x == y\n",
+                "}\n",
+            ),
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "incomparable literal-inferred pairs should be diagnosed, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}

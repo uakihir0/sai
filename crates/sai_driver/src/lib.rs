@@ -103003,7 +103003,7 @@ property "shared"() {}
         // Owner 57 (`a += b; b += a`) used to gate on the merge-cycle
         // check: root normalization makes the second merge a same-group
         // no-op, so it is genuinely supported now.
-        for index in [24, 32, 35, 42, 50, 53, 56, 63, 67, 68, 72] {
+        for index in [24, 32, 42, 50, 53, 56, 63, 67, 68, 72] {
             assert!(
                 matches!(
                     owners[index]
@@ -103024,6 +103024,17 @@ property "shared"() {}
             FunctionBodyTypeCheck::Supported { diagnostics }
                 if diagnostics.len() == 1
                     && diagnostics[0].code == sai_diagnostics::Code::OperatorNotSupported
+        ));
+        // `x < value` with `var x = 1` and a `Bool` parameter — the
+        // integer-family variable never unifies with `Bool` (spec 6.3), so
+        // the comparison reports its mismatch instead of gating.
+        assert!(matches!(
+            owners[35]
+                .body_type_check()
+                .expect("an incomparable operand pair is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
         // `x` merges under `y` at `y + x`, so the merge child precedes its
         // parent in declaration order — a per-index deferred pass would
