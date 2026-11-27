@@ -11135,3 +11135,15 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Probes accept `pub fn f(x: I32) { x + 1 }`, `x + y`, `not x`, `x << 1`, `x - 1 * 2`, and float arithmetic; `x + 1.5` with `x: I32` diagnoses TYPE_MISMATCH; out-of-range literals still diagnose; every pre-existing CLI and driver test passes unchanged.
 
 **Remaining scope.** Branch-wise unit checking in the kernel (`if` tails with operator branches); statements and `let` bindings in unit bodies; array-position unification in discards.
+
+## IR-1196: Statements and let bindings in unit-returning bodies
+
+**Decision.** Unit-mode blocks admit statements: `let` bindings type through the same initializer machinery as in primitive-returning bodies, and expression-statements discard their values (spec 6.11.1) by synthesizing without an expectation exactly like the tail. `assert` statements, assignments, and annotations behave as in primitive bodies — annotation mismatches diagnose at the initializer.
+
+**Reason.** Statement checking in the kernel is almost entirely return-mode-independent — only the expression-statement fallback carried the return type as inference guidance, and in unit mode the correct guidance is none. The block-level literal defaulting already covers statement literals through the shared floor mechanism.
+
+**Failure boundary.** Statement-only bodies without any tail gate at the driver level (the diagnostics converter keys on the tail — an implementation artifact, not a spec boundary); `if`/`match` tails still fall back to the driver validators; bool-literal arithmetic operands keep the kernel-wide gate.
+
+**Verification.** Probes accept `pub fn f(x: I32) { let y = x + 1\ny }`, chained bindings, `Str` bindings, annotated bindings, expression-statements, and asserts; `let y = x + 1.5` with `x: I32` and `let y: I64 = x` diagnose TYPE_MISMATCH; tail-less statement bodies gate. CLI suite extended.
+
+**Remaining scope.** Tail-less statement bodies; branch-wise unit checking in the kernel; array-position unification in discards.
