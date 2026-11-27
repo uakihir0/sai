@@ -11159,3 +11159,15 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Probes accept `0..=127/128..=255` over U8, `-128..=127` over I8, open-ended `201..`, exclusive `0..5` pairs, single-arm full ranges, and unit-discard tails; partial coverage (`0..=100` alone, `1`/`2` over I32) still diagnoses NON_EXHAUSTIVE_MATCH. CLI suite extended.
 
 **Remaining scope.** Const-valued pattern coverage; enum/variant exhaustiveness; slice patterns.
+
+## IR-1194: Const references in composite return elements
+
+**Decision.** Const paths and member-access const references in composite return element positions validate as self-typed values: the element type must match the const's declared type exactly, since concrete types do not coerce (spec 6.1). Matching accepts; mismatching diagnoses TYPE_MISMATCH at the element; consts absent from the direct-fragment index gate.
+
+**Reason.** The const-path site index already carries the declared type of every resolvable const reference in the body, so element validation only needs the equality check — no evaluation, since type correctness does not depend on the value. Unlike discard positions, array elements accept const references here because the expected type comes from the signature rather than element unification.
+
+**Failure boundary.** Tuple-typed or otherwise non-direct const types are not indexed and gate; elements whose expected type does not resolve in the direct fragment gate.
+
+**Verification.** Probes accept `(N, 1)` against `(I64, I64)`, `[N, 1]` against `Array<I32, 2>`, and `(S, 1)` with `S: Str`; `N: I64` against `(I32, I32)` diagnoses TYPE_MISMATCH. CLI suite extended.
+
+**Remaining scope.** Array-position unification in discards; kernel unit-return integration for operators and local bindings.
