@@ -28,7 +28,11 @@ use std::collections::{HashMap, HashSet};
 /// parameter types, and local path resolutions from the current owner analysis.
 pub struct PrimitiveBodyInput<'a, 'hir> {
     pub body: &'a Body<'hir>,
-    pub return_type: PrimTy,
+    /// `Some` checks the tail against the primitive return type. `None`
+    /// means the body checks against `()` — a value tail discards its
+    /// result (spec 6.11.1/6.25.2), so it is synthesized without an
+    /// expectation and any type is accepted.
+    pub return_type: Option<PrimTy>,
     pub initial_bindings: &'a HashMap<BindingId, PrimTy>,
     /// `Str`-typed parameter bindings admitted by the owner-aware driver —
     /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
@@ -381,7 +385,9 @@ struct LiteralVariable<'hir> {
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
 pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> PrimitiveBodyCheck {
-    if !supports_primitive_literal(input.return_type) {
+    if let Some(return_type) = input.return_type
+        && !supports_primitive_literal(return_type)
+    {
         return PrimitiveBodyCheck::Unsupported;
     }
     let binding_nodes = input
@@ -645,7 +651,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_block(&mut self, block: &Block<'hir>) -> Result<(), ()> {
-        self.check_block_expected(block, self.input.return_type)
+        match self.input.return_type {
+            Some(return_type) => self.check_block_expected(block, return_type),
+            None => self.check_block_unit(block),
+        }
+    }
+
+    /// A body block checked against `()`: every value tail discards its
+    /// result (spec 6.11.1/6.25.2), so it is synthesized without an
+    /// expectation and any type is accepted. Statements stay gated for
+    /// their own slice; `if`/`match` tails fall to the driver-level
+    /// validators until branch-wise unit checking lands here.
+    fn check_block_unit(&mut self, block: &Block<'hir>) -> Result<(), ()> {
+        if block.safety != Safety::Safe || !block.stmts.is_empty() {
+            return Err(());
+        }
+        let Some(tail) = block.tail else {
+            return Ok(());
+        };
+        let literal_floor = self.literal_variables.len();
+        let check = self.check_initializer_value(tail, None)?;
+        self.record_expression_type(tail.hir_id, check.local_type);
+        self.default_unresolved_literals(literal_floor);
+        Ok(())
     }
 
     fn check_block_expected(&mut self, block: &Block<'hir>, expected: PrimTy) -> Result<(), ()> {
@@ -3296,7 +3324,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Block(_) => return Err(()),
             _ => {}
         }
-        let local_type = self.check_expr_value(expression, self.input.return_type)?;
+        let Some(return_type) = self.input.return_type else {
+            return Err(());
+        };
+        let local_type = self.check_expr_value(expression, return_type)?;
         self.record_expression_type(expression.hir_id, local_type);
         Ok(())
     }
@@ -3784,20 +3815,26 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             _ => {}
         }
-        self.check_expr_value(value, self.input.return_type)
+        let Some(return_type) = self.input.return_type else {
+            return Err(());
+        };
+        self.check_expr_value(value, return_type)
     }
 
     /// `continue` resolves like `break`, minus the value rule.
     /// `return e` checks `e` against the declared primitive return type like a
     /// tail; a bare `return` in a non-unit body reports TYPE_MISMATCH (§6.17).
     fn check_return(&mut self, hir_id: HirId, value: Option<&'hir Expr<'hir>>) -> Result<(), ()> {
+        let Some(return_type) = self.input.return_type else {
+            return Err(());
+        };
         match value {
-            Some(value) => self.check_expr_expected(value, self.input.return_type),
+            Some(value) => self.check_expr_expected(value, return_type),
             None => {
                 self.errors.push(PrimitiveBodyError {
                     node: hir_id,
                     kind: PrimitiveBodyErrorKind::MissingReturnValue {
-                        expected: self.input.return_type,
+                        expected: return_type,
                     },
                 });
                 Ok(())
@@ -5069,7 +5106,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // reports the `Str` mismatch with its resolved type
             // instead of gating — `break n + 1` under a `Str` `β` is
             // `expected `Str`, found `I32``.
-            _ => self.check_expr_value(expression, self.input.return_type)?,
+            _ => match self.input.return_type {
+                Some(return_type) => self.check_expr_value(expression, return_type)?,
+                None => return Err(()),
+            },
         };
         match local_type {
             LocalType::Concrete(found) => self.errors.push(PrimitiveBodyError {
