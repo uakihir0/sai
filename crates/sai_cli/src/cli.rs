@@ -3719,9 +3719,6 @@ fn check_public_function_body_coverage(
                 .body_type_check()
                 .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
                 && owner
-                    .local_resolution()
-                    .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
-                && owner
                     .resolution()
                     .is_ok_and(|resolution| resolution.diagnostics.is_empty())
                 && owner.lowering_diagnostics().is_empty()
@@ -3889,9 +3886,6 @@ fn check_mixed_public_item_coverage(
             owner
                 .body_type_check()
                 .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
-                && owner
-                    .local_resolution()
-                    .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
                 && owner
                     .resolution()
                     .is_ok_and(|resolution| resolution.diagnostics.is_empty())
@@ -8417,6 +8411,13 @@ fn module_tree_workspace_check_diagnostics(
                 {
                     let mut body_diagnostics = Vec::new();
                     for owner in function_resolutions.owners() {
+                        // Local resolution diagnostics (`DUPLICATE_BINDING`,
+                        // `SHADOWS_MODULE`) are resolution-complete for
+                        // every body shape, so they surface wherever the
+                        // body itself checks — like inherent methods do.
+                        if let Ok(Some(locals)) = owner.local_resolution() {
+                            body_diagnostics.extend(locals.diagnostics.iter().cloned());
+                        }
                         match owner.body_type_check() {
                             Ok(body_check) => {
                                 body_diagnostics.extend(body_check.diagnostics().iter().cloned())
@@ -8612,6 +8613,13 @@ fn module_tree_workspace_check_diagnostics(
                         };
                     let mut body_diagnostics = Vec::new();
                     for owner in function_resolutions.owners() {
+                        // Local resolution diagnostics (`DUPLICATE_BINDING`,
+                        // `SHADOWS_MODULE`) are resolution-complete for
+                        // every body shape, so they surface wherever the
+                        // body itself checks — like inherent methods do.
+                        if let Ok(Some(locals)) = owner.local_resolution() {
+                            body_diagnostics.extend(locals.diagnostics.iter().cloned());
+                        }
                         match owner.body_type_check() {
                             Ok(body_check) => {
                                 body_diagnostics.extend(body_check.diagnostics().iter().cloned())

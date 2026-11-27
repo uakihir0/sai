@@ -11246,3 +11246,18 @@ the right operand against the left, and same-type non-arithmetic pairs
 report the operator diagnostic. The same rule applies in the remainder
 and literal-operand paths. The driver's `OPERATOR_NOT_SUPPORTED`
 translation learned the arithmetic operators.
+
+## IR-1202: Local resolution diagnostics surface in function bodies
+
+**Slice.** Rebinding a name in the same block is `DUPLICATE_BINDING`
+(spec 6.12.1, D-MOD-03) and shadowing an imported module alias is
+`SHADOWS_MODULE` (D-MOD-01). The resolver has always produced both for
+function bodies, but the CLI only collected them for inherent methods —
+for `pub fn` owners the coverage gate treated any local resolution
+diagnostic as a reason to gate the whole body, so
+`let y = x\nlet y = x` reported `FEATURE_NOT_IMPLEMENTED` instead of the
+spec diagnostic. Local resolution is scope-complete for every body
+shape, so its diagnostics now surface wherever the body itself checks:
+the coverage conjunct is dropped and the function-owner emission loops
+collect them, exactly like the inherent-method path already did.
+Shadowing a name of an enclosing block remains allowed per spec.
