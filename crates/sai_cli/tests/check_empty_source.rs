@@ -5677,7 +5677,6 @@ fn primitive_body_str_forms_outside_the_slice_remain_gated() {
     for source in [
         "pub fn str_arith() -> Bool {\n    let s = \"a\"\n    s + 1 == 2\n}\n",
         "pub fn str_match() -> Bool {\n    let s = \"a\"\n    match s { \"x\" => true, _ => false }\n}\n",
-        "pub fn str_assign_int() -> Bool {\n    var n = 1\n    n = \"a\"\n    true\n}\n",
     ] {
         let output = run_check(source, "", &[], &[]);
         assert_check_stays_gated(&output, source);
@@ -26405,6 +26404,115 @@ fn private_inherent_method_bodies_are_checked() {
         assert!(
             !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
             "private method bodies should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn assignments_to_literal_inferred_variables_are_checked() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x = true\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x = 2.5\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1.5\n",
+                "    x = 2\n",
+                "    1\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x = \"text\"\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> I32 {\n",
+                "    var x = 1\n",
+                "    x = 2\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[],
+        ),
+        (
+            concat!(
+                "pub fn f() -> F64 {\n",
+                "    var x = 1.5\n",
+                "    x = 2.5\n",
+                "    x\n",
+                "}\n",
+            ),
+            &[],
+        ),
+        (
+            concat!(
+                "pub fn f() -> U8 {\n",
+                "    var x = 1\n",
+                "    var y: U8 = x\n",
+                "    x = 300\n",
+                "    y\n",
+                "}\n",
+            ),
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        (
+            concat!(
+                "pub fn f() -> U8 {\n",
+                "    var x = 1\n",
+                "    var y: U8 = x\n",
+                "    x = 200\n",
+                "    y\n",
+                "}\n",
+            ),
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "assignments to literal-inferred variables should be checked, not gated:\n{stdout}"
         );
         let expected_exit = if code_counts.is_empty() {
             Some(0)

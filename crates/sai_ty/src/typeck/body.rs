@@ -4735,6 +4735,52 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let Some(variable) = self.literal_variables.get(id) else {
                         return Err(());
                     };
+                    // A variable already resolved by an earlier constraint
+                    // checks the literal against the resolved type directly —
+                    // `var x = 1` used at `U8` range-checks a later `x = 300`
+                    // at `U8` instead of joining the literal group.
+                    if let Some(expected) = variable.resolved {
+                        match primitive_literal_kind(literal) {
+                            Some(found) => {
+                                self.check_annotated_literal(expected, literal, found, rhs.hir_id);
+                            }
+                            // A `Str`/`Slice<Byte>` literal never unifies with
+                            // the integer/floating-point family (spec 6.3).
+                            None => {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: rhs.hir_id,
+                                    kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                        expected: ScalarType::Primitive(expected),
+                                        found: scalar_literal_kind(literal),
+                                    },
+                                });
+                            }
+                        }
+                        self.record_expression_type(rhs.hir_id, LocalType::Concrete(expected));
+                        return Ok(());
+                    }
+                    let literal_kind = primitive_literal_kind(literal);
+                    if literal_kind != Some(variable.kind) {
+                        // A literal of another family can never unify with
+                        // the variable's family (spec 6.3: integer literals
+                        // unify only with integer types, float literals only
+                        // with `F32`/`F64`), so the assignment mismatches no
+                        // matter which type the variable later resolves to.
+                        // The expected side names the family default — the
+                        // type the variable takes when nothing else constrains
+                        // it — like the comparison-operand recovery does.
+                        self.errors.push(PrimitiveBodyError {
+                            node: rhs.hir_id,
+                            kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                                expected: ScalarType::Primitive(literal_variable_default_type(
+                                    variable.kind,
+                                )),
+                                found: scalar_literal_kind(literal),
+                            },
+                        });
+                        self.record_expression_type(rhs.hir_id, LocalType::LiteralVariable(id));
+                        return Ok(());
+                    }
                     match variable.kind {
                         PrimitiveLiteralKind::Integer => {
                             self.add_integer_literal_constraint(id, literal, rhs.hir_id)?;

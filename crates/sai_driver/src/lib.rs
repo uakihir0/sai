@@ -73253,10 +73253,9 @@ property "shared"() {}
         );
         assert_eq!(diagnostics[1].code, sai_diagnostics::Code::TypeMismatch);
         assert_eq!(diagnostics[1].message, "expected `I64`, found `Str`");
-        // Gated owners: `Str` arithmetic operands, a `Str` match
-        // scrutinee, and a literal-variable `Str` assignment stay
-        // outside the slice.
-        for owner in owners[25..28].iter() {
+        // Gated owners: `Str` arithmetic operands and a `Str` match
+        // scrutinee stay outside the slice.
+        for owner in owners[25..27].iter() {
             assert!(matches!(
                 owner
                     .body_type_check()
@@ -73264,6 +73263,17 @@ property "shared"() {}
                 FunctionBodyTypeCheck::Unsupported
             ));
         }
+        // `var n = 1; n = "a"` — a string literal can never unify with the
+        // integer literal variable (spec 6.3), so the assignment is
+        // diagnosed rather than gated.
+        assert!(matches!(
+            owners[27]
+                .body_type_check()
+                .expect("a string literal assigned to an integer variable is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
     }
 
     #[test]
@@ -102968,17 +102978,26 @@ property "shared"() {}
             "a deferred `-x` on a merge child declared before its parent must still error: {:?}",
             owners[59].body_type_check()
         );
-        for index in [13, 17] {
-            assert!(
-                matches!(
-                    owners[index]
-                        .body_type_check()
-                        .expect("unsupported assignment form is gated"),
-                    FunctionBodyTypeCheck::Unsupported
-                ),
-                "function owner {index} should remain gated"
-            );
-        }
+        // `var x = 1; x = 2.5` — a float literal can never unify with the
+        // integer literal variable (spec 6.3), so the assignment is
+        // diagnosed rather than gated.
+        assert!(matches!(
+            owners[13]
+                .body_type_check()
+                .expect("a cross-family literal assignment is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        assert!(
+            matches!(
+                owners[17]
+                    .body_type_check()
+                    .expect("unsupported assignment form is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ),
+            "function owner 17 should remain gated"
+        );
         // `x = 3` on `var x = 1; x = 2` unifies through a merge child —
         // the literal-variable's single additional site is full, so the
         // third site joins the resolution group instead of gating.

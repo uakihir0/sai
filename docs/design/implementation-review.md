@@ -11337,3 +11337,40 @@ forms pass when valid, `Char`/`Bool`/`F64` bitwise report
 admission of IR-1203. Twenty-two method-bodied cases moved out of the
 gated-expectation tables into a dedicated checked-behavior test that
 asserts each case's diagnostics or success.
+
+## IR-1205: Assignments to literal-inferred variables diagnose cross-family literals
+
+**Slice.** An unannotated `var` initialized by an integer or float
+literal (`var x = 1`) binds a literal inference variable. Assigning a
+literal of another family to it is a type error, not an unsupported
+shape: integer literals unify only with integer types and float
+literals only with `F32`/`F64` (spec 6.3), so `x = true`, `x = 2.5`,
+`x = "a"` or an integer literal into a float variable can never hold
+no matter which type the variable later resolves to.
+
+```sai
+pub fn f() -> I32 {
+    var x = 1
+    x = true   // TYPE_MISMATCH: expected `I64`, found a Bool literal
+    x
+}
+```
+
+The expected side of the diagnostic names the family default (`I64`/
+`F64`) — the type the variable takes when nothing else constrains it —
+matching the comparison-operand recovery. A variable already resolved
+by an earlier constraint checks the literal against the resolved type
+instead: `var x = 1; var y: U8 = x; x = 300` reports
+`LITERAL_OUT_OF_RANGE` at `U8`.
+
+**Implementation.** The kernel's assignment checking gained the two
+missing literal-variable arms (resolved-variable checking and
+cross-family mismatch) where previously both dropped out of the slice
+as unsupported. Same-family literals still join the variable's
+resolution group as additional constraint sites.
+
+**Bounded slice.** A mismatching assignment on an unresolved variable
+reports the family default as the expected type even when a later use
+would have resolved the variable to a different integer type; the
+error itself is resolution-independent, only the type name in the
+message can be imprecise.
