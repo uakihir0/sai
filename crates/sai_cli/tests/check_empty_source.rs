@@ -11816,6 +11816,9 @@ fn public_parameterized_composite_literal_returns_emit_check_result() {
         "const N: I32 = 5\npub fn f() -> (I32, I32) { (N + 1, 2) }\n",
         "pub fn f(x: I32) -> (I32, (I32, I32)) { (x, (x + 1, x * 2)) }\n",
         "pub fn f(x: U8) -> (U8, U8) { (x + 1, 200) }\n",
+        "pub fn f(x: I32, y: U32) -> (I32, I32) { (x << y, 1) }\n",
+        "pub fn f(x: I32) -> (I32, I32) { (x % 3, x +% 2) }\n",
+        "pub fn f(x: F32) -> (F32, F32) { (x + 1e38, 1.0) }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -11838,6 +11841,30 @@ fn public_composite_operator_element_errors_are_diagnosed() {
         ),
         (
             "pub fn f(x: U8) -> (U8, U8) { (x + 300, 2) }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub fn f(x: I32, y: I32) -> (I32, I32) { (x << y, 1) }\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub fn f(x: I32) -> (I32, I32) { (x << -1, 1) }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub fn f(x: U8) -> (U8, U8) { (-x, 1) }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(x: F64) -> (F64, F64) { (x % 2.0, 1.0) }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(x: F64) -> (F64, F64) { (x +% 2.0, 1.0) }\n",
+            "OPERATOR_NOT_SUPPORTED",
+        ),
+        (
+            "pub fn f(x: F32) -> (F32, F32) { (x + 1e39, 1.0) }\n",
             "LITERAL_OUT_OF_RANGE",
         ),
     ] {
