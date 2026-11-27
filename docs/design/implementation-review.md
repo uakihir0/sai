@@ -11195,3 +11195,35 @@ no-effect warning, and must-use discard diagnostics.
 **Verification.** Probes accept parameter arithmetic/bitwise/shift/comparison/logical/unary elements in tuples, arrays, and nested composites, const-reference operands, and float arithmetic; `x + 1.5` with `x: I32`, `x + 1` against `(I64, I32)` with `x: I32`, and int/float mixing diagnose TYPE_MISMATCH; `x + 300` with `x: U8` diagnoses LITERAL_OUT_OF_RANGE; `as` casts gate. CLI suite extended.
 
 **Remaining scope.** `as` casts in element positions; `Str` operator elements; composite operands inside operators; method calls in composite positions.
+
+## IR-1200: Statement-position unit checking — `while` bodies and no-`else` `if` discards
+
+**Slice.** Statement-position control flow now follows the spec's unit
+checking: an `if` without `else` checks its branch against `()` wherever
+the `if` appears (spec 6.14.1), so discarding branch tails like
+`if x < 10 { x + 1 }` as a statement are admitted and validated. Loop
+bodies check against `()` (T-Loop), so `if`/`match` tails inside them
+discard branch-wise — this is what admits the `while` desugaring's user
+body, making `while x < 10 { x + 1 }` check end to end, including
+`continue`/`break` (`break v` in a `while` is `INVALID_BREAK_VALUE`).
+`while` loops are also admitted as unit-body tails. When the first branch
+of a statement-position `if`/`else` chain is statement-shaped (hence
+`()`-typed), the rest of the chain checks against `()` per spec 6.14.1
+rule 2, so `if c { } else { x + 1 }` discards correctly. Discards
+validate fully: mixed-type arithmetic is `TYPE_MISMATCH` and out-of-range
+literals are `LITERAL_OUT_OF_RANGE` inside these positions.
+
+**Boundary.** A statement-position `if`/`else` whose *first* branch
+carries a value tail needs cross-branch unification (spec 6.14.1 rule 2
+synthesis) and stays gated, as do statement-position `match` expressions
+with value-carrying arms, and `while` used as a value-position tail.
+Operator expressions mixing `Str` operands keep their own gates.
+
+**Implementation.** The kernel's statement-position `if` checker unit-
+checks no-`else` branches through the unit-mode block checker, and unit-
+checks the `else` chain once the first branch is known statement-shaped.
+Loop-body `if`/`match` tails route through the unit-tail checker, which
+also learned `loop`/`break`/`continue`/`return` tails. The driver's
+statement-`if` shape mirror no longer gates branch contents — admission
+is a safe superset because the kernel's `Err` falls back to the
+validators — and unit-mode bodies admit non-`loop` loop tails.

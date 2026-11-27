@@ -701,6 +701,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     Some(els) => self.check_unit_if_else_tail(els),
                 }
             }
+            ExprKind::Loop {
+                body,
+                label,
+                source,
+            } => {
+                // `loop`/`while` are `()`-typed or diverging, so they check
+                // in place like a statement-position loop.
+                self.check_loop_stmt(tail.hir_id, body, label, source)
+            }
+            ExprKind::Break { label, value } => self.check_break(tail.hir_id, label, value),
+            ExprKind::Continue { label } => self.check_continue(tail.hir_id, label),
+            ExprKind::Return(value) => self.check_return(tail.hir_id, value),
             _ => {
                 let check = self.check_initializer_value(tail, None)?;
                 self.record_expression_type(tail.hir_id, check.local_type);
@@ -3456,15 +3468,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Block(_) => return Err(()),
             _ => {}
         }
-        let local_type = match self.input.return_type {
-            Some(return_type) => self.check_expr_value(expression, return_type)?,
-            // Expression-statements in a unit body discard their value
-            // (spec 6.11.1): synthesize without an expectation like the
-            // tail — any type is accepted.
-            None => self
-                .check_initializer_value(expression, None)
-                .map(|check| check.local_type)?,
-        };
+        // Expression statements discard their value wherever the enclosing
+        // function returns (spec 6.11.1/6.25.2): they synthesize without
+        // an expectation — the return type never constrains them.
+        let local_type = self
+            .check_initializer_value(expression, None)
+            .map(|check| check.local_type)?;
         self.record_expression_type(expression.hir_id, local_type);
         Ok(())
     }
@@ -3575,7 +3584,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 Some(tail) => match tail.kind {
                     ExprKind::Break { label, value } => self.check_break(tail.hir_id, label, value),
                     ExprKind::Continue { label } => self.check_continue(tail.hir_id, label),
-                    ExprKind::If { .. } | ExprKind::Match { .. } => self.check_expr_stmt(tail),
+                    // The loop body checks against `()` (T-Loop), so an
+                    // `if`/`match` tail discards branch-wise like any
+                    // other unit-position tail — this is what admits the
+                    // `while` desugaring's user body.
+                    ExprKind::If { .. } | ExprKind::Match { .. } => {
+                        self.check_unit_tail_expression(tail)
+                    }
                     ExprKind::Return(value) => self.check_return(tail.hir_id, value),
                     _ => Err(()),
                 },
@@ -4009,14 +4024,40 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         els: Option<&'hir Expr<'hir>>,
     ) -> Result<(), ()> {
         self.check_if_condition(condition)?;
-        self.check_stmt_block(then)?;
         match els {
-            None => Ok(()),
-            Some(els) => match els.kind {
-                ExprKind::Block(block) => self.check_stmt_block(block),
-                ExprKind::If { cond, then, els } => self.check_if_stmt(cond, then, els),
-                _ => Err(()),
-            },
+            // An `if` without `else` has type `()` and its block checks
+            // against `()` (spec 6.14.1), so a tail value discards per
+            // §6.25.2 — independent of the `if`'s own position.
+            None => self.check_block_unit(then),
+            Some(els) => {
+                // The statement-position `if` synthesizes: the first
+                // branch determines the type every other branch checks
+                // against. Only statement-shaped first branches are in
+                // scope — they are `()`-typed, so the rest of the chain
+                // checks branch-wise against `()` exactly like a unit
+                // tail. Value-carrying first branches need cross-branch
+                // unification and stay gated.
+                self.check_stmt_block(then)?;
+                if matches!(
+                    then.tail.map(|tail| tail.kind),
+                    Some(ExprKind::Return(..) | ExprKind::Break { .. } | ExprKind::Continue { .. })
+                ) {
+                    // A first branch ending in `return`/`break`/`continue`
+                    // diverges, so its type is `Never` rather than `()` —
+                    // the rest of the chain synthesizes on its own (spec
+                    // 6.14.1 rule 2). Plain `else` blocks need no
+                    // unification, so they check against `()` like any
+                    // unit block; `else if` chains and branching `else`
+                    // tails do, and stay gated.
+                    return match els.kind {
+                        ExprKind::Block(block) if !block_branches_on_value_tail(block) => {
+                            self.check_block_unit(block)
+                        }
+                        _ => Err(()),
+                    };
+                }
+                self.check_unit_if_else_tail(els)
+            }
         }
     }
 
@@ -10728,6 +10769,23 @@ fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
 /// needs them for coverage keeps the catch-all requirement. `USize` and
 /// `ISize` domains are unbounded by design (the analysis must not depend
 /// on pointer width, §6.22.2) and finite patterns can never cover them.
+
+/// Whether a block's tail is a nested `if`/`match` — the shapes whose
+/// branch types would need unification when the block is synthesized.
+fn block_branches_on_value_tail(block: &Block<'_>) -> bool {
+    let mut current = block;
+    loop {
+        let Some(tail) = current.tail else {
+            return false;
+        };
+        match tail.kind {
+            ExprKind::If { .. } | ExprKind::Match { .. } => return true,
+            ExprKind::Block(inner) => current = inner,
+            _ => return false,
+        }
+    }
+}
+
 fn integer_patterns_cover_domain(arms: &[Arm<'_>], scrutinee_type: PrimTy) -> bool {
     let Some(domain) = integer_domain_intervals(scrutinee_type) else {
         return false;

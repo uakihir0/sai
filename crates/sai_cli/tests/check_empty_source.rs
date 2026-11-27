@@ -11739,6 +11739,32 @@ fn public_unit_return_discards_tail_values() {
         "const N: I64 = 1\npub fn f() { if true { N } else { 2 } }\n",
         "const S: Str = \"a\"\npub fn f() { S }\n",
         "const C: I64 = 1\nconst D: I64 = C\npub fn f() { D }\n",
+        // Statement-position `if` without `else` checks its branch against
+        // `()` (spec 6.14.1), so discarding tails are admitted; the same
+        // applies inside `while` bodies and `loop` tails.
+        "pub fn f(x: I32) { if x < 10 { x + 1 }\n1 }\n",
+        "pub fn f(x: I32) { if x < 10 { let y = x + 1\ny }\n1 }\n",
+        "pub fn f(x: I32) { if x < 10 { } else { x + 1 }\n1 }\n",
+        "pub fn f(x: I32) { if x < 10 { } else if x > 5 { x + 1 }\n1 }\n",
+        "pub fn f(x: I32) { while x < 10 { x + 1 } }\n",
+        "pub fn f(x: I32) { while x < 10 { x + 1 }\n1 }\n",
+        "pub fn f(x: I32) { while x < 10 { let y = x + 1\ny }\n1 }\n",
+        "pub fn f(x: I32) { while x < 10 { if x > 5 { x } else { break } }\n1 }\n",
+        "pub fn f(x: I32) { loop { if x < 10 { x + 1 } else { break } }\n1 }\n",
+        "pub fn f(x: I32) { loop { if x < 10 { x + 1 } }\n1 }\n",
+        "pub fn f(x: I32) { while x < 10 { continue }\n1 }\n",
+        // Discarding expression statements synthesize without the return
+        // type's expectation, and loop-body `match` tails discard
+        // branch-wise.
+        "pub fn f() -> Bool { ~1\ntrue }\n",
+        "pub fn f() -> Bool { if true { ~1 }\ntrue }\n",
+        "pub fn f(x: I32) { loop { match x { 1 => 1, _ => x + 1 } }\n1 }\n",
+        "pub fn f(x: I32) { loop { match x { 1 => { x + 1 }, _ => {} } }\n1 }\n",
+        "pub fn f(x: I32) -> I32 { x + 1\n0 }\n",
+        // A diverging first branch is `Never`-typed, so a plain `else`
+        // block needs no unification — it checks like any unit block.
+        "pub fn f(x: I32) -> Bool { if x < 10 { return true } else { }\ntrue }\n",
+        "pub fn f(x: I32) -> Bool { if x < 10 { return true } else { 5 }\ntrue }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -11775,6 +11801,27 @@ fn public_unit_return_discard_errors_are_diagnosed() {
         (
             "pub fn f(x: I32) { match x { 0 => x + 1.5, _ => x } }\n",
             "TYPE_MISMATCH",
+        ),
+        (
+            "pub fn f(x: I32) { if x < 10 { x + 1.5 }\n1 }\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub fn f(x: I32) { while x < 10 { x + 1.5 }\n1 }\n",
+            "TYPE_MISMATCH",
+        ),
+        ("pub fn f(x: I32) { while x { 1 }\n1 }\n", "TYPE_MISMATCH"),
+        (
+            "pub fn f(x: I32) { while x < 10 { break 1 }\n1 }\n",
+            "INVALID_BREAK_VALUE",
+        ),
+        (
+            "pub fn f(x: I32) { if x < 10 { 99999999999999999999 }\n1 }\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub fn f(x: I8) { while x < 10 { x + 300 }\n1 }\n",
+            "LITERAL_OUT_OF_RANGE",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
@@ -12177,7 +12224,6 @@ fn unsupported_match_tail_shapes_remain_gated() {
         "pub fn choose(value: I32) -> I32 { match 0 { 0 => 1, _ => 2 } }\n",
         "pub fn choose(value: I32) -> Bool { match value { 0 => 1, _ => 2 }\n true }\n",
         "pub fn choose(value: I32) -> I32 { match value { _ => 1 }\n 0 }\n",
-        "pub fn choose(flag: Bool) -> I32 { var x: I32 = 0\n if flag { x = 1\n 5 }\n x }\n",
         "pub fn choose(flag: Bool) -> I32 { var x = 1\n x += flag\n x }\n",
         "pub fn choose() -> I32 { var a = 1\n    var b = 2.5\n    let sum = a + b\n    sum\n }\n",
         "pub fn choose() -> Bool { var a = true\n    var b = false\n    a + b\n }\n",
