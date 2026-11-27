@@ -6786,6 +6786,35 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.check_comparison(operator, left, right)?
             }
             ExprKind::Lit(Lit::Bool(_)) => LocalType::Concrete(PrimTy::Bool),
+            // A non-`Bool` literal in condition position can never hold —
+            // sai has no truthiness coercion — so `if 1`/`while 'a'` is a
+            // type error rather than an unsupported shape.
+            ExprKind::Lit(literal) => {
+                if let Some(found) = primitive_literal_kind(literal) {
+                    self.errors.push(PrimitiveBodyError {
+                        node: condition.hir_id,
+                        kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                            expected: PrimTy::Bool,
+                            found,
+                        },
+                    });
+                    self.record_expression_type(
+                        condition.hir_id,
+                        LocalType::Concrete(PrimTy::Bool),
+                    );
+                    return Ok(());
+                }
+                // `Str`/`Slice<Byte>` literals mismatch `Bool` as scalars.
+                self.errors.push(PrimitiveBodyError {
+                    node: condition.hir_id,
+                    kind: PrimitiveBodyErrorKind::ScalarLiteralTypeMismatch {
+                        expected: ScalarType::Primitive(PrimTy::Bool),
+                        found: scalar_literal_kind(literal),
+                    },
+                });
+                self.record_expression_type(condition.hir_id, LocalType::Concrete(PrimTy::Bool));
+                return Ok(());
+            }
             _ => return Err(()),
         };
         match local_type {
@@ -6816,6 +6845,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // A `!`-valued condition (an all-diverging `match`/`if`
             // stored as `Error(None)`) coerces to `Bool`.
             LocalType::Error(None) => Ok(()),
+            // A literal-inference variable is integer- or float-family and
+            // can never resolve to `Bool` (spec 6.3), so `while x` on
+            // `var x = 1` mismatches no matter the final integer type.
+            LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                let Some(variable) = self.literal_variables.get(id) else {
+                    return Err(());
+                };
+                self.errors.push(PrimitiveBodyError {
+                    node: condition.hir_id,
+                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                        expected: PrimTy::Bool,
+                        found: variable.kind,
+                    },
+                });
+                Ok(())
+            }
             _ => Err(()),
         }
     }

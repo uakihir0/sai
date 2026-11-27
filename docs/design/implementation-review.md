@@ -11374,3 +11374,34 @@ reports the family default as the expected type even when a later use
 would have resolved the variable to a different integer type; the
 error itself is resolution-independent, only the type name in the
 message can be imprecise.
+
+## IR-1206: Non-`Bool` literal conditions diagnose instead of gating
+
+**Slice.** sai has no truthiness coercion: a condition must be `Bool`
+(spec 6.15.1). A literal of any other type in condition position is a
+type error no matter what type inference later decides — `if 1`,
+`while 'a'`, `if "a"` and `if b"a"` can never hold — so these report
+`TYPE_MISMATCH` instead of dropping behind the stage gate:
+
+```sai
+pub fn f() -> I32 {
+    if 1 { 1 } else { 2 }   // TYPE_MISMATCH: expected `Bool`, found an integer literal
+}
+```
+
+The same applies to literal-inference variables: `if x` on `var x = 1`
+mismatches because integer- and float-family variables never resolve
+to `Bool` (spec 6.3). `while` conditions inherit the diagnosis through
+the loop desugaring's synthetic `if`.
+
+**Implementation.** The kernel's `check_if_condition` gained the
+non-`Bool` literal arm (mismatch, then recovery as `Bool`) and the
+literal-variable arm of its result match. The driver's coverage walker
+`primitive_if_condition_shape_is_supported` now admits every literal
+in condition position — like byte strings in comparison operands, they
+are admitted only so the checker can diagnose them.
+
+**Bounded slice.** Unit-position statement `if`s with no parameters
+(`pub fn f() -> I32 { if 1 { 1 } else { 2 }\n0 }`) remain behind the
+gate: that whole shape is unimplemented even for valid programs, so
+the condition inside it is not yet reachable.
