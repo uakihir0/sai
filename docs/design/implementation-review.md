@@ -11653,3 +11653,20 @@ unification (spec 6.12). The walker admits operator scrutinee shapes
 through value admission; anything the funnel cannot type falls back to
 the gate. Literal scrutinees, typed-range patterns and `Str` comparisons
 keep their existing boundaries.
+
+## IR-1217: Literal-left operator scrutinees resolve through concrete operands
+
+**Slice.** IR-1216 admitted operator match scrutinees, but the
+literal-left arithmetic path kept the inference-variable wrapper even
+when the concrete operand resolved it: `match 1 + x` at `x: I32` gated
+while `match x + 1` passed.
+
+**Implementation.** The scrutinee synthesis now reads the operand
+funnel's result through the shared concretization, so a resolved
+literal variable drives pattern checking with its resolution — `1 + x`
+at `x: I32` checks patterns against `I32` and mismatched arms report
+`TYPE_MISMATCH` exactly like the literal-right order. Genuinely
+unresolved scrutinee variables (`match 1 + 2`) stay gated: spec 6.27
+defaults them at the *end* of inference for the enclosing body, which
+is a defaulting-pass slice of its own rather than a scrutinee-local
+shortcut.
