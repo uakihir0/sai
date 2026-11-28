@@ -11651,6 +11651,22 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1240: Record construction with `Str` fields
+
+- Slice: constructor field types are primitive-or-`Str`; a `Str`
+  field's initializer checks against the string initializer rules
+  (string literals, `Str`-typed paths and calls), so
+  `Name(first: "ada", age: 30)` constructs while `first: 3` reports
+  TYPE_MISMATCH. Constructor tails cover `Str` fields too.
+
+## IR-1239: Record field mutation
+
+- Slice: `p.x = 3` — a record field place assigns leaf-wise through
+  the same projection map reads use. Mutability is the root binding's:
+  `let` bindings and immutable parameters diagnose
+  `ASSIGN_TO_IMMUTABLE`; wrong-type and out-of-range values diagnose
+  like any primitive assignment.
+
 ## IR-1238: Record construction with primitive fields
 
 - Slice: `var p = Point(x: 1, y: 2)` — a call whose callee is a plain

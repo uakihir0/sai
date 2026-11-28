@@ -27607,6 +27607,105 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_construction_checks_str_fields() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Records with `Str` fields construct with string literals;
+        // wrong-type initializers diagnose like a `Str` annotation.
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: \"ada\", age: 30)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn make() -> Name {\n    Name(first: \"ada\", age: 30)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: 3, age: 30)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: \"ada\", age: 300)\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: \"ada\")\n}\n",
+            &[("MISSING_FIELD", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record construction with Str fields should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn record_field_mutation_checks_leafwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `p.x = 3` on a `var` record binding assigns the primitive
+        // field leaf-wise; immutable bindings and params diagnose
+        // ASSIGN_TO_IMMUTABLE.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    p.x = 3\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> I32 {\n    var p = Point(x: 1, y: 2)\n    p.x = 3\n    p.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    let p = Point(x: 1, y: 2)\n    p.x = 3\n}\n",
+            &[("ASSIGN_TO_IMMUTABLE", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    p.x = true\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Point { x: U8, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    p.x = 300\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record field mutation should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn record_construction_checks_field_initializers() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `var p = Point(x: 1, y: 2)` constructs; field reads,

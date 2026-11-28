@@ -138,7 +138,16 @@ fn intern_composite_shape(
 #[derive(Clone, Debug)]
 pub struct RecordConstructorSite {
     pub def: sai_hir::DefId,
-    pub fields: Vec<(sai_hir::Symbol, PrimTy)>,
+    pub fields: Vec<(sai_hir::Symbol, ConstructorFieldType)>,
+}
+
+/// A record constructor field's type: primitive fields check against
+/// their coercion type, `Str` fields against the string initializer
+/// rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConstructorFieldType {
+    Primitive(PrimTy),
+    Str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5820,7 +5829,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let mut base = lhs;
         loop {
             match base.kind {
-                ExprKind::TupleField { base: inner, .. } | ExprKind::Index(inner, _) => {
+                ExprKind::TupleField { base: inner, .. }
+                | ExprKind::Index(inner, _)
+                | ExprKind::Field { base: inner, .. } => {
                     base = inner;
                 }
                 _ => break,
@@ -5856,7 +5867,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.check_projection_place_mutability(lhs);
                     Ok(Some((leaf,)))
                 }
-                ExprKind::Field { .. } | ExprKind::Unary(UnOp::Deref, _) => Err(()),
+                // A record field place resolves its leaf type through
+                // the same projection map reads use — record parameters
+                // and constructed bindings project primitive fields.
+                ExprKind::Field { .. } => {
+                    let Some(primitive) = self
+                        .input
+                        .self_field_projections
+                        .and_then(|fields| fields.get(&lhs.hir_id))
+                        .copied()
+                    else {
+                        return Err(());
+                    };
+                    self.check_projection_place_mutability(lhs);
+                    Ok(Some((LocalType::Concrete(primitive),)))
+                }
+                ExprKind::Unary(UnOp::Deref, _) => Err(()),
                 _ => {
                     self.errors.push(PrimitiveBodyError {
                         node: lhs.hir_id,
@@ -8717,7 +8743,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             else {
                 continue;
             };
-            self.check_expr_expected(argument.expr, expected)?;
+            match expected {
+                ConstructorFieldType::Primitive(primitive) => {
+                    self.check_expr_expected(argument.expr, primitive)?;
+                }
+                ConstructorFieldType::Str => {
+                    self.check_str_annotated_initializer(argument.expr)?;
+                }
+            }
         }
         Ok(LocalType::Nominal(site.def))
     }

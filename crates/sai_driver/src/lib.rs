@@ -13882,11 +13882,9 @@ fn check_function_body_primitive_local_block(
                     // Non-primitive fields (`Str`, records) gate the
                     // site: every field must carry a primitive type in
                     // this slice.
-                    if !all_fields
-                        .iter()
-                        .all(|field| fields.contains_key(field.as_str()))
-                        || !str_fields.is_empty()
-                    {
+                    if !all_fields.iter().all(|field| {
+                        fields.contains_key(field.as_str()) || str_fields.contains(field.as_str())
+                    }) {
                         return;
                     }
                     if base.is_some() {
@@ -13913,8 +13911,10 @@ fn check_function_body_primitive_local_block(
                     let mut unknown_spans = Vec::new();
                     let mut unnamed_spans = Vec::new();
                     // Field types keyed by symbol for the kernel.
-                    let mut site_fields: Vec<(sai_hir::Symbol, sai_resolve::prelude::PrimTy)> =
-                        Vec::new();
+                    let mut site_fields: Vec<(
+                        sai_hir::Symbol,
+                        sai_ty::typeck::body::ConstructorFieldType,
+                    )> = Vec::new();
                     for argument in args {
                         let (field_sym, field_span) = if let Some(name) = argument.name {
                             (Some(name.sym), name.span)
@@ -13943,13 +13943,18 @@ fn check_function_body_primitive_local_block(
                         let normalized_field = sai_syntax::normalize_identifier(
                             spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
                         );
-                        let Some(primitive) = fields.get(normalized_field.as_str()) else {
-                            unknown_spans.push(field_span);
-                            continue;
-                        };
+                        let field_type =
+                            if let Some(primitive) = fields.get(normalized_field.as_str()) {
+                                sai_ty::typeck::body::ConstructorFieldType::Primitive(*primitive)
+                            } else if str_fields.contains(normalized_field.as_str()) {
+                                sai_ty::typeck::body::ConstructorFieldType::Str
+                            } else {
+                                unknown_spans.push(field_span);
+                                continue;
+                            };
                         initialized.insert(field_sym);
                         if !site_fields.iter().any(|(sym, _)| *sym == field_sym) {
-                            site_fields.push((field_sym, *primitive));
+                            site_fields.push((field_sym, field_type));
                         }
                     }
                     // `all_fields` is normalized-name keyed; the declared
@@ -16538,12 +16543,14 @@ fn primitive_assign_target_shape_is_supported(
         // misdiagnosed.
         if matches!(
             target.kind,
-            ExprKind::TupleField { .. } | ExprKind::Index(..)
+            ExprKind::TupleField { .. } | ExprKind::Index(..) | ExprKind::Field { .. }
         ) {
             let mut root = target;
             loop {
                 match root.kind {
-                    ExprKind::TupleField { base, .. } | ExprKind::Index(base, _) => root = base,
+                    ExprKind::TupleField { base, .. }
+                    | ExprKind::Index(base, _)
+                    | ExprKind::Field { base, .. } => root = base,
                     _ => break,
                 }
             }
@@ -16553,10 +16560,7 @@ fn primitive_assign_target_shape_is_supported(
                 _ => false,
             };
         }
-        return !matches!(
-            target.kind,
-            ExprKind::Field { .. } | ExprKind::Unary(UnOp::Deref, _)
-        );
+        return !matches!(target.kind, ExprKind::Unary(UnOp::Deref, _));
     };
     let Some(binding) = resolved_plain_local_path_binding(path, locals, inputs) else {
         return false;
