@@ -11651,6 +11651,20 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1244: Record-typed call signatures
+
+- Slice: `FunctionDirectType::Record(DefId)` flows through the direct
+  call signature pipeline, so `var p = make()` binds a
+  record-returning call — the copy scan seeds the binding's record
+  name from the signature output — and `take(q)` /
+  `take(Point(x: 1, y: 2))` / `take(make())` check record arguments
+  against the parameter's nominal identity. Primitive parameters in
+  mixed signatures check like before. Bounded: mismatched-record and
+  scalar arguments gate — primitive diagnostics cannot name record
+  types — and unit-output callees stay outside the signature scan
+  (a pre-existing frontier: even `take(5)` on a unit-output fn gates
+  on main).
+
 ## IR-1243: Nested record construction
 
 - Slice: record-typed constructor fields — `Outer(inner: Inner(v: 1),

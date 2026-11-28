@@ -27607,6 +27607,59 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_typed_call_signatures_check_arguments() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `var p = make()` binds a record-returning call; `take(q)`
+        // passes copies and constructions as record arguments.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn make() -> Point {\n    Point(x: 1, y: 2)\n}\npub fn f() -> I32 {\n    var p = make()\n    p.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn take(p: Point) -> I32 {\n    1\n}\npub fn f() {\n    var q = Point(x: 1, y: 2)\n    var r = take(q)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn take(p: Point) -> I32 {\n    1\n}\npub fn f() {\n    var r = take(Point(x: 1, y: 2))\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn make() -> Point {\n    Point(x: 1, y: 2)\n}\npub fn take(p: Point) -> I32 {\n    1\n}\npub fn f() {\n    var r = take(make())\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn take(p: Point) -> I32 {\n    1\n}\npub fn f() {\n    var r = take(Point(x: true, y: 2))\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn take(p: Point, n: I32) -> I32 {\n    n\n}\npub fn f() {\n    var q = Point(x: 1, y: 2)\n    var r = take(q, true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record call signatures should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn nested_record_construction_checks_recursively() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `Outer(inner: Inner(v: 1), w: 2)` — record-typed fields

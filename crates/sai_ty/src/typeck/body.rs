@@ -165,6 +165,7 @@ pub struct PrimitiveCallSignature {
 pub enum PrimitiveCallOutput {
     Primitive(PrimTy),
     Str,
+    Record(sai_hir::DefId),
 }
 
 /// What a direct call's explicit parameter accepts: a primitive literal
@@ -175,6 +176,7 @@ pub enum PrimitiveCallOutput {
 pub enum PrimitiveCallParameter {
     Primitive(PrimTy),
     Str,
+    Record(sai_hir::DefId),
 }
 
 /// The declared type of a const reference the driver resolved: a
@@ -4627,6 +4629,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             PrimitiveCallParameter::Primitive(expected) => {
                 return self.check_annotated_path(source_type, expected, node);
             }
+            // A record parameter takes a same-record argument — copies,
+            // parameters, and nested constructions all synthesize the
+            // nominal type. Wrong-type arguments stay gated: primitive
+            // diagnostics cannot name the record type.
+            PrimitiveCallParameter::Record(def) => {
+                return match source_type {
+                    LocalType::Nominal(found) if found == def => Ok(()),
+                    LocalType::Error(_) => Ok(()),
+                    _ => Err(()),
+                };
+            }
             PrimitiveCallParameter::Str => {}
         }
         match source_type {
@@ -4678,11 +4691,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         expected: PrimitiveCallParameter,
         literal: Lit<'hir>,
         node: HirId,
-    ) {
+    ) -> Result<(), ()> {
         match expected {
             PrimitiveCallParameter::Primitive(expected) => {
                 let Some(found) = primitive_literal_kind(literal) else {
-                    return;
+                    return Ok(());
                 };
                 self.check_annotated_literal(expected, literal, found, node);
             }
@@ -4699,7 +4712,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     });
                 }
             }
+            // A literal never types as a record — the mismatch gates
+            // like other nominal mismatches.
+            PrimitiveCallParameter::Record(_) => return Err(()),
         }
+        Ok(())
     }
 
     fn check_expr_stmt(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
@@ -8868,7 +8885,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     {
                         return Err(());
                     }
-                    self.check_call_parameter_literal(expected, literal, argument.expr.hir_id);
+                    self.check_call_parameter_literal(expected, literal, argument.expr.hir_id)?;
                 }
                 ExprKind::Path(_) => {
                     let local_type = self.check_local_path(argument.expr)?;
@@ -9022,6 +9039,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                                     ExprKind::Lit(Lit::Byte(_)) => PrimTy::Byte,
                                     _ => return Err(()),
                                 },
+                                PrimitiveCallParameter::Record(_) => return Err(()),
                             };
                             self.check_direct_call_bitwise_not_literal(operand, expected)?
                         }
@@ -9075,6 +9093,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         PrimitiveCallParameter::Str => {
                             self.check_str_annotated_initializer(argument.expr)?;
                         }
+                        PrimitiveCallParameter::Record(_) => return Err(()),
                     }
                 }
                 // A `{ ...; e }` argument checks its inner statements and
@@ -9097,6 +9116,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         PrimitiveCallParameter::Str => {
                             self.check_str_annotated_initializer(argument.expr)?;
                         }
+                        PrimitiveCallParameter::Record(_) => return Err(()),
                     }
                 }
                 _ => return Err(()),
@@ -9105,6 +9125,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(match signature.output {
             PrimitiveCallOutput::Primitive(output) => LocalType::Concrete(output),
             PrimitiveCallOutput::Str => LocalType::Str,
+            PrimitiveCallOutput::Record(def) => LocalType::Nominal(def),
         })
     }
 

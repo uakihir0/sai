@@ -7435,6 +7435,7 @@ fn const_reference_literal_type(direct_type: FunctionDirectType) -> Option<Const
         FunctionDirectType::Primitive(primitive) => Some(ConstLiteralType::Primitive(primitive)),
         FunctionDirectType::Str => Some(ConstLiteralType::Str),
         FunctionDirectType::Unit => Some(ConstLiteralType::Unit),
+        FunctionDirectType::Record(_) => None,
     }
 }
 
@@ -9219,6 +9220,7 @@ fn check_function_body_shape_dispatch(
             None => Some(FunctionDirectType::Unit),
         };
         match return_type {
+            Some(FunctionDirectType::Record(_)) => return Ok(FunctionBodyTypeCheck::Unsupported),
             Some(FunctionDirectType::Unit) if block.stmts.is_empty() && block.tail.is_none() => {
                 Vec::new()
             }
@@ -9560,7 +9562,7 @@ fn synthesize_structural_operator_type(
                         ConstLiteralType::Primitive(*primitive)
                     }
                     FunctionDirectType::Str => ConstLiteralType::Str,
-                    FunctionDirectType::Unit => return Ok(None),
+                    FunctionDirectType::Unit | FunctionDirectType::Record(_) => return Ok(None),
                 };
                 Ok(StructuralOperandType::Concrete(direct))
             } else if let ExprKind::Path(path) = expr.kind {
@@ -13639,7 +13641,7 @@ fn check_function_body_primitive_local_block(
                 FunctionDirectType::Str => {
                     merged_str_fields.entry(*hir_id).or_insert("`Str`");
                 }
-                FunctionDirectType::Unit => {}
+                FunctionDirectType::Unit | FunctionDirectType::Record(_) => {}
             }
         }
     }
@@ -13830,6 +13832,28 @@ fn check_function_body_primitive_local_block(
                         // A constructor initializer seeds the binding with
                         // the record name too, so `var p = Point(x: 1, y:
                         // 2)` projects `p.x` like a copy does.
+                        // A call to a record-returning function seeds
+                        // the binding too — `var p = make()` projects
+                        // `p.x` like a constructed record does.
+                        if let ExprKind::Call { .. } = init.kind {
+                            if let Some(sai_ty::typeck::body::PrimitiveCallSignature {
+                                output:
+                                    sai_ty::typeck::body::PrimitiveCallOutput::Record(output_def),
+                                ..
+                            }) = direct_call_signatures
+                                .and_then(|signatures| signatures.get(&init.hir_id))
+                            {
+                                if let Some(record_name) =
+                                    inputs.record_type_defs.borrow().as_ref().and_then(|defs| {
+                                        defs.iter().find_map(|(name, def)| {
+                                            (def == output_def).then(|| name.clone())
+                                        })
+                                    })
+                                {
+                                    nominal_binding_record_names.insert(binding, record_name);
+                                }
+                            }
+                        }
                         if let ExprKind::Call { callee, .. } = init.kind {
                             if let ExprKind::Path(callee_path) = callee.kind {
                                 if callee_path.root == PathRoot::Plain
@@ -14738,8 +14762,8 @@ fn check_function_body_primitive_local_block(
                             sai_ty::typeck::body::ConstPathType::Primitive(*primitive)
                         }
                         FunctionDirectType::Str => sai_ty::typeck::body::ConstPathType::Str,
-                        FunctionDirectType::Unit => {
-                            unreachable!("unit consts are not indexed")
+                        FunctionDirectType::Unit | FunctionDirectType::Record(_) => {
+                            unreachable!("unit and record consts are not indexed")
                         }
                     },
                 )
@@ -15058,6 +15082,17 @@ fn is_supported_direct_call_argument_shape(
                 inputs,
                 self_field_projections,
             )
+        }
+        // A constructor call argument admits through its site — the
+        // kernel checks the record type against the parameter itself.
+        ExprKind::Call { .. }
+            if inputs
+                .record_constructor_sites
+                .borrow()
+                .as_ref()
+                .is_some_and(|sites| sites.contains_key(&expression.hir_id)) =>
+        {
+            true
         }
         ExprKind::Call {
             callee,
@@ -20715,6 +20750,7 @@ enum FunctionDirectType {
     Primitive(sai_resolve::prelude::PrimTy),
     Str,
     Unit,
+    Record(DefId),
 }
 
 #[derive(Clone, Debug)]
@@ -20898,6 +20934,7 @@ fn const_constructor_type_name(ty: &ConstConstructorType) -> String {
         }
         ConstConstructorType::Scalar(FunctionDirectType::Str) => "Str".to_string(),
         ConstConstructorType::Scalar(FunctionDirectType::Unit) => "()".to_string(),
+        ConstConstructorType::Scalar(FunctionDirectType::Record(_)) => "<record>".to_string(),
         ConstConstructorType::Tuple(elements) => {
             let mut display = elements
                 .iter()
@@ -20997,6 +21034,7 @@ fn function_direct_type_name(ty: FunctionDirectType) -> &'static str {
         FunctionDirectType::Primitive(primitive) => const_primitive_name(primitive),
         FunctionDirectType::Str => "Str",
         FunctionDirectType::Unit => "()",
+        FunctionDirectType::Record(_) => "<record>",
     }
 }
 
@@ -21491,6 +21529,9 @@ fn direct_primitive_call_site(
                 }
                 FunctionDirectType::Str => sai_ty::typeck::body::PrimitiveCallOutput::Str,
                 FunctionDirectType::Unit => return None,
+                FunctionDirectType::Record(def) => {
+                    sai_ty::typeck::body::PrimitiveCallOutput::Record(def)
+                }
             };
             Some(sai_ty::typeck::body::PrimitiveCallSignature {
                 callee: callee.hir_id,
@@ -21503,6 +21544,9 @@ fn direct_primitive_call_site(
                         ),
                         FunctionDirectType::Str => {
                             Some(sai_ty::typeck::body::PrimitiveCallParameter::Str)
+                        }
+                        FunctionDirectType::Record(def) => {
+                            Some(sai_ty::typeck::body::PrimitiveCallParameter::Record(*def))
                         }
                         FunctionDirectType::Unit => None,
                     })
@@ -21977,6 +22021,9 @@ fn const_literal_type_from_direct_type(direct_type: FunctionDirectType) -> Const
         FunctionDirectType::Primitive(primitive) => ConstLiteralType::Primitive(primitive),
         FunctionDirectType::Str => ConstLiteralType::Str,
         FunctionDirectType::Unit => ConstLiteralType::Unit,
+        // Const types never carry nominal records — those classify as
+        // `ConstConstructorType::Nominal` before this conversion.
+        FunctionDirectType::Record(_) => unreachable!("records are not const literal types"),
     }
 }
 
@@ -23989,7 +24036,7 @@ fn str_seed_resolve(
         let found_name = match const_type {
             FunctionDirectType::Primitive(found) => const_primitive_name(found),
             FunctionDirectType::Str => "Str",
-            FunctionDirectType::Unit => continue,
+            FunctionDirectType::Unit | FunctionDirectType::Record(_) => continue,
         };
         let matches_type = matches!(
             const_type,
@@ -25057,6 +25104,11 @@ fn str_expr_family(
                         // A `Str` parameter takes `Str`-family arguments
                         // with no primitive expectation to forward.
                         sai_ty::typeck::body::PrimitiveCallParameter::Str => Some(("`Str`", None)),
+                        // Record parameters admit opaquely — the kernel
+                        // checks nominal identity itself.
+                        sai_ty::typeck::body::PrimitiveCallParameter::Record(_) => {
+                            Some(("`Record`", None))
+                        }
                     })
                     .collect::<Option<Vec<_>>>()
                 else {
@@ -25067,6 +25119,7 @@ fn str_expr_family(
                         str_prim_family_name(primitive)
                     }
                     sai_ty::typeck::body::PrimitiveCallOutput::Str => Some("`Str`"),
+                    sai_ty::typeck::body::PrimitiveCallOutput::Record(_) => Some("`Record`"),
                 }) else {
                     return Ok(None);
                 };
@@ -25372,7 +25425,7 @@ fn str_match_arm_pattern(
         let found_name = match const_type {
             FunctionDirectType::Primitive(primitive) => const_primitive_name(primitive),
             FunctionDirectType::Str => "Str",
-            FunctionDirectType::Unit => return Ok(None),
+            FunctionDirectType::Unit | FunctionDirectType::Record(_) => return Ok(None),
         };
         if matches!(
             const_type,
@@ -25415,7 +25468,7 @@ fn str_match_arm_pattern(
             (Some(_), FunctionDirectType::Str) => true,
             (None, FunctionDirectType::Str) => false,
             (None, FunctionDirectType::Primitive(_)) => true,
-            (_, FunctionDirectType::Unit) => return Ok(None),
+            (_, FunctionDirectType::Unit | FunctionDirectType::Record(_)) => return Ok(None),
         };
         if mismatch {
             let expected_name = scrutinee_prim.map(const_primitive_name).unwrap_or("Str");
@@ -30229,6 +30282,9 @@ fn str_pure_init_family(
                                 str_prim_family_name(*primitive)
                             }
                             sai_ty::typeck::body::PrimitiveCallParameter::Str => Some("`Str`"),
+                            sai_ty::typeck::body::PrimitiveCallParameter::Record(_) => {
+                                Some("`Record`")
+                            }
                         })
                         .collect::<Option<Vec<_>>>()?,
                     match signature.output {
@@ -30236,6 +30292,7 @@ fn str_pure_init_family(
                             str_prim_family_name(primitive)?
                         }
                         sai_ty::typeck::body::PrimitiveCallOutput::Str => "`Str`",
+                        sai_ty::typeck::body::PrimitiveCallOutput::Record(_) => "`Record`",
                     },
                 )
             } else if let Some(signature) = str_self_method_call(init, inputs) {
@@ -33387,7 +33444,7 @@ fn local_enum_variant_parameter_primitive(
 
     match resolve_function_direct_type(*signature_parameter.ty, type_paths, symbols, inputs)? {
         FunctionDirectType::Primitive(primitive) => Some(primitive),
-        FunctionDirectType::Str | FunctionDirectType::Unit => None,
+        FunctionDirectType::Str | FunctionDirectType::Unit | FunctionDirectType::Record(_) => None,
     }
 }
 
@@ -33460,7 +33517,7 @@ fn local_enum_variant_annotated_local_type(
     match resolve_function_direct_type(*annotated_type?, type_paths, symbols, inputs)? {
         FunctionDirectType::Primitive(primitive) => Some(ConstLiteralType::Primitive(primitive)),
         FunctionDirectType::Unit => Some(ConstLiteralType::Unit),
-        FunctionDirectType::Str => None,
+        FunctionDirectType::Str | FunctionDirectType::Record(_) => None,
     }
 }
 
@@ -33760,7 +33817,7 @@ fn local_enum_variant_annotated_tuple_local_leaf_mismatch(
         let actual_leaf = match actual_leaf {
             FunctionDirectType::Primitive(primitive) => ConstLiteralType::Primitive(primitive),
             FunctionDirectType::Unit => ConstLiteralType::Unit,
-            FunctionDirectType::Str => continue,
+            FunctionDirectType::Str | FunctionDirectType::Record(_) => continue,
         };
         if !matches!(
             expected_leaf,
@@ -33908,7 +33965,7 @@ fn local_enum_variant_annotated_tuple_pattern_matches(
             let leaf_type = match leaf_type {
                 FunctionDirectType::Primitive(primitive) => ConstLiteralType::Primitive(primitive),
                 FunctionDirectType::Unit => ConstLiteralType::Unit,
-                FunctionDirectType::Str => return None,
+                FunctionDirectType::Str | FunctionDirectType::Record(_) => return None,
             };
             let local_binding = locals.bindings.get(&binding)?;
             let supported_mode = matches!(
@@ -44608,8 +44665,13 @@ impl RootDatabase {
                         // `s: Str` parameters project `Str` — `take_str(s)`
                         // / `take_str("a")` bind like a `Str` annotation.
                         Some(FunctionDirectType::Str) => Some(FunctionDirectType::Str),
-                        Some(FunctionDirectType::Unit | FunctionDirectType::Primitive(_))
-                        | None => None,
+                        Some(FunctionDirectType::Unit | FunctionDirectType::Primitive(_)) => None,
+                        Some(record @ FunctionDirectType::Record(_)) => Some(record),
+                        // Record-typed parameters carry their nominal
+                        // identity so calls check arguments against the
+                        // same record type.
+                        None => resolve_record_type_def(*parameter.ty, Some(&type_paths))
+                            .map(FunctionDirectType::Record),
                     }
                 })
                 .collect::<Option<Vec<_>>>()
@@ -44633,6 +44695,10 @@ impl RootDatabase {
                 // `-> Str` callees project `PrimitiveCallOutput::Str` —
                 // `let t = make_str()` binds a `Str` local.
                 Some(FunctionDirectType::Str) => FunctionDirectType::Str,
+                None => match resolve_record_type_def(*return_ty, Some(&type_paths)) {
+                    Some(def) => FunctionDirectType::Record(def),
+                    None => continue,
+                },
                 _ => continue,
             };
 
