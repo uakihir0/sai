@@ -1856,6 +1856,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return self.check_wrapping(operator, left, right, expression);
         }
 
+        // The operand-error floor is captured before any operand
+        // evaluation: operands can be evaluated speculatively in earlier
+        // guards and then hit the type cache, so a per-site floor would
+        // miss the diagnostic that produced an error type.
+        let operand_error_floor = self.errors.len();
+
         if let ExprKind::Lit(literal) = left.kind {
             let Some(kind) = primitive_literal_kind(literal) else {
                 return Err(());
@@ -1905,7 +1911,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 return Ok(local_type);
             }
             if let Ok(error_type @ LocalType::Error(_)) = self.check_operand_local_type(right) {
-                return Ok(error_type);
+                if self.errors.len() > operand_error_floor {
+                    return Ok(error_type);
+                }
+                return Err(());
             }
             let right_type = self
                 .check_operand_local_type(right)
@@ -1939,13 +1948,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_local_type = self.check_operand_local_type(left).ok().ok_or(())?;
-        // An error left operand already reported its diagnostic (`t.5`
-        // out of range) — the arithmetic propagates it instead of
-        // gating so the error is not hidden behind the implementation
-        // gate. The right operand still checks for recovery.
+        // An error left operand produced *with* a diagnostic (`t.5` out
+        // of range) propagates instead of gating, so the error is not
+        // hidden behind the implementation gate. A silent error type —
+        // an `if` whose branches all `return` carries no diagnostic —
+        // must not skip the operator's own validation, so it gates as
+        // before. The right operand still checks for recovery.
         if let LocalType::Error(_) = left_local_type {
-            let _ = self.check_operand_local_type(right);
-            return Ok(left_local_type);
+            if self.errors.len() > operand_error_floor {
+                let _ = self.check_operand_local_type(right);
+                return Ok(left_local_type);
+            }
+            return Err(());
         }
         let unresolved_literal_variable = matches!(left_local_type, LocalType::LiteralVariable(id)
             if self
@@ -2100,7 +2114,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         if let Ok(error_type @ LocalType::Error(_)) = self.check_operand_local_type(right) {
-            return Ok(error_type);
+            if self.errors.len() > operand_error_floor {
+                return Ok(error_type);
+            }
+            return Err(());
         }
         let right_type = self
             .check_operand_local_type(right)
