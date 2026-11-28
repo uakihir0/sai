@@ -11651,6 +11651,18 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1230: Diverging composite return tails
+
+- Slice: `pub fn f(x: I32) -> (I32, I32) { return (x, 1) }` — a `return`
+  expression in tail position diverges, so the block is `Never` and
+  coerces; the return value checks against the composite shape like a
+  statement-position return.
+- Statement-only composite bodies whose statements end in a direct
+  `return` diverge and admit; other missing-tail shapes are certain
+  mismatches whose diagnostic needs composite type display — they stay
+  gated with that slice, as do bare `return` tails and scalar values at
+  composite returns.
+
 ## IR-1229: Composite projection assignment places
 
 - Slice: `var u = (x, 1); u.1 = 2` and `var a = [x, 1]; a[0] = 2` —

@@ -803,7 +803,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         let literal_floor = self.literal_variables.len();
         let Some(tail) = block.tail else {
-            return Err(());
+            // A statement-only composite body mirrors the primitive one:
+            // a direct `return` statement diverges, so the block is
+            // `Never` and coerces to the composite expectation. Other
+            // missing-tail shapes are certain mismatches, but their
+            // diagnostic needs composite type display — they stay gated
+            // unless the statements produced errors of their own, which
+            // must surface instead of hiding behind the gate.
+            let mut diverges = false;
+            let error_floor = self.errors.len();
+            for stmt in block.stmts {
+                self.check_stmt(stmt)?;
+                if let StmtKind::Expr(expression) = stmt.kind {
+                    if let ExprKind::Return(_) = expression.kind {
+                        diverges = true;
+                    }
+                }
+            }
+            if !diverges && self.errors.len() == error_floor {
+                return Err(());
+            }
+            self.default_unresolved_literals(literal_floor);
+            return Ok(());
         };
         for stmt in block.stmts {
             self.check_stmt(stmt)?;
@@ -838,6 +859,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .check_match_tail(scrutinee, arms, source, expected)
                 .map(|_| ()),
             ExprKind::Block(block) => self.check_block_composite_expected(block, expected),
+            // A `return` tail diverges, so the tail itself coerces to
+            // anything; the return value checks against the composite
+            // shape like a return statement in statement position. A
+            // bare `return` at a composite return type is a certain
+            // mismatch whose diagnostic needs composite type display —
+            // it stays gated with that slice.
+            ExprKind::Return(Some(value)) => self.check_composite_expr_expected(value, expected),
             _ => {
                 // A non-literal composite expression (a binding path or a
                 // projection yielding a composite) synthesizes first,
