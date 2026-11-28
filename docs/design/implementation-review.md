@@ -11651,6 +11651,22 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1229: Composite projection assignment places
+
+- Slice: `var u = (x, 1); u.1 = 2` and `var a = [x, 1]; a[0] = 2` —
+  tuple-field and index places assign through the projection chain.
+- The kernel resolves the leaf type through the same projection logic
+  reads use (nested chains like `u.0.1` included); the right side
+  checks against the leaf — literal leaves join the inference group,
+  composite leaves check element-wise, and compound assignment
+  desugars identically.
+- Mutability is the root binding's: `let u = (x, 1); u.1 = 2` is
+  `ASSIGN_TO_IMMUTABLE`; out-of-range tuple indices keep
+  `TUPLE_INDEX_OUT_OF_RANGE`; the bounds check of an array index stays
+  a runtime panic, not a compile error.
+- Scalar-base projections (`x.0 = 1` at `x: I32`) stay gated — a
+  certain mismatch needing the type-display diagnostic, a later slice.
+
 ## IR-1228: Statement-less non-literal composite tails
 
 - Slice: `pub fn f(t: (I32, I64)) -> (I32, I64) { t }` — only

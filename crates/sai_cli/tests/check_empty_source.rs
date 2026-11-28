@@ -27619,6 +27619,72 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn composite_projection_places_assign_leafwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Tuple-field and index places assign through the projection:
+        // the leaf type checks the right side, and mutability is the
+        // root binding's.
+        (
+            "pub fn f(x: I32) {\n    var u = (x, 1)\n    u.1 = 2\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    var a = [x, 1]\n    a[0] = 2\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    var u = ((x, 1), 2)\n    u.0.1 = 3\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    let u = (x, 1)\n    u.1 = 2\n}\n",
+            &[("ASSIGN_TO_IMMUTABLE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) {\n    var u = (x, 1)\n    u.1 = true\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) {\n    var u = (x, 1)\n    u.5 = 2\n}\n",
+            &[("TUPLE_INDEX_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) {\n    var u = (x, 1)\n    u.1 = 300\n    var v: U8 = u.1\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) {\n    var u = (x, 1)\n    u.1 += 1\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    var u = ((x, 1), 2)\n    u.0 = (3, 4)\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "composite projection places should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn composite_statementless_path_tails_check_leafwise() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // Statement-less bodies ending in a non-literal composite tail
