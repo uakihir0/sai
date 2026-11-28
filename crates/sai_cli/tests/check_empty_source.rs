@@ -6250,7 +6250,6 @@ fn unsupported_unannotated_literal_copy_forms_remain_gated() {
         "pub fn copy() -> I32 {\n    let source = 42\n    let copied = r#source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let var source = 42\n    let copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source = 42\n    let var copied = source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let (source, other) = (42, 7)\n    let copied = source\n    copied\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -6440,7 +6439,6 @@ fn unsupported_flat_unannotated_primitive_local_forms_remain_gated() {
     for source in [
         "pub fn self_reference() -> I32 {\n    let source = source\n    source\n}\n",
         "pub fn forward_reference() -> I32 {\n    let copied = later\n    let later = 1\n    copied\n}\n",
-        "pub fn destructured() -> I32 {\n    let (source, other) = (1, 2)\n    source\n}\n",
         "pub fn raw_path() -> I32 {\n    let source = 1\n    let copied = r#source\n    copied\n}\n",
         "pub fn qualified_path() -> I32 {\n    let source = 1\n    let copied = values.VALUE\n    copied\n}\n",
         "pub fn generic_path() -> I32 {\n    let source = 1\n    let copied = source<I32>\n    copied\n}\n",
@@ -10534,7 +10532,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left * right\n    result\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let result = later * left\n    let later: I32 = 1\n    result\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let result = result - left\n    result\n}\n",
-        "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let result = first - second\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -10624,7 +10621,6 @@ fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn add(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let sum = left + right\n    sum\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let sum = later + left\n    let later: I32 = 1\n    sum\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let sum = sum + left\n    sum\n}\n",
-        "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let sum = first + second\n    sum\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -27354,4 +27350,132 @@ fn literal_left_operator_scrutinees_resolve_through_concrete_operands() {
             assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
         }
     }
+}
+
+#[test]
+fn tuple_destructuring_binds_elements_in_let_statements() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, b) = (x, 1)\n    a + b\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, (b, c)) = (x, (1, 2))\n    a + b + c\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (var a, _) = (x, 1)\n    a = a + 1\n    a\n}\n",
+            &[],
+        ),
+        // A destructured numeric literal keeps its inference provenance,
+        // so unary operators on it check like a direct `let n = 1`.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, n) = (x, 1)\n    let result: I32 = -n\n    result\n}\n",
+            &[],
+        ),
+        // Single-element tuples destructure through the trailing-comma
+        // form (spec 6.5.1).
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a,) = (x,)\n    a\n}\n",
+            &[],
+        ),
+        // A nested arity mismatch recovers: the healthy nested elements
+        // stay bound and the diagnostic still surfaces.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, (b, c, d)) = (x, (1, 2))\n    b\n}\n",
+            &[("PATTERN_ARITY_MISMATCH", 1)],
+        ),
+        // A tuple pattern against a scalar element is a type mismatch
+        // (spec 6.21.2), not a gate — the bindings recover as error types.
+        (
+            "pub fn f(x: I32, y: I32) -> I32 {\n    let (a, (b, c)) = (x, y)\n    b\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        // Composite literals against primitive expectations are always
+        // a mismatch — inference cannot change it — so they diagnose
+        // instead of gating.
+        (
+            "pub fn f() {\n    var n: U64 = 1\n    n = (1, 2)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        // Element errors surface alongside the certain mismatch.
+        (
+            "pub fn f(x: U8) {\n    var n: U64 = 1\n    n = [x, 300]\n}\n",
+            &[("TYPE_MISMATCH", 1), ("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        // Assigning to a `var` recovered binding does not cascade past
+        // the pattern diagnostic either.
+        (
+            "pub fn f(x: I32, y: I32) -> I32 {\n    let (a, (var b, c)) = (x, y)\n    b = 1\n    b\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, b, c) = (x, 1)\n    a\n}\n",
+            &[("PATTERN_ARITY_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, (b, c, d)) = (x, (1, 2))\n    a\n}\n",
+            &[("PATTERN_ARITY_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, _) = (x, 1)\n    a = 2\n    a\n}\n",
+            &[("ASSIGN_TO_IMMUTABLE", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "tuple destructuring should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn error_tainted_annotated_assignments_check_at_the_annotation() {
+    // A `var` whose initializer carries an error still assigns at its
+    // annotation: `var n: U64 = self.missing` range-checks later values
+    // at `U64`, not the `I64` literal default.
+    let output = run_check(
+        "type S { x: I32 }\nimpl S {\n    pub fn f(self: borrow Self) {\n        var n: U64 = self.missing\n        n = 9223372036854775808\n    }\n}\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""),
+        "2^63 fits the `U64` annotation:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "error-tainted assignment should check, not gate:\n{stdout}"
+    );
+
+    let output = run_check(
+        "type S { x: I32 }\nimpl S {\n    pub fn f(self: borrow Self) {\n        var n: U64 = self.missing\n        n = 18446744073709551616\n    }\n}\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let actual = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""))
+        .count();
+    assert_eq!(actual, 1, "2^64 exceeds `U64`:\n{stdout}");
 }

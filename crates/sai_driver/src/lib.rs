@@ -15276,7 +15276,7 @@ fn primitive_value_expression_shape_is_supported(
         // the same value admission. The kernel builds the composite type
         // from the elements; element shapes it cannot check yet (nested
         // arrays, cross-family literal joins) fall back to the gate.
-        ExprKind::Tuple(elements) if elements.len() >= 2 => {
+        ExprKind::Tuple(elements) if !elements.is_empty() => {
             return elements.iter().all(|element| {
                 primitive_value_expression_shape_is_supported(
                     element,
@@ -15682,11 +15682,15 @@ fn primitive_assign_target_shape_is_supported(
     }
     matches!(
         locals.bindings.get(&binding).map(|local| local.kind),
+        // `Pattern` bindings come from destructuring — destructured `var`
+        // bindings are assignable like `var` locals, and the kernel
+        // diagnoses assignment to immutable ones (`ASSIGN_TO_IMMUTABLE`).
         Some(
             sai_resolve::owner::BindingKind::Let
                 | sai_resolve::owner::BindingKind::Var
                 | sai_resolve::owner::BindingKind::Param
                 | sai_resolve::owner::BindingKind::VarParam
+                | sai_resolve::owner::BindingKind::Pattern { .. }
         )
     )
 }
@@ -15908,6 +15912,85 @@ fn primitive_let_statement_shape_is_supported(
     else {
         return false;
     };
+    if let PatKind::Tuple(patterns) = pat.kind {
+        // Tuple destructuring (spec 6.21.2): no annotation in this slice,
+        // subpatterns are bindings/wildcards or nested tuples, and the
+        // initializer follows value admission. Every element binding is
+        // visible after the statement.
+        if ty.is_some() {
+            return false;
+        }
+        fn destructuring_pattern_shape_is_supported(
+            pattern: &sai_hir::patterns::Pat<'_>,
+            locals: &LocalResolution,
+        ) -> bool {
+            match pattern.kind {
+                PatKind::Wild => true,
+                PatKind::Binding {
+                    mode,
+                    binding,
+                    sub: None,
+                    ..
+                } => matches!(
+                    (locals.bindings.get(&binding).map(|local| local.kind), mode),
+                    // Tuple destructuring registers subpattern bindings as
+                    // `Pattern { var }` rather than `Let`/`Var` — the
+                    // resolver only gives `Let` to direct single bindings.
+                    (
+                        Some(sai_resolve::owner::BindingKind::Pattern { var: false }),
+                        sai_hir::patterns::BindingMode::Value
+                    ) | (
+                        Some(sai_resolve::owner::BindingKind::Pattern { var: true }),
+                        sai_hir::patterns::BindingMode::Var
+                    )
+                ),
+                PatKind::Tuple(nested) => nested
+                    .iter()
+                    .all(|element| destructuring_pattern_shape_is_supported(element, locals)),
+                _ => false,
+            }
+        }
+        fn destructuring_pattern_bindings(
+            pattern: &sai_hir::patterns::Pat<'_>,
+            bindings: &mut HashSet<sai_hir::BindingId>,
+        ) {
+            match pattern.kind {
+                PatKind::Binding { binding, .. } => {
+                    bindings.insert(binding);
+                }
+                PatKind::Tuple(nested) => {
+                    for element in nested {
+                        destructuring_pattern_bindings(element, bindings);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !patterns
+            .iter()
+            .all(|pattern| destructuring_pattern_shape_is_supported(pattern, locals))
+        {
+            return false;
+        }
+        if !primitive_value_expression_shape_is_supported(
+            init,
+            preceding_bindings,
+            locals,
+            inputs,
+            symbols,
+            type_paths,
+            self_field_projections,
+            unknown_self_fields,
+            direct_call_signatures,
+            primitive_types,
+        ) {
+            return false;
+        }
+        for pattern in patterns {
+            destructuring_pattern_bindings(pattern, preceding_bindings);
+        }
+        return true;
+    }
     let PatKind::Binding {
         mode,
         name,
@@ -18564,9 +18647,11 @@ fn primitive_body_errors_to_diagnostics(
                 .stmts
                 .iter()
                 .find_map(|stmt| match stmt.kind {
-                    StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
-                        primitive_body_error_span(init, error.node)
+                    StmtKind::Let { pat, init, .. } => {
+                        primitive_destructuring_pattern_error_span(pat, error.node)
+                            .or_else(|| primitive_body_error_span(init, error.node))
                     }
+                    StmtKind::Expr(init) => primitive_body_error_span(init, error.node),
                     StmtKind::Assert { cond, msg, .. } => {
                         primitive_body_error_span(cond, error.node).or_else(|| {
                             msg.and_then(|msg| primitive_body_error_span(msg, error.node))
@@ -18700,6 +18785,19 @@ fn primitive_body_errors_to_diagnostics(
                 "tuple index out of range".to_owned(),
                 "tuple index out of range",
             )?,
+            PrimitiveBodyErrorKind::PatternArityMismatch { expected, found } => {
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::PatternArityMismatch,
+                    format!(
+                        "tuple pattern has {found} element(s) but the type has arity {expected}"
+                    ),
+                    "pattern arity mismatch",
+                )?
+            }
             PrimitiveBodyErrorKind::MissingBlockTail { expected } => const_literal_diagnostic(
                 owner.id,
                 inputs,
@@ -18763,6 +18861,30 @@ fn primitive_body_errors_to_diagnostics(
                     "type mismatch",
                 )?
             }
+            PrimitiveBodyErrorKind::CompositeLiteralAgainstPrimitive { expected, tuple } => {
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found {}",
+                        const_primitive_name(expected),
+                        if tuple { "a tuple" } else { "an array" },
+                    ),
+                    "type mismatch",
+                )?
+            }
+            PrimitiveBodyErrorKind::TuplePatternOnNonTuple => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                "tuple pattern requires a tuple type".to_string(),
+                "not a tuple",
+            )?,
             PrimitiveBodyErrorKind::LiteralScalarTypeMismatch { expected, found } => {
                 const_literal_diagnostic(
                     owner.id,
@@ -19057,6 +19179,27 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
     }
 }
 
+/// Destructuring-pattern errors anchor at the pattern itself — the
+/// initializer search never reaches pattern nodes, so without this a
+/// `PATTERN_ARITY_MISMATCH` would lose its span and gate the body.
+fn primitive_destructuring_pattern_error_span(
+    pattern: &sai_hir::patterns::Pat<'_>,
+    node: HirId,
+) -> Option<sai_hir::Span> {
+    if pattern.hir_id == node {
+        return Some(pattern.span);
+    }
+    match pattern.kind {
+        PatKind::Tuple(elements) | PatKind::Or(elements) => elements
+            .iter()
+            .find_map(|element| primitive_destructuring_pattern_error_span(element, node)),
+        PatKind::Binding { sub: Some(sub), .. } => {
+            primitive_destructuring_pattern_error_span(sub, node)
+        }
+        _ => None,
+    }
+}
+
 fn primitive_body_block_error_span(
     block: &sai_hir::expressions::Block<'_>,
     node: HirId,
@@ -19070,9 +19213,11 @@ fn primitive_body_block_error_span(
             (stmt.hir_id == node)
                 .then_some(stmt.span)
                 .or_else(|| match stmt.kind {
-                    StmtKind::Let { init, .. } | StmtKind::Expr(init) => {
-                        primitive_body_error_span(init, node)
+                    StmtKind::Let { pat, init, .. } => {
+                        primitive_destructuring_pattern_error_span(pat, node)
+                            .or_else(|| primitive_body_error_span(init, node))
                     }
+                    StmtKind::Expr(init) => primitive_body_error_span(init, node),
                     StmtKind::Assert { cond, msg, .. } => primitive_body_error_span(cond, node)
                         .or_else(|| msg.and_then(|msg| primitive_body_error_span(msg, node))),
                     StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
