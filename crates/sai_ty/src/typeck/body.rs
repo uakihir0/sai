@@ -874,16 +874,26 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             | (ExprKind::Array(elements), CompositeType::Tuple(_)) => {
                 // A composite literal never coerces across the tuple/array
                 // boundary, so the shape mismatch is a definitive type
-                // error; the elements still check without an expectation
-                // so leaf errors inside them surface.
+                // error; the elements still check so leaf errors inside
+                // them surface.
                 self.errors.push(PrimitiveBodyError {
                     node: expression.hir_id,
                     kind: PrimitiveBodyErrorKind::CompositeShapeMismatch {
                         expected_tuple: !matches!(expression.kind, ExprKind::Tuple(_)),
                     },
                 });
-                for element in elements.iter() {
-                    let _ = self.check_initializer_value(element, None);
+                if matches!(expression.kind, ExprKind::Array(_)) {
+                    // Array elements unify with each other regardless of
+                    // the mismatched context, so the recovery keeps the
+                    // cross-element unification (`[x, 300]` at `x: U8`
+                    // still range-checks the literal against the anchor).
+                    let _ = self.check_array_literal_elements(elements);
+                } else {
+                    // Tuple elements are heterogeneous, so each checks in
+                    // its own inference position.
+                    for element in elements.iter() {
+                        let _ = self.check_initializer_value(element, None);
+                    }
                 }
                 Ok(())
             }
