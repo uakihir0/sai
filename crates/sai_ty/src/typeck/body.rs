@@ -4999,6 +4999,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// `return e` checks `e` against the declared primitive return type like a
     /// tail; a bare `return` in a non-unit body reports TYPE_MISMATCH (§6.17).
     fn check_return(&mut self, hir_id: HirId, value: Option<&'hir Expr<'hir>>) -> Result<(), ()> {
+        if let Some(composite) = self.composite_return_type {
+            // A composite `return` value checks against the return shape
+            // like a composite tail; a bare `return` is unit-typed and
+            // stays gated for its own slice.
+            return match value {
+                Some(value) => self.check_composite_expr_expected(value, composite),
+                None => Err(()),
+            };
+        }
         let Some(return_type) = self.input.return_type else {
             return Err(());
         };
