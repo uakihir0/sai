@@ -911,6 +911,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     ) -> Result<(), ()> {
         match local_type {
             LocalType::Concrete(primitive) => {
+                // A plain path to a composite binding can never coerce to
+                // the primitive leaf — the mismatch is certain, and it
+                // reports here instead of gating the body.
+                if let Some(binding) = self.plain_local_path_binding(expression) {
+                    if let Some(LocalType::Composite(index)) = self.known_bindings.get(&binding) {
+                        let tuple = matches!(
+                            self.composite_types.get(*index),
+                            Some(CompositeType::Tuple(_))
+                        );
+                        self.errors.push(PrimitiveBodyError {
+                            node: expression.hir_id,
+                            kind: PrimitiveBodyErrorKind::CompositeLiteralAgainstPrimitive {
+                                expected: primitive,
+                                tuple,
+                            },
+                        });
+                        return Ok(());
+                    }
+                }
                 // The synthesized element type still unifies with the
                 // leaf expectation: bare literals come back as inference
                 // variables that must resolve against it (range checks
@@ -919,7 +938,120 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.check_annotated_path(synthesized, primitive, expression.hir_id)?;
                 Ok(())
             }
-            LocalType::Composite(_) => self.check_composite_literal_value(expression, local_type),
+            LocalType::Composite(_) => {
+                if matches!(expression.kind, ExprKind::Tuple(_) | ExprKind::Array(_)) {
+                    self.check_composite_literal_value(expression, local_type)
+                } else {
+                    // A non-literal element (a path or projection of
+                    // composite type) synthesizes first, then unifies
+                    // with the shape leaf-wise so literal variables
+                    // inside it still resolve (`let pair = (x, 1)` in
+                    // `(pair, y)` at `((I32, I64), Bool)`).
+                    let synthesized = self.check_initializer_value(expression, None)?.local_type;
+                    self.unify_composite_element(synthesized, local_type, expression.hir_id)
+                }
+            }
+            _ => Err(()),
+        }
+    }
+
+    /// A synthesized composite element type unified against its shape
+    /// type leaf-wise (spec 6.3.1): leaves go through the annotated-path
+    /// coercion so literal variables resolve and concrete mismatches
+    /// report, composite structure recurses with arity/length/shape
+    /// diagnostics, and error-typed elements are accepted without a
+    /// cascade. Scalar elements where the shape expects a composite
+    /// stay gated for their own slice.
+    fn unify_composite_element(
+        &mut self,
+        synthesized: LocalType,
+        expected: LocalType,
+        node: HirId,
+    ) -> Result<(), ()> {
+        match expected {
+            LocalType::Concrete(primitive) => match synthesized {
+                LocalType::Composite(index) => {
+                    let tuple = matches!(
+                        self.composite_types.get(index),
+                        Some(CompositeType::Tuple(_))
+                    );
+                    self.errors.push(PrimitiveBodyError {
+                        node,
+                        kind: PrimitiveBodyErrorKind::CompositeLiteralAgainstPrimitive {
+                            expected: primitive,
+                            tuple,
+                        },
+                    });
+                    Ok(())
+                }
+                other => self.check_annotated_path(other, primitive, node),
+            },
+            LocalType::Composite(expected_index) => match synthesized {
+                LocalType::Error(_) => Ok(()),
+                LocalType::Composite(synthesized_index) => {
+                    let Some(shape) = self.composite_types.get(expected_index).cloned() else {
+                        return Err(());
+                    };
+                    let Some(actual) = self.composite_types.get(synthesized_index).cloned() else {
+                        return Err(());
+                    };
+                    match (actual, shape) {
+                        (
+                            CompositeType::Tuple(found_elements),
+                            CompositeType::Tuple(expected_elements),
+                        ) => {
+                            if found_elements.len() != expected_elements.len() {
+                                self.errors.push(PrimitiveBodyError {
+                                    node,
+                                    kind: PrimitiveBodyErrorKind::CompositeArityMismatch {
+                                        tuple: true,
+                                        expected: expected_elements.len(),
+                                        found: found_elements.len(),
+                                    },
+                                });
+                            }
+                            for (found, expected) in
+                                found_elements.iter().zip(expected_elements.iter())
+                            {
+                                self.unify_composite_element(*found, *expected, node)?;
+                            }
+                            Ok(())
+                        }
+                        (
+                            CompositeType::Array {
+                                elem: found_elem,
+                                len: found_len,
+                            },
+                            CompositeType::Array {
+                                elem: expected_elem,
+                                len: expected_len,
+                            },
+                        ) => {
+                            if found_len != expected_len {
+                                self.errors.push(PrimitiveBodyError {
+                                    node,
+                                    kind: PrimitiveBodyErrorKind::CompositeArityMismatch {
+                                        tuple: false,
+                                        expected: expected_len,
+                                        found: found_len,
+                                    },
+                                });
+                            }
+                            self.unify_composite_element(found_elem, expected_elem, node)
+                        }
+                        (_, shape) => {
+                            self.errors.push(PrimitiveBodyError {
+                                node,
+                                kind: PrimitiveBodyErrorKind::CompositeShapeMismatch {
+                                    expected_tuple: matches!(shape, CompositeType::Tuple(_)),
+                                },
+                            });
+                            Ok(())
+                        }
+                    }
+                }
+                _ => Err(()),
+            },
             _ => Err(()),
         }
     }
