@@ -18763,6 +18763,21 @@ fn primitive_body_errors_to_diagnostics(
                     "type mismatch",
                 )?
             }
+            PrimitiveBodyErrorKind::LiteralScalarTypeMismatch { expected, found } => {
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected {}, found `{}`",
+                        scalar_literal_name(expected),
+                        scalar_name(found)
+                    ),
+                    "type mismatch",
+                )?
+            }
             PrimitiveBodyErrorKind::OperatorNotSupported { operator, operand } => {
                 let operator_text = match operator {
                     BinOp::Add => "+",

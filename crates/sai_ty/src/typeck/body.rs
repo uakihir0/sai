@@ -225,6 +225,14 @@ pub enum PrimitiveBodyErrorKind {
         expected: ScalarType,
         found: ScalarLiteralKind,
     },
+    /// `expected <literal>, found <type>` — the mirror of
+    /// `ScalarLiteralTypeMismatch` for positions where the literal
+    /// variable is the established type and the concrete scalar is the
+    /// newcomer (`[1, true]` blames `true`).
+    LiteralScalarTypeMismatch {
+        expected: ScalarLiteralKind,
+        found: ScalarType,
+    },
     OperatorNotSupported {
         operator: BinOp,
         operand: PrimitiveOperatorOperand,
@@ -6181,8 +6189,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
                 Ok(LocalType::Concrete(expected))
             }
-            (LocalType::Str, LocalType::LiteralVariable(id))
-            | (LocalType::LiteralVariable(id), LocalType::Str) => {
+            (LocalType::Str, LocalType::LiteralVariable(id)) => {
                 handled_group_root = Some(self.literal_variable_group_root(id));
                 let kind = self
                     .literal_variables
@@ -6198,8 +6205,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
                 Ok(LocalType::Str)
             }
-            (LocalType::Concrete(expected), LocalType::LiteralVariable(id))
-            | (LocalType::LiteralVariable(id), LocalType::Concrete(expected)) => {
+            (LocalType::LiteralVariable(id), LocalType::Str) => {
+                handled_group_root = Some(self.literal_variable_group_root(id));
+                let kind = self
+                    .literal_variables
+                    .get(id)
+                    .map(|variable| variable.kind)
+                    .unwrap_or(PrimitiveLiteralKind::Integer);
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::LiteralScalarTypeMismatch {
+                        expected: ScalarLiteralKind::Primitive(kind),
+                        found: ScalarType::Str,
+                    },
+                });
+                Ok(LocalType::Str)
+            }
+            (LocalType::Concrete(expected), LocalType::LiteralVariable(id)) => {
                 handled_group_root = Some(self.literal_variable_group_root(id));
                 if self.resolve_literal_variable(id, expected).is_ok() {
                     Ok(LocalType::Concrete(expected))
@@ -6217,6 +6239,26 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         },
                     });
                     Ok(LocalType::Concrete(expected))
+                }
+            }
+            (LocalType::LiteralVariable(id), LocalType::Concrete(concrete)) => {
+                handled_group_root = Some(self.literal_variable_group_root(id));
+                if self.resolve_literal_variable(id, concrete).is_ok() {
+                    Ok(LocalType::Concrete(concrete))
+                } else {
+                    let kind = self
+                        .literal_variables
+                        .get(id)
+                        .map(|variable| variable.kind)
+                        .unwrap_or(PrimitiveLiteralKind::Integer);
+                    self.errors.push(PrimitiveBodyError {
+                        node,
+                        kind: PrimitiveBodyErrorKind::LiteralScalarTypeMismatch {
+                            expected: ScalarLiteralKind::Primitive(kind),
+                            found: ScalarType::Primitive(concrete),
+                        },
+                    });
+                    Ok(LocalType::Concrete(concrete))
                 }
             }
             (LocalType::LiteralVariable(left), LocalType::LiteralVariable(right)) => {
