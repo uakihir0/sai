@@ -11667,6 +11667,23 @@ through value admission; anything the funnel cannot type falls back to
 the gate. Literal scrutinees, typed-range patterns and `Str` comparisons
 keep their existing boundaries.
 
+## IR-1218: Unit bodies discard composite literal tails element-wise
+
+**Slice.** Composite construction reached let bindings and projection
+reads, but a composite literal *tail* in a unit-returning body still
+gated: `pub fn f(x: I32) { let t = (x, 1)\n(t.0, 2) }` — even though
+spec 6.25.2 discards the tail value exactly like any scalar tail.
+
+**Implementation.** The kernel already funnels unit tails through the
+shared initializer path, so the only gap was walker admission:
+unit-returning bodies now admit tuple and array tails of any shape. The
+construction checks element-wise — `(t.0 + 1.5, 2)` reports the float
+mismatch and `[x, true]` elements report the join mismatch exactly like
+initializer positions — while the tail value itself discards. Composite
+tails at *value* returns keep their own slice: checking them against
+the return type needs the expected composite structure, which the
+primitive kernel does not yet receive.
+
 ## IR-1217: Literal-left operator scrutinees resolve through concrete operands
 
 **Slice.** IR-1216 admitted operator match scrutinees, but the
