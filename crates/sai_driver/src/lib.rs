@@ -14266,6 +14266,15 @@ fn check_function_body_primitive_local_block(
             })
             .collect::<HashMap<_, _>>()
     });
+    let mut composite_annotations = HashMap::new();
+    collect_composite_let_annotations(
+        &body.value,
+        type_paths,
+        symbols,
+        inputs,
+        target_cfg,
+        &mut composite_annotations,
+    );
     let check = sai_ty::typeck::body::check_primitive_local_block_body(
         sai_ty::typeck::body::PrimitiveBodyInput {
             body,
@@ -14273,6 +14282,7 @@ fn check_function_body_primitive_local_block(
             initial_bindings: &initial_bindings,
             composite_initial_bindings: Some(&composite_initial_bindings),
             composite_return_shape: composite_return_shape.as_ref(),
+            composite_annotations: Some(&composite_annotations),
             str_bindings: Some(&str_admissions.locals),
             str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
@@ -15777,6 +15787,298 @@ fn primitive_value_expression_shape_is_supported(
 /// for `let`/parameter targets), or a syntactically non-place target the
 /// checker reports as INVALID_ASSIGN_TARGET. Field, tuple-field, index,
 /// and dereference places stay outside this slice.
+/// Syntactic plausibility of a composite `let` annotation: a non-empty
+/// tuple type or an `Array<..>` path. The precise resolution — element
+/// types, array lengths — happens in the owner-aware collection pass;
+/// over-admission here falls back to the kernel's gate.
+fn composite_annotation_shape_is_plausible(
+    ty: &sai_hir::types::Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> bool {
+    match ty.kind {
+        TyKind::Tuple(elements) => !elements.is_empty(),
+        TyKind::Path(path) => {
+            path.root == PathRoot::Plain
+                && path.segments.len() == 1
+                && matches!(
+                    type_paths.and_then(|paths| paths.paths().get(&path.hir_id)),
+                    Some(PathRes {
+                        base: Res::PrimTy(sai_resolve::prelude::PrimTy::Array),
+                        ..
+                    })
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Collect composite `let` annotations across a whole body, keyed by the
+/// annotation type node. The admission walkers see statements one at a
+/// time without the target configuration array lengths need, so the
+/// precise resolution lives in this single recursive pass.
+fn collect_composite_let_annotations(
+    expression: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    target_cfg: &TargetCfg,
+    annotations: &mut HashMap<HirId, sai_ty::typeck::body::CompositeBindingShape>,
+) {
+    match expression.kind {
+        ExprKind::Block(block) => collect_composite_let_annotations_in_block(
+            block,
+            type_paths,
+            symbols,
+            inputs,
+            target_cfg,
+            annotations,
+        ),
+        ExprKind::If { cond, then, els } => {
+            collect_composite_let_annotations(
+                cond,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg,
+                annotations,
+            );
+            collect_composite_let_annotations_in_block(
+                then,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg,
+                annotations,
+            );
+            if let Some(els) = els {
+                collect_composite_let_annotations(
+                    els,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                    annotations,
+                );
+            }
+        }
+        ExprKind::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_composite_let_annotations(
+                scrutinee,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg,
+                annotations,
+            );
+            for arm in arms {
+                if let Some(guard) = arm.guard {
+                    collect_composite_let_annotations(
+                        guard,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        target_cfg,
+                        annotations,
+                    );
+                }
+                collect_composite_let_annotations(
+                    arm.body,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                    annotations,
+                );
+            }
+        }
+        ExprKind::Loop { body, .. } => collect_composite_let_annotations_in_block(
+            body,
+            type_paths,
+            symbols,
+            inputs,
+            target_cfg,
+            annotations,
+        ),
+        ExprKind::Break {
+            value: Some(value), ..
+        } => collect_composite_let_annotations(
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            target_cfg,
+            annotations,
+        ),
+        ExprKind::Field { base, .. }
+        | ExprKind::TupleField { base, .. }
+        | ExprKind::Unary(_, base)
+        | ExprKind::Borrow(_, base)
+        | ExprKind::Try(base)
+        | ExprKind::Await(base)
+        | ExprKind::Return(Some(base)) => collect_composite_let_annotations(
+            base,
+            type_paths,
+            symbols,
+            inputs,
+            target_cfg,
+            annotations,
+        ),
+        ExprKind::Binary(_, left, right) | ExprKind::Index(left, right) => {
+            collect_composite_let_annotations(
+                left,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg,
+                annotations,
+            );
+            collect_composite_let_annotations(
+                right,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg,
+                annotations,
+            );
+        }
+        ExprKind::Call { callee, args, base } => {
+            collect_composite_let_annotations(
+                callee,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg,
+                annotations,
+            );
+            for argument in args {
+                collect_composite_let_annotations(
+                    argument.expr,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                    annotations,
+                );
+            }
+            if let Some(base) = base {
+                collect_composite_let_annotations(
+                    base,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                    annotations,
+                );
+            }
+        }
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
+            for element in elements {
+                collect_composite_let_annotations(
+                    element,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                    annotations,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_composite_let_annotations_in_block(
+    block: &sai_hir::expressions::Block<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    target_cfg: &TargetCfg,
+    annotations: &mut HashMap<HirId, sai_ty::typeck::body::CompositeBindingShape>,
+) {
+    for stmt in block.stmts {
+        match stmt.kind {
+            StmtKind::Let { ty, init, .. } => {
+                if let Some(ty) = ty {
+                    if let Some(
+                        shape @ (sai_ty::typeck::body::CompositeBindingShape::Tuple(_)
+                        | sai_ty::typeck::body::CompositeBindingShape::Array { .. }),
+                    ) = resolve_composite_binding_shape(
+                        *ty, type_paths, symbols, inputs, target_cfg,
+                    ) {
+                        annotations.insert(ty.hir_id, shape);
+                    }
+                }
+                collect_composite_let_annotations(
+                    init,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                    annotations,
+                );
+            }
+            StmtKind::Expr(expression) => collect_composite_let_annotations(
+                expression,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg,
+                annotations,
+            ),
+            StmtKind::Assert { cond, msg, .. } => {
+                collect_composite_let_annotations(
+                    cond,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                    annotations,
+                );
+                if let Some(msg) = msg {
+                    collect_composite_let_annotations(
+                        msg,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        target_cfg,
+                        annotations,
+                    );
+                }
+            }
+            StmtKind::Assign { lhs, rhs } | StmtKind::AssignOp { lhs, rhs, .. } => {
+                collect_composite_let_annotations(
+                    lhs,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                    annotations,
+                );
+                collect_composite_let_annotations(
+                    rhs,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                    annotations,
+                );
+            }
+        }
+    }
+    if let Some(tail) = block.tail {
+        collect_composite_let_annotations(
+            tail,
+            type_paths,
+            symbols,
+            inputs,
+            target_cfg,
+            annotations,
+        );
+    }
+}
+
 fn primitive_assign_target_shape_is_supported(
     target: &HirExpr<'_>,
     preceding_bindings: &HashSet<sai_hir::BindingId>,
@@ -16164,6 +16466,11 @@ fn primitive_let_statement_shape_is_supported(
                 str_annotated = true;
                 str_admissions.annotations.insert(ty.hir_id);
             }
+            // Composite annotations (`let t: (I32, I64) = ..`) admit
+            // syntactically — the precise shape resolution happens in the
+            // owner-aware pre-pass, and shapes the kernel cannot check
+            // fall back to the gate there.
+            _ if composite_annotation_shape_is_plausible(ty, type_paths) => {}
             _ => return false,
         }
     }
@@ -76117,6 +76424,7 @@ property "shared"() {}
                 initial_bindings: &std::collections::HashMap::new(),
                 composite_initial_bindings: None,
                 composite_return_shape: None,
+                composite_annotations: None,
                 str_bindings: None,
                 str_annotations: None,
                 primitive_types: &std::collections::HashMap::new(),

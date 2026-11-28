@@ -27619,6 +27619,79 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn composite_annotated_bindings_check_leafwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `let t: (I32, I64) = ..` checks the initializer against the
+        // shape leaf-wise and binds the composite type.
+        (
+            "pub fn f(x: I32) {\n    let t: (I32, I64) = (x, 1)\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    let t: (I32, I64) = (x, 1)\n    var u = t.0\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    let a: Array<I32, 2> = [x, 1]\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    let t: ((I32, I64), Bool) = ((x, 1), true)\n    var u = t.0.1\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    var t: (I32, I64) = (x, 1)\n    t.1 = 2\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> (I32, I64) {\n    let t: (I32, I64) = (x, 1)\n    t\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    if x > 0 {\n        let t: (I32, I64) = (x, 1)\n    }\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    let t: (I32, I64) = (x, true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) {\n    let t: (I32, I64) = (x, 1, 2)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) {\n    let t: (I32, I64) = [x, 1]\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f() {\n    let t: (U8, I64) = (300, 1)\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "composite annotated bindings should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn composite_diverging_return_tails_check_against_shape() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // A `return` tail diverges, so the block coerces; the return
