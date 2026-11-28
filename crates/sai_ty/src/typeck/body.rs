@@ -1856,12 +1856,6 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return self.check_wrapping(operator, left, right, expression);
         }
 
-        // The operand-error floor is captured before any operand
-        // evaluation: operands can be evaluated speculatively in earlier
-        // guards and then hit the type cache, so a per-site floor would
-        // miss the diagnostic that produced an error type.
-        let operand_error_floor = self.errors.len();
-
         if let ExprKind::Lit(literal) = left.kind {
             let Some(kind) = primitive_literal_kind(literal) else {
                 return Err(());
@@ -1910,11 +1904,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.add_integer_literal_constraint(id, right_literal, right.hir_id)?;
                 return Ok(local_type);
             }
+            // An error right operand propagates: diagnostic-backed
+            // errors keep their already-reported diagnostic visible, and
+            // a `!` operand coerces — the literal's inference variable
+            // stays unresolved either way.
             if let Ok(error_type @ LocalType::Error(_)) = self.check_operand_local_type(right) {
-                if self.errors.len() > operand_error_floor {
-                    return Ok(error_type);
-                }
-                return Err(());
+                return Ok(error_type);
             }
             let right_type = self
                 .check_operand_local_type(right)
@@ -1955,11 +1950,35 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // must not skip the operator's own validation, so it gates as
         // before. The right operand still checks for recovery.
         if let LocalType::Error(_) = left_local_type {
-            if self.errors.len() > operand_error_floor {
-                let _ = self.check_operand_local_type(right);
-                return Ok(left_local_type);
+            // An error left operand is either diagnostic-backed (an
+            // out-of-range projection already reported) or the `!` of a
+            // diverging `if`/`match`. Either way the arithmetic must not
+            // gate: gating would discard diagnostics the body already
+            // produced. `!` coerces to the other operand's type, so with
+            // a concrete right operand the operator validates as if the
+            // left had that type; against a literal or another error the
+            // error propagates without further commitment.
+            match self.check_operand_local_type(right) {
+                Ok(LocalType::Concrete(right_type)) => {
+                    // `!` coerces to the right operand's type, so the
+                    // operator validates as if both operands had it.
+                    return match primitive_arithmetic_result(operator, right_type, right_type) {
+                        PrimitiveArithmeticResult::Type(result) => Ok(LocalType::Concrete(result)),
+                        _ => {
+                            self.report_operator_not_supported(
+                                expression,
+                                operator,
+                                PrimitiveOperatorOperand::Concrete(right_type),
+                            );
+                            Ok(left_local_type)
+                        }
+                    };
+                }
+                _ => {
+                    let _ = self.check_operand_local_type(right);
+                    return Ok(left_local_type);
+                }
             }
-            return Err(());
         }
         let unresolved_literal_variable = matches!(left_local_type, LocalType::LiteralVariable(id)
             if self
@@ -2114,10 +2133,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         if let Ok(error_type @ LocalType::Error(_)) = self.check_operand_local_type(right) {
-            if self.errors.len() > operand_error_floor {
-                return Ok(error_type);
-            }
-            return Err(());
+            // `!` coerces to the concrete left operand's type — the
+            // operator validates as if both operands had it. A
+            // diagnostic-backed error propagates the same way; either
+            // beats gating, which would discard diagnostics the body
+            // already produced.
+            return match primitive_arithmetic_result(operator, left_type, left_type) {
+                PrimitiveArithmeticResult::Type(result) => Ok(LocalType::Concrete(result)),
+                _ => {
+                    self.report_operator_not_supported(
+                        expression,
+                        operator,
+                        PrimitiveOperatorOperand::Concrete(left_type),
+                    );
+                    Ok(error_type)
+                }
+            };
         }
         let right_type = self
             .check_operand_local_type(right)
