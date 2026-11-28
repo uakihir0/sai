@@ -27391,6 +27391,12 @@ fn tuple_destructuring_binds_elements_in_let_statements() {
             "pub fn f(x: I32, y: I32) -> I32 {\n    let (a, (b, c)) = (x, y)\n    b\n}\n",
             &[("TYPE_MISMATCH", 1)],
         ),
+        // Assigning to a `var` recovered binding does not cascade past
+        // the pattern diagnostic either.
+        (
+            "pub fn f(x: I32, y: I32) -> I32 {\n    let (a, (var b, c)) = (x, y)\n    b = 1\n    b\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
         (
             "pub fn f(x: I32) -> I32 {\n    let (a, b, c) = (x, 1)\n    a\n}\n",
             &[("PATTERN_ARITY_MISMATCH", 1)],

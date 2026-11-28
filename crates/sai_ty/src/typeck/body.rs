@@ -5069,7 +5069,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
         if !matches!(
             local_type,
-            LocalType::Concrete(_) | LocalType::Str | LocalType::LiteralVariable(_)
+            LocalType::Concrete(_)
+                | LocalType::Str
+                | LocalType::LiteralVariable(_)
+                | LocalType::Error(_)
+                | LocalType::ErrorLiteralVariable(_)
         ) {
             return Err(());
         }
@@ -5095,6 +5099,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             LocalType::Concrete(place_type) => {
                 self.check_initializer_value(rhs, Some(place_type))?;
                 self.record_expression_type(lhs.hir_id, LocalType::Concrete(place_type));
+                Ok(())
+            }
+            // An error-typed place (a recovered destructured binding, say)
+            // already carries its own diagnostic — the right side checks
+            // for its own errors and the assignment itself is accepted.
+            LocalType::Error(_) | LocalType::ErrorLiteralVariable(_) => {
+                self.check_initializer_value(rhs, None)?;
                 Ok(())
             }
             // `s = e` on a `Str` place desugars like `let s: Str = e` — the
