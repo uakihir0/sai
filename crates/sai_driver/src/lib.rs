@@ -15272,7 +15272,7 @@ fn primitive_value_expression_shape_is_supported(
         // the same value admission. The kernel builds the composite type
         // from the elements; element shapes it cannot check yet (nested
         // arrays, cross-family literal joins) fall back to the gate.
-        ExprKind::Tuple(elements) if elements.len() >= 2 => {
+        ExprKind::Tuple(elements) if !elements.is_empty() => {
             return elements.iter().all(|element| {
                 primitive_value_expression_shape_is_supported(
                     element,

@@ -6250,7 +6250,6 @@ fn unsupported_unannotated_literal_copy_forms_remain_gated() {
         "pub fn copy() -> I32 {\n    let source = 42\n    let copied = r#source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let var source = 42\n    let copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source = 42\n    let var copied = source\n    copied\n}\n",
-        "pub fn copy() -> I32 {\n    let (source, other) = (42, 7)\n    let copied = source\n    copied\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -6440,7 +6439,6 @@ fn unsupported_flat_unannotated_primitive_local_forms_remain_gated() {
     for source in [
         "pub fn self_reference() -> I32 {\n    let source = source\n    source\n}\n",
         "pub fn forward_reference() -> I32 {\n    let copied = later\n    let later = 1\n    copied\n}\n",
-        "pub fn destructured() -> I32 {\n    let (source, other) = (1, 2)\n    source\n}\n",
         "pub fn raw_path() -> I32 {\n    let source = 1\n    let copied = r#source\n    copied\n}\n",
         "pub fn qualified_path() -> I32 {\n    let source = 1\n    let copied = values.VALUE\n    copied\n}\n",
         "pub fn generic_path() -> I32 {\n    let source = 1\n    let copied = source<I32>\n    copied\n}\n",
@@ -10534,7 +10532,6 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left * right\n    result\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let result = later * left\n    let later: I32 = 1\n    result\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let result = result - left\n    result\n}\n",
-        "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let result = first - second\n    result\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -10624,7 +10621,6 @@ fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
         "type IntegerAlias = I32\npub fn add(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let sum = left + right\n    sum\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let sum = later + left\n    let later: I32 = 1\n    sum\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let sum = sum + left\n    sum\n}\n",
-        "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let sum = first + second\n    sum\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -27322,6 +27318,24 @@ fn tuple_destructuring_binds_elements_in_let_statements() {
         (
             "pub fn f(x: I32) -> I32 {\n    let (var a, _) = (x, 1)\n    a = a + 1\n    a\n}\n",
             &[],
+        ),
+        // A destructured numeric literal keeps its inference provenance,
+        // so unary operators on it check like a direct `let n = 1`.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, n) = (x, 1)\n    let result: I32 = -n\n    result\n}\n",
+            &[],
+        ),
+        // Single-element tuples destructure through the trailing-comma
+        // form (spec 6.5.1).
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a,) = (x,)\n    a\n}\n",
+            &[],
+        ),
+        // A nested arity mismatch recovers: the healthy nested elements
+        // stay bound and the diagnostic still surfaces.
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, (b, c, d)) = (x, (1, 2))\n    b\n}\n",
+            &[("PATTERN_ARITY_MISMATCH", 1)],
         ),
         (
             "pub fn f(x: I32) -> I32 {\n    let (a, b, c) = (x, 1)\n    a\n}\n",

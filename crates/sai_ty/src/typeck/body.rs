@@ -1554,6 +1554,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         self.mutable_bindings.insert(binding);
                     }
                     self.known_bindings.insert(binding, element_type);
+                    // A destructured literal element is the same
+                    // unannotated literal binding a direct `let n = 1`
+                    // introduces — unary and operator provenance treat it
+                    // alike, or `-n` on the element would gate.
+                    if let LocalType::LiteralVariable(id) = element_type {
+                        if let Some(variable) = self.literal_variables.get(id) {
+                            match variable.kind {
+                                PrimitiveLiteralKind::Integer => {
+                                    self.direct_unannotated_integer_literals.insert(binding);
+                                }
+                                PrimitiveLiteralKind::FloatingPoint => {
+                                    self.direct_unannotated_float_literals.insert(binding);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
                 // Nested tuple patterns destructure nested composites the
                 // same way; a scalar element here means the pattern is not
@@ -1575,6 +1592,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                                 found: nested.len(),
                             },
                         });
+                        // Recover like the top level: bind the shared
+                        // prefix and error-type the missing elements so
+                        // uses do not cascade past the diagnostic.
+                        self.bind_tuple_pattern(nested, &nested_types)?;
+                        if nested.len() > nested_types.len() {
+                            self.bind_error_pattern_elements(&nested[nested_types.len()..]);
+                        }
                         continue;
                     }
                     self.bind_tuple_pattern(nested, &nested_types)?;
@@ -6621,7 +6645,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // Annotated composite coercions and composite element uses
                 // are later slices and stay gated.
                 ExprKind::Tuple(elements) => {
-                    if annotation.is_some() || elements.len() < 2 {
+                    if annotation.is_some() || elements.is_empty() {
                         return Err(());
                     }
                     let mut element_types = Vec::with_capacity(elements.len());
