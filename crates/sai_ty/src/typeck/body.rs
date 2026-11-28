@@ -272,6 +272,13 @@ pub enum PrimitiveBodyErrorKind {
         expected: usize,
         found: usize,
     },
+    /// A tuple literal checked against an array shape or an array
+    /// literal checked against a tuple shape — composite literals never
+    /// coerce across the tuple/array boundary, so this is always a
+    /// mismatch regardless of inference.
+    CompositeShapeMismatch {
+        expected_tuple: bool,
+    },
     ConstPatternType {
         found: ScalarType,
     },
@@ -860,6 +867,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 for element in elements.iter() {
                     self.check_value_against_local_type(element, elem)?;
+                }
+                Ok(())
+            }
+            (ExprKind::Tuple(elements), CompositeType::Array { .. })
+            | (ExprKind::Array(elements), CompositeType::Tuple(_)) => {
+                // A composite literal never coerces across the tuple/array
+                // boundary, so the shape mismatch is a definitive type
+                // error; the elements still check without an expectation
+                // so leaf errors inside them surface.
+                self.errors.push(PrimitiveBodyError {
+                    node: expression.hir_id,
+                    kind: PrimitiveBodyErrorKind::CompositeShapeMismatch {
+                        expected_tuple: !matches!(expression.kind, ExprKind::Tuple(_)),
+                    },
+                });
+                for element in elements.iter() {
+                    let _ = self.check_initializer_value(element, None);
                 }
                 Ok(())
             }

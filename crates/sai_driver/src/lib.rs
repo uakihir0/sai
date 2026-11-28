@@ -18923,6 +18923,29 @@ fn primitive_body_errors_to_diagnostics(
                     )?
                 }
             }
+            PrimitiveBodyErrorKind::CompositeShapeMismatch { expected_tuple } => {
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected {}, found {}",
+                        if expected_tuple {
+                            "a tuple"
+                        } else {
+                            "an array"
+                        },
+                        if expected_tuple {
+                            "an array"
+                        } else {
+                            "a tuple"
+                        },
+                    ),
+                    "type mismatch",
+                )?
+            }
             PrimitiveBodyErrorKind::MissingBlockTail { expected } => const_literal_diagnostic(
                 owner.id,
                 inputs,
