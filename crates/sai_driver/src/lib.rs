@@ -13739,8 +13739,12 @@ fn check_function_body_primitive_local_block(
     // In unit mode the unit-literal tail trivially discards (spec 6.11.1);
     // the kernel's initializer synthesis has no composite representation
     // for it, so admission skips the shape whitelist below.
-    let is_supported_unit_tail = return_type.is_none()
-        && matches!(tail_kind, Some(ExprKind::Tuple(elements)) if elements.is_empty());
+    // Unit-mode composite tails discard their values like any other
+    // synthesized tail (spec 6.25.2): the kernel checks the construction
+    // element-wise through the shared initializer path, so `(t.0, 2)` or
+    // `[x, 1]` tails validate their interiors instead of gating.
+    let is_supported_unit_tail =
+        return_type.is_none() && matches!(tail_kind, Some(ExprKind::Tuple(_) | ExprKind::Array(_)));
     // Unit-mode `if` tails check branch-wise in the kernel, so an omitted
     // `else` — `{}` by spec 6.14.1 — is admissible there too.
     let is_supported_if_tail = matches!(tail_kind, Some(ExprKind::If { els: Some(_), .. }))
@@ -13876,7 +13880,7 @@ fn check_function_body_primitive_local_block(
         Some(ExprKind::TupleField { .. } | ExprKind::Index(..)) if is_supported_projection_tail => {
             None
         }
-        Some(ExprKind::Tuple(_)) if is_supported_unit_tail => None,
+        Some(ExprKind::Tuple(_) | ExprKind::Array(_)) if is_supported_unit_tail => None,
         // A statement-only unit body carries no tail binding.
         None => None,
         _ => return Ok(None),

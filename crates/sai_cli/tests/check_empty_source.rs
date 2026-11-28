@@ -27265,3 +27265,51 @@ fn operator_expressions_serve_as_match_scrutinees() {
         }
     }
 }
+
+#[test]
+fn unit_bodies_discard_composite_literal_tails() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // A composite literal tail in a unit-returning body discards its
+        // value (spec 6.25.2) but the construction still checks
+        // element-wise through the shared initializer path.
+        (
+            "pub fn f(x: I32) {\n    let t = (x, 1)\n    (t.0, 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) {\n    let t = (x, 1)\n    [t.0, x]\n}\n",
+            &[],
+        ),
+        ("pub fn f(x: I32) {\n    (x, 1)\n}\n", &[]),
+        // Invalid interiors diagnose exactly like initializer positions.
+        (
+            "pub fn f(x: I32) {\n    let t = (x, 1)\n    (t.0 + 1.5, 2)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) {\n    (x, x + true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "unit composite tails should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
