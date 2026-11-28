@@ -27619,6 +27619,47 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_parameter_unknown_fields_diagnose_unknown_field() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `p.z` on a record without `z` is UNKNOWN_FIELD (spec 6.7.1),
+        // in tail and operator positions.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> I32 {\n    p.z\n}\n",
+            &[("UNKNOWN_FIELD", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> I32 {\n    p.z + 1\n}\n",
+            &[("UNKNOWN_FIELD", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> I32 {\n    p.x\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "unknown record fields should diagnose, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn record_copies_project_fields_through_the_copy() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `var q = p` seeds the copy with the source record name, so

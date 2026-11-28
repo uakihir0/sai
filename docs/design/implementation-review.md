@@ -11651,6 +11651,17 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1236: Unknown fields on record parameters
+
+- Slice: `p.z` where the record declares no `z` is `UNKNOWN_FIELD`
+  with the same candidate suggestions unknown `self` fields get — in
+  tail and operator positions — recovering as an error type instead of
+  gating. `Str` fields of record declarations project through the
+  `Str` projection map the self-field machinery uses.
+- The driver records every declared field name alongside the primitive
+  projections, so a miss on a declared-but-non-primitive field still
+  gates (bounded) while a miss on an undeclared name diagnoses.
+
 ## IR-1235: Record copies project fields through the copy
 
 - Slice: `var q = p` / `let q = p` where `p` is a record-typed
