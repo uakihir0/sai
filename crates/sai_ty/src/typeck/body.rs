@@ -998,6 +998,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.check_annotated_path(synthesized, primitive, expression.hir_id)?;
                 Ok(())
             }
+            LocalType::LiteralVariable(_) | LocalType::ErrorLiteralVariable(_) => {
+                // Inference-position leaves (composite constructions keep
+                // their literals as variables): the element synthesizes,
+                // then unifies with the variable leaf — concrete elements
+                // resolve it, variable elements join the group.
+                let synthesized = self.check_initializer_value(expression, None)?.local_type;
+                self.unify_composite_element(synthesized, local_type, expression.hir_id)
+            }
             LocalType::Composite(_) => {
                 if matches!(expression.kind, ExprKind::Tuple(_) | ExprKind::Array(_)) {
                     self.check_composite_literal_value(expression, local_type)
@@ -1045,6 +1053,69 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     Ok(())
                 }
                 other => self.check_annotated_path(other, primitive, node),
+            },
+            // An inference-position leaf (a composite built without an
+            // annotation keeps its literals as variables): concrete right
+            // sides resolve the variable like an annotated coercion, and
+            // variable right sides join the group like scalar `x = y`
+            // assignments — `var t = (x, 1); t = (x, 2)` joins the two
+            // element literals into one inference group.
+            expected_variable @ (LocalType::LiteralVariable(id)
+            | LocalType::ErrorLiteralVariable(id)) => match synthesized {
+                LocalType::Error(_) => Ok(()),
+                LocalType::Concrete(found) => match self.literal_variable_group_type(id) {
+                    Some(expected) => {
+                        self.check_annotated_path(LocalType::Concrete(found), expected, node)
+                    }
+                    None => self.check_annotated_path(expected_variable, found, node),
+                },
+                LocalType::LiteralVariable(other) | LocalType::ErrorLiteralVariable(other) => {
+                    match (
+                        self.literal_variable_group_type(id),
+                        self.literal_variable_group_type(other),
+                    ) {
+                        (Some(expected), Some(found)) => {
+                            self.check_annotated_path(LocalType::Concrete(found), expected, node)?;
+                        }
+                        (Some(expected), None) => {
+                            self.check_annotated_path(
+                                LocalType::LiteralVariable(other),
+                                expected,
+                                node,
+                            )?;
+                        }
+                        (None, Some(found)) => {
+                            self.check_annotated_path(expected_variable, found, node)?;
+                        }
+                        (None, None) => {
+                            if self.literal_variable_group_root(id)
+                                != self.literal_variable_group_root(other)
+                            {
+                                let (Some(kind), Some(other_kind)) = (
+                                    self.literal_variables.get(id).map(|variable| variable.kind),
+                                    self.literal_variables
+                                        .get(other)
+                                        .map(|variable| variable.kind),
+                                ) else {
+                                    return Err(());
+                                };
+                                if kind != other_kind {
+                                    self.errors.push(PrimitiveBodyError {
+                                        node,
+                                        kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                            expected: literal_variable_default_type(kind),
+                                            found: other_kind,
+                                        },
+                                    });
+                                } else {
+                                    self.merge_literal_variables(id, other)?;
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err(()),
             },
             LocalType::Composite(expected_index) => match synthesized {
                 LocalType::Error(_) => Ok(()),
@@ -5610,6 +5681,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 | LocalType::LiteralVariable(_)
                 | LocalType::Error(_)
                 | LocalType::ErrorLiteralVariable(_)
+                | LocalType::Composite(_)
         ) {
             return Err(());
         }
@@ -5627,7 +5699,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// (`var x = 1; x = 2`) keeps the binding's shared literal variable: a
     /// literal right side joins it as an additional literal site, and a
     /// concretely typed right side resolves the variable at the assignment.
-    fn check_assign_stmt(&mut self, lhs: &Expr<'hir>, rhs: &Expr<'hir>) -> Result<(), ()> {
+    fn check_assign_stmt(
+        &mut self,
+        lhs: &'hir Expr<'hir>,
+        rhs: &'hir Expr<'hir>,
+    ) -> Result<(), ()> {
         let Some((place_type,)) = self.assign_place(lhs)? else {
             return Ok(());
         };
@@ -5801,6 +5877,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                 }
                 self.record_expression_type(lhs.hir_id, LocalType::LiteralVariable(id));
+                Ok(())
+            }
+            // A composite place assigns a composite value: the right side
+            // checks against the place shape leaf-wise like a return
+            // value checks against the return shape.
+            LocalType::Composite(_) => {
+                self.check_composite_expr_expected(rhs, place_type)?;
+                self.record_expression_type(lhs.hir_id, place_type);
                 Ok(())
             }
             _ => Err(()),
