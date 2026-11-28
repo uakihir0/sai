@@ -8189,11 +8189,18 @@ fn check_function_body_type(
     // only one the supported slice can express — stays gated rather than
     // passing silently. Scalar-only exports check like any function.
     if item.vis == Visibility::Export {
+        // Composite tuple/array types do not resolve to a direct type at
+        // all, so an `is_some_and` test would treat them as scalar. Any
+        // parameter or return type that fails primitive resolution is
+        // non-scalar for the boundary: it gates here, and a type that
+        // genuinely cannot resolve would gate downstream anyway.
         let non_scalar = sig.params.iter().any(|parameter| {
             resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
-                .is_some_and(|direct| !matches!(direct, FunctionDirectType::Primitive(_)))
+                .map_or(true, |direct| {
+                    !matches!(direct, FunctionDirectType::Primitive(_))
+                })
         }) || sig.ret.is_some_and(|ret| {
-            resolve_function_direct_type(*ret, type_paths, symbols, inputs).is_some_and(|direct| {
+            resolve_function_direct_type(*ret, type_paths, symbols, inputs).map_or(true, |direct| {
                 !matches!(
                     direct,
                     FunctionDirectType::Primitive(_) | FunctionDirectType::Unit
@@ -13800,8 +13807,20 @@ fn check_function_body_primitive_local_block(
     block_bindings.insert(const_path_sentinel_binding());
     for stmt in block.stmts {
         if let StmtKind::Let { pat, .. } = stmt.kind {
-            if let PatKind::Binding { binding, .. } = pat.kind {
-                block_bindings.insert(binding);
+            // Destructuring patterns bind their elements in the same
+            // scope (spec 6.21.2) — a tuple pattern's bindings precede
+            // the tail like a plain `let` binding does.
+            let mut pattern_stack = vec![*pat];
+            while let Some(pattern) = pattern_stack.pop() {
+                match pattern.kind {
+                    PatKind::Binding { binding, .. } => {
+                        block_bindings.insert(binding);
+                    }
+                    PatKind::Tuple(nested) => {
+                        pattern_stack.extend(nested.iter().copied());
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -75958,6 +75977,7 @@ property "shared"() {}
                 body: diagnostic_order_body,
                 return_type: Some(PrimTy::Bool),
                 initial_bindings: &std::collections::HashMap::new(),
+                composite_initial_bindings: None,
                 str_bindings: None,
                 str_annotations: None,
                 primitive_types: &std::collections::HashMap::new(),
