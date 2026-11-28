@@ -13647,6 +13647,7 @@ fn check_function_body_primitive_local_block(
     let str_self_field_projections = Some(&merged_str_fields);
     let mut initial_bindings = HashMap::new();
     let mut composite_initial_bindings = HashMap::new();
+    let mut nominal_initial_bindings = HashMap::new();
     let mut str_admissions = StrShapeAdmissions::default();
     if sig.params.len() != body.params.len() {
         return Ok(None);
@@ -13689,6 +13690,13 @@ fn check_function_body_primitive_local_block(
             // their shapes intern into the kernel's composite arena, so
             // `t.0` and `a[i]` project through the usual machinery.
             _ => {
+                // Record parameters seed the nominal binding map — slice
+                // one treats the value as opaque: it cannot be
+                // constructed or projected yet, so every use gates.
+                if let Some(def) = resolve_record_type_def(*parameter.ty, type_paths) {
+                    nominal_initial_bindings.insert(body_parameter.binding, def);
+                    continue;
+                }
                 let Some(shape) = resolve_composite_binding_shape(
                     *parameter.ty,
                     type_paths,
@@ -13857,6 +13865,7 @@ fn check_function_body_primitive_local_block(
         .keys()
         .copied()
         .chain(composite_initial_bindings.keys().copied())
+        .chain(nominal_initial_bindings.keys().copied())
         .collect::<HashSet<_>>();
     block_bindings.insert(const_path_sentinel_binding());
     for stmt in block.stmts {
@@ -14065,6 +14074,7 @@ fn check_function_body_primitive_local_block(
         .keys()
         .copied()
         .chain(composite_initial_bindings.keys().copied())
+        .chain(nominal_initial_bindings.keys().copied())
         .collect::<HashSet<_>>();
     // `Str` parameters are admitted everywhere a preceding local is — the
     // kernel decides which operand positions still reject `LocalType::Str`.
@@ -14283,6 +14293,7 @@ fn check_function_body_primitive_local_block(
             composite_initial_bindings: Some(&composite_initial_bindings),
             composite_return_shape: composite_return_shape.as_ref(),
             composite_annotations: Some(&composite_annotations),
+            nominal_initial_bindings: Some(&nominal_initial_bindings),
             str_bindings: Some(&str_admissions.locals),
             str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
@@ -15787,6 +15798,24 @@ fn primitive_value_expression_shape_is_supported(
 /// for `let`/parameter targets), or a syntactically non-place target the
 /// checker reports as INVALID_ASSIGN_TARGET. Field, tuple-field, index,
 /// and dereference places stay outside this slice.
+/// Resolve a type path to a record type declaration — the `DefId` is
+/// the nominal type identity for the kernel's opaque record bindings.
+fn resolve_record_type_def(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+) -> Option<sai_hir::DefId> {
+    let TyKind::Path(path) = ty.kind else {
+        return None;
+    };
+    match type_paths?.paths().get(&path.hir_id) {
+        Some(PathRes {
+            base: Res::Def(DefKind::Struct, def),
+            ..
+        }) => Some(*def),
+        _ => None,
+    }
+}
+
 /// Syntactic plausibility of a composite `let` annotation: a non-empty
 /// tuple type or an `Array<..>` path. The precise resolution — element
 /// types, array lengths — happens in the owner-aware collection pass;
@@ -76446,6 +76475,7 @@ property "shared"() {}
                 composite_initial_bindings: None,
                 composite_return_shape: None,
                 composite_annotations: None,
+                nominal_initial_bindings: None,
                 str_bindings: None,
                 str_annotations: None,
                 primitive_types: &std::collections::HashMap::new(),
@@ -116518,14 +116548,18 @@ property "shared"() {}
             matches!(check, FunctionBodyTypeCheck::Unsupported),
             "call stays gated: {check:?}"
         );
-        // `s: Str` names the user record, not core `Str` — a record
-        // parameter is outside the primitive walk, so the method's own
-        // body gates too, and `self.take("a")` gates instead of passing
-        // a `Str` literal to a record parameter.
+        // `s: Str` names the user record, not core `Str` — since
+        // IR-1233 the record parameter seeds an opaque nominal binding,
+        // so the unused-parameter body checks; `self.take("a")` still
+        // gates because no primitive call signature exists for the
+        // record parameter.
         let check = methods[3].body_type_check().expect("body check runs");
         assert!(
-            matches!(check, FunctionBodyTypeCheck::Unsupported),
-            "record-param method stays gated: {check:?}"
+            matches!(
+                check,
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "record-param method checks with the opaque nominal binding: {check:?}"
         );
         let check = methods[4].body_type_check().expect("body check runs");
         assert!(
