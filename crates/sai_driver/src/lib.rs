@@ -14177,6 +14177,12 @@ fn check_function_body_primitive_local_block(
             }
         }
     }
+    // Publish the merged `Str` projections so admission — which
+    // consults the inputs side-channel — accepts record `Str` field
+    // reads like method `self` projections.
+    if !merged_str_fields.is_empty() {
+        *inputs.str_self_field_projections.borrow_mut() = Some(merged_str_fields.clone());
+    }
     *inputs.record_constructor_sites.borrow_mut() = if constructor_sites.is_empty() {
         None
     } else {

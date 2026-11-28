@@ -27607,6 +27607,47 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_str_field_reads_bind_strings() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `n.first` reads a `Str` field off a constructed binding, a
+        // parameter, or a direct construction.
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: \"ada\", age: 30)\n    var s = n.first\n}\n",
+            &[],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var s = Name(first: \"x\", age: 1).first\n}\n",
+            &[],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f(n: Name) {\n    var s = n.first\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record Str field reads should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn record_typed_call_signatures_check_arguments() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `var p = make()` binds a record-returning call; `take(q)`

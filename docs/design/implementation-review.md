@@ -11651,6 +11651,13 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1245: `Str` field reads on record values
+
+- Slice: the merged `Str` projection map publishes into the inputs
+  side-channel like the method path does, so `n.first` reads a `Str`
+  field off constructed bindings, copies, parameters, and direct
+  construction projections.
+
 ## IR-1244: Record-typed call signatures
 
 - Slice: `FunctionDirectType::Record(DefId)` flows through the direct
