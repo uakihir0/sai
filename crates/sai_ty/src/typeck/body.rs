@@ -1914,6 +1914,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // a `!` operand coerces — the literal's inference variable
             // stays unresolved either way.
             if let Ok(error_type @ LocalType::Error(_)) = self.check_operand_local_type(right) {
+                // The left literal still registers its inference
+                // variable so a later annotation or tail range-checks
+                // it — diverging operands do not erase the literal's
+                // own constraints.
+                if matches!(
+                    kind,
+                    PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                ) {
+                    self.local_type_for_unannotated_literal(literal, kind, left.hir_id);
+                }
                 return Ok(error_type);
             }
             let right_type = self
@@ -1967,8 +1977,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 Ok(LocalType::Concrete(right_type)) => {
                     // `!` coerces to the right operand's type, so the
                     // operator validates as if both operands had it.
+                    // The result stays the error type: committing to
+                    // the numeric result would let a later projection
+                    // gate the body and swallow the operand's diagnostic.
                     return match primitive_arithmetic_result(operator, right_type, right_type) {
-                        PrimitiveArithmeticResult::Type(result) => Ok(LocalType::Concrete(result)),
+                        PrimitiveArithmeticResult::Type(_) => Ok(left_local_type),
                         _ => {
                             self.report_operator_not_supported(
                                 expression,
@@ -1979,9 +1992,33 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         }
                     };
                 }
-                _ => {
-                    let _ = self.check_operand_local_type(right);
+                Ok(_) => {
                     return Ok(left_local_type);
+                }
+                Err(()) => {
+                    // Literal right operands error out of the operand
+                    // checker by design — register the numeric literal's
+                    // inference variable so a later annotation or tail
+                    // still range-checks it, then propagate the error.
+                    if let ExprKind::Lit(literal) = right.kind {
+                        if let Some(kind) = primitive_literal_kind(literal) {
+                            if matches!(
+                                kind,
+                                PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                            ) {
+                                self.local_type_for_unannotated_literal(
+                                    literal,
+                                    kind,
+                                    right.hir_id,
+                                );
+                                return Ok(left_local_type);
+                            }
+                        }
+                    }
+                    // A genuinely unsupported right operand keeps the
+                    // gate — the error operand must not launder it into
+                    // acceptance.
+                    return Err(());
                 }
             }
         }
@@ -2144,7 +2181,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // beats gating, which would discard diagnostics the body
             // already produced.
             return match primitive_arithmetic_result(operator, left_type, left_type) {
-                PrimitiveArithmeticResult::Type(result) => Ok(LocalType::Concrete(result)),
+                PrimitiveArithmeticResult::Type(_) => Ok(error_type),
                 _ => {
                     self.report_operator_not_supported(
                         expression,
