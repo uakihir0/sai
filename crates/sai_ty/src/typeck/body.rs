@@ -6827,6 +6827,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         return Err(());
                     }
                     if let Some(expected) = annotation {
+                        // The mismatch is certain, but the elements still
+                        // check in inference positions so their own errors
+                        // (`[x, 300]` at `x: U8`) surface alongside it.
+                        for element in elements.iter() {
+                            // Recovery only: an unsupported element shape
+                            // must not abort the body — the mismatch is
+                            // certain regardless of the elements.
+                            let _ = self.check_initializer_value(element, None);
+                        }
                         self.errors.push(PrimitiveBodyError {
                             node: init.hir_id,
                             kind: PrimitiveBodyErrorKind::CompositeLiteralAgainstPrimitive {
@@ -6854,6 +6863,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         return Err(());
                     }
                     if let Some(expected) = annotation {
+                        // The array unification still runs: cross-element
+                        // errors (`[x, 300]` at `x: U8` range-checking the
+                        // literal against the anchor) surface alongside
+                        // the certain mismatch.
+                        let _ = self.check_array_literal_elements(elements);
                         self.errors.push(PrimitiveBodyError {
                             node: init.hir_id,
                             kind: PrimitiveBodyErrorKind::CompositeLiteralAgainstPrimitive {
