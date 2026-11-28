@@ -217,6 +217,13 @@ pub enum PrimitiveBodyErrorKind {
     /// TYPE_MISMATCH): the pattern requires a tuple but the value is a
     /// scalar or inference variable.
     TuplePatternOnNonTuple,
+    /// A tuple or array literal checked against a primitive expectation —
+    /// composite literals never coerce to primitive types (spec 6.3.1),
+    /// so this is always a mismatch regardless of inference.
+    CompositeLiteralAgainstPrimitive {
+        expected: PrimTy,
+        tuple: bool,
+    },
     ConstPatternType {
         found: ScalarType,
     },
@@ -6754,8 +6761,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // Annotated composite coercions and composite element uses
                 // are later slices and stay gated.
                 ExprKind::Tuple(elements) => {
-                    if annotation.is_some() || elements.is_empty() {
+                    if elements.is_empty() {
                         return Err(());
+                    }
+                    if let Some(expected) = annotation {
+                        self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::CompositeLiteralAgainstPrimitive {
+                                expected,
+                                tuple: true,
+                            },
+                        });
+                        return Ok(InitializerCheck {
+                            local_type: LocalType::Error(Some(expected)),
+                            deferred_neg_result: false,
+                            deferred_bitnot_result: false,
+                        });
                     }
                     let mut element_types = Vec::with_capacity(elements.len());
                     for element in elements.iter() {
@@ -6767,8 +6788,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     LocalType::Composite(index)
                 }
                 ExprKind::Array(elements) => {
-                    if annotation.is_some() || elements.is_empty() {
+                    if elements.is_empty() {
                         return Err(());
+                    }
+                    if let Some(expected) = annotation {
+                        self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::CompositeLiteralAgainstPrimitive {
+                                expected,
+                                tuple: false,
+                            },
+                        });
+                        return Ok(InitializerCheck {
+                            local_type: LocalType::Error(Some(expected)),
+                            deferred_neg_result: false,
+                            deferred_bitnot_result: false,
+                        });
                     }
                     let elem = self.check_array_literal_elements(elements)?;
                     let index = self.composite_types.len();

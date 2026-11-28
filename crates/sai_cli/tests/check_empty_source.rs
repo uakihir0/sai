@@ -27391,6 +27391,13 @@ fn tuple_destructuring_binds_elements_in_let_statements() {
             "pub fn f(x: I32, y: I32) -> I32 {\n    let (a, (b, c)) = (x, y)\n    b\n}\n",
             &[("TYPE_MISMATCH", 1)],
         ),
+        // Composite literals against primitive expectations are always
+        // a mismatch — inference cannot change it — so they diagnose
+        // instead of gating.
+        (
+            "pub fn f() {\n    var n: U64 = 1\n    n = (1, 2)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
         // Assigning to a `var` recovered binding does not cascade past
         // the pattern diagnostic either.
         (
