@@ -11651,6 +11651,15 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1223: Non-literal composite tails
+
+- Slice: `pub fn f(x: I32) -> (I32, I64) { let t = (x, 1)\n t }` — a
+  composite binding or projection as the tail of a statement-bearing
+  composite body synthesizes first, then unifies with the return shape
+  leaf-wise (the same leaf-wise unification as composite elements).
+- Gate: scalar tails at composite returns, composite if/match tails,
+  and composite assignment remain future slices.
+
 ## IR-1222: Composite path elements in composite return tails
 
 - Slice: `pub fn f(x: I32) -> ((I32, I64), Bool) { let pair = (x, 1)\n(pair, true) }` —
