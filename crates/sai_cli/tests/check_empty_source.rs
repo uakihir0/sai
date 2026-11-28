@@ -27619,6 +27619,40 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn composite_statementless_path_tails_check_leafwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Statement-less bodies ending in a non-literal composite tail
+        // check in the kernel too.
+        ("pub fn f(t: (I32, I64)) -> (I32, I64) {\n    t\n}\n", &[]),
+        (
+            "pub fn f(t: (I32, I64)) -> (I32, Bool) {\n    t\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "statement-less path tails should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn composite_assignments_check_leafwise() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // A composite place assigns a composite value: literal elements
