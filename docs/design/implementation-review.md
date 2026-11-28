@@ -11651,6 +11651,32 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1238: Record construction with primitive fields
+
+- Slice: `var p = Point(x: 1, y: 2)` — a call whose callee is a plain
+  single-segment path naming a same-file record whose fields are all
+  primitive checks in the kernel: every initializer unifies with its
+  field type (`TYPE_MISMATCH`, `LITERAL_OUT_OF_RANGE`), and structural
+  errors diagnose driver-side per spec 6.18.1 (`DUPLICATE_FIELD`,
+  `UNKNOWN_FIELD`, `MISSING_FIELD`, `RECORD_FIELD_NEEDS_NAME`).
+  Punning (`Point(x)`) resolves like the const constructor slice.
+- The constructor's nominal identity comes from a module-scope scan
+  the driver side-channels through `CurrentOwnerInputs` (the same
+  pattern `const_path_sites` uses), so `var p = Point(..); p` returns
+  through the IR-1237 pass-through and `p.x` reads through the IR-1234
+  projection machinery — the copy scan treats constructor
+  initializers like path copies.
+- Constructor tails check in return position (`-> Point { Point(x: 1,
+  y: 2) }` — the kernel's nominal return accepts a constructor of the
+  same `DefId` and checks it like any site) and in unit-discard
+  position; a wrong-record constructor tail gates for the
+  type-display slice.
+- Bounded: `Str`/record-typed fields, `..base` functional updates,
+  nested-type construction when the outer record has non-primitive
+  fields, direct construction projections (`Point(..).x`), field
+  mutation, and module-qualified constructor paths gate for their own
+  slices.
+
 ## IR-1237: Record pass-through returns
 
 - Slice: `pub fn f(p: Point) -> Point { p }` — a body whose tail is a

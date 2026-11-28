@@ -54,6 +54,12 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// slice one accepts only pass-through tails: a path whose binding
     /// is the same record type. Other tail shapes gate.
     pub nominal_return_def: Option<sai_hir::DefId>,
+    /// Record construction call sites admitted by the owner-aware
+    /// driver, keyed by the call expression — slice one covers records
+    /// whose fields are all primitive. Structural errors (duplicate,
+    /// unknown, missing, or unnamed fields) are diagnosed driver-side;
+    /// the kernel checks the initializer of every named known field.
+    pub record_constructor_sites: Option<&'a HashMap<HirId, RecordConstructorSite>>,
     /// `Str`-typed parameter bindings admitted by the owner-aware driver —
     /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
     pub str_bindings: Option<&'a HashSet<BindingId>>,
@@ -126,6 +132,15 @@ fn intern_composite_shape(
 
 /// A direct function signature projected by the owner-aware driver for one
 /// call site. The call site and callee identities are both checked before use.
+/// A record construction site's shape: the constructed record's
+/// identity and its primitive field types keyed by field name. The
+/// driver keys sites by the call expression's `HirId`.
+#[derive(Clone, Debug)]
+pub struct RecordConstructorSite {
+    pub def: sai_hir::DefId,
+    pub fields: Vec<(sai_hir::Symbol, PrimTy)>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrimitiveCallSignature {
     pub callee: HirId,
@@ -840,6 +855,27 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let Some(tail) = block.tail else {
             return Err(());
         };
+        // A constructor tail of the same record type checks its field
+        // initializers like any construction site — `-> Point {
+        // Point(x: 1, y: 2) }` is the construction slice's natural
+        // return form.
+        if let ExprKind::Call {
+            args, base: None, ..
+        } = tail.kind
+        {
+            if let Some(site) = self
+                .input
+                .record_constructor_sites
+                .and_then(|sites| sites.get(&tail.hir_id))
+                .filter(|site| site.def == expected)
+                .cloned()
+            {
+                self.check_record_constructor_call(args, &site)?;
+                self.record_expression_type(tail.hir_id, LocalType::Nominal(expected));
+                self.default_unresolved_literals(literal_floor);
+                return Ok(());
+            }
+        }
         let ExprKind::Path(path) = tail.kind else {
             return Err(());
         };
@@ -8645,6 +8681,47 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
+    // A record construction call: every argument naming a known field
+    // checks its initializer against the field's primitive type.
+    // Structural errors — duplicate, unknown, missing, or unnamed
+    // fields — are diagnosed driver-side, so unknown names simply skip
+    // their check here and punning resolves the field from the path.
+    fn check_record_constructor_call(
+        &mut self,
+        args: &[sai_hir::expressions::Arg<'hir>],
+        site: &RecordConstructorSite,
+    ) -> Result<LocalType, ()> {
+        for argument in args {
+            let field_sym = if let Some(name) = argument.name {
+                Some(name.sym)
+            } else if let ExprKind::Path(path) = argument.expr.kind {
+                if path.root == PathRoot::Plain
+                    && path.segments.len() == 1
+                    && path.segments[0].args.is_none()
+                {
+                    Some(path.segments[0].name.sym)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(field_sym) = field_sym else {
+                continue;
+            };
+            let Some((_, expected)) = site
+                .fields
+                .iter()
+                .find(|(name, _)| *name == field_sym)
+                .map(|(name, ty)| (*name, *ty))
+            else {
+                continue;
+            };
+            self.check_expr_expected(argument.expr, expected)?;
+        }
+        Ok(LocalType::Nominal(site.def))
+    }
+
     fn check_direct_call(
         &mut self,
         expression: &Expr<'hir>,
@@ -8658,6 +8735,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         else {
             return Err(());
         };
+        if let Some(site) = self
+            .input
+            .record_constructor_sites
+            .and_then(|sites| sites.get(&expression.hir_id))
+            .cloned()
+        {
+            return self.check_record_constructor_call(args, &site);
+        }
         let signature = self
             .input
             .call_signatures

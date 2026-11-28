@@ -27607,6 +27607,99 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_construction_checks_field_initializers() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `var p = Point(x: 1, y: 2)` constructs; field reads,
+        // arithmetic, pass-through returns, copies, expression
+        // initializers, and punning all check.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> I32 {\n    var p = Point(x: 1, y: 2)\n    p.x + p.y\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> Point {\n    var p = Point(x: 1, y: 2)\n    p\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(a: I32) {\n    var p = Point(x: a, y: a + 1)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(x: I32) {\n    var p = Point(x, y: 2)\n}\n",
+            &[],
+        ),
+        // Constructor tails check in return and unit positions.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> Point {\n    Point(x: 1, y: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(a: I32) -> Point {\n    Point(x: a, y: a + 1)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> Point {\n    Point(x: 1, y: true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    Point(x: 1, y: 2)\n}\n",
+            &[],
+        ),
+        // Structural errors diagnose per spec 6.18.1.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1)\n}\n",
+            &[("MISSING_FIELD", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2, x: 3)\n}\n",
+            &[("DUPLICATE_FIELD", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, z: 2, y: 3)\n}\n",
+            &[("UNKNOWN_FIELD", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(1, y: 2)\n}\n",
+            &[("RECORD_FIELD_NEEDS_NAME", 1)],
+        ),
+        // Initializer type errors diagnose like any primitive position.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Point { x: U8, y: I32 }\npub fn f() {\n    var p = Point(x: 300, y: 2)\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record construction should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn record_returns_accept_pass_through_tails() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `-> Point { p }` / copies pass through; statements may

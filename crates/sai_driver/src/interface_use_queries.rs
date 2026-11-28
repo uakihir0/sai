@@ -7225,6 +7225,8 @@ fn current_owner_inputs_from_prepared(input: &OwnedPhase1ModuleInput) -> Current
         str_self_field_projections: std::cell::RefCell::new(None),
         str_self_method_calls: std::cell::RefCell::new(None),
         const_path_sites: std::cell::RefCell::new(None),
+        record_constructor_sites: std::cell::RefCell::new(None),
+        record_type_defs: std::cell::RefCell::new(None),
     }
 }
 

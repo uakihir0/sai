@@ -13738,9 +13738,13 @@ fn check_function_body_primitive_local_block(
     let mut merged_unknown_fields: HashSet<HirId> =
         unknown_self_fields.cloned().unwrap_or_default();
     let mut driver_diagnostics: Vec<Diagnostic> = Vec::new();
-    if !nominal_binding_record_names.is_empty()
-        && let ExprKind::Block(body_block) = body.value.kind
-    {
+    let mut constructor_sites: HashMap<HirId, sai_ty::typeck::body::RecordConstructorSite> =
+        HashMap::new();
+    // The record scan serves both nominal-parameter projections and
+    // construction sites, so it runs for every block body — the walks
+    // are cheap AST scans and every use stays conditional on what it
+    // collected.
+    if let ExprKind::Block(body_block) = body.value.kind {
         use sai_syntax::ast::AstNode as _;
         if let Some(source_file) = ast::SourceFile::cast(inputs.root.clone()) {
             let mut records: HashMap<String, HashMap<String, sai_resolve::prelude::PrimTy>> =
@@ -13807,8 +13811,227 @@ fn check_function_body_primitive_local_block(
                                 }
                             }
                         }
+                        // A constructor initializer seeds the binding with
+                        // the record name too, so `var p = Point(x: 1, y:
+                        // 2)` projects `p.x` like a copy does.
+                        if let ExprKind::Call {
+                            callee, base: None, ..
+                        } = init.kind
+                        {
+                            if let ExprKind::Path(callee_path) = callee.kind {
+                                if callee_path.root == PathRoot::Plain
+                                    && callee_path.segments.len() == 1
+                                    && callee_path.segments[0].args.is_none()
+                                {
+                                    if let Ok(callee_name) =
+                                        symbols.resolve(callee_path.segments[0].name.sym)
+                                    {
+                                        let normalized = sai_syntax::normalize_identifier(
+                                            callee_name
+                                                .strip_prefix("r#")
+                                                .unwrap_or(callee_name.as_ref()),
+                                        );
+                                        if records.contains_key(&normalized) {
+                                            nominal_binding_record_names
+                                                .insert(binding, normalized);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+            }
+            // Record construction sites: a call whose callee is a plain
+            // single-segment path naming a scanned record. Structural
+            // errors — duplicate, unknown, missing, or unnamed fields
+            // — diagnose here; the kernel checks each known field's
+            // initializer. Slice one needs every field primitive and
+            // no `..base` — anything else stays outside the site map
+            // and gates.
+            if !records.is_empty() {
+                visit_block_expressions(body_block, &mut |expression| {
+                    let ExprKind::Call { callee, args, base } = expression.kind else {
+                        return;
+                    };
+                    let ExprKind::Path(callee_path) = callee.kind else {
+                        return;
+                    };
+                    if callee_path.root != PathRoot::Plain
+                        || callee_path.segments.len() != 1
+                        || callee_path.segments[0].args.is_some()
+                    {
+                        return;
+                    }
+                    let Ok(callee_name) = symbols.resolve(callee_path.segments[0].name.sym) else {
+                        return;
+                    };
+                    let normalized_type = sai_syntax::normalize_identifier(
+                        callee_name
+                            .strip_prefix("r#")
+                            .unwrap_or(callee_name.as_ref()),
+                    );
+                    let Some(fields) = records.get(&normalized_type) else {
+                        return;
+                    };
+                    let Some((_, candidates, all_fields, str_fields)) =
+                        record_meta.get(&normalized_type)
+                    else {
+                        return;
+                    };
+                    // Non-primitive fields (`Str`, records) gate the
+                    // site: every field must carry a primitive type in
+                    // this slice.
+                    if !all_fields
+                        .iter()
+                        .all(|field| fields.contains_key(field.as_str()))
+                        || !str_fields.is_empty()
+                    {
+                        return;
+                    }
+                    if base.is_some() {
+                        return;
+                    }
+                    // The constructor's nominal identity comes from the
+                    // resolver: the callee path resolves to the record's
+                    // struct definition.
+                    let Some(def) = inputs
+                        .record_type_defs
+                        .borrow()
+                        .as_ref()
+                        .and_then(|defs| defs.get(&normalized_type).copied())
+                    else {
+                        return;
+                    };
+                    // Structural validation (spec 6.18.1): duplicates,
+                    // unknown names, missing fields, and unnamed
+                    // non-punning arguments diagnose; the site still
+                    // enters the kernel map so initializers check.
+                    let mut seen: HashSet<sai_hir::Symbol> = HashSet::new();
+                    let mut initialized: HashSet<sai_hir::Symbol> = HashSet::new();
+                    let mut duplicate_spans = Vec::new();
+                    let mut unknown_spans = Vec::new();
+                    let mut unnamed_spans = Vec::new();
+                    // Field types keyed by symbol for the kernel.
+                    let mut site_fields: Vec<(sai_hir::Symbol, sai_resolve::prelude::PrimTy)> =
+                        Vec::new();
+                    for argument in args {
+                        let (field_sym, field_span) = if let Some(name) = argument.name {
+                            (Some(name.sym), name.span)
+                        } else if let ExprKind::Path(path) = argument.expr.kind {
+                            if path.root == PathRoot::Plain
+                                && path.segments.len() == 1
+                                && path.segments[0].args.is_none()
+                            {
+                                (Some(path.segments[0].name.sym), path.segments[0].name.span)
+                            } else {
+                                (None, argument.expr.span)
+                            }
+                        } else {
+                            (None, argument.expr.span)
+                        };
+                        let Some(field_sym) = field_sym else {
+                            unnamed_spans.push(argument.expr.span);
+                            continue;
+                        };
+                        if !seen.insert(field_sym) {
+                            duplicate_spans.push(field_span);
+                        }
+                        let Ok(spelling) = symbols.resolve(field_sym) else {
+                            continue;
+                        };
+                        let normalized_field = sai_syntax::normalize_identifier(
+                            spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+                        );
+                        let Some(primitive) = fields.get(normalized_field.as_str()) else {
+                            unknown_spans.push(field_span);
+                            continue;
+                        };
+                        initialized.insert(field_sym);
+                        if !site_fields.iter().any(|(sym, _)| *sym == field_sym) {
+                            site_fields.push((field_sym, *primitive));
+                        }
+                    }
+                    // `all_fields` is normalized-name keyed; the declared
+                    // order of candidate spellings lines up with the
+                    // record scan's parse order, so missing detection
+                    // compares normalized spellings.
+                    let mut missing_names = Vec::new();
+                    for spelling in candidates {
+                        let normalized_spelling = sai_syntax::normalize_identifier(
+                            spelling.strip_prefix("r#").unwrap_or(spelling.as_str()),
+                        );
+                        let covered = initialized.iter().any(|sym| {
+                            symbols.resolve(*sym).is_ok_and(|written| {
+                                sai_syntax::normalize_identifier(
+                                    written.strip_prefix("r#").unwrap_or(written.as_ref()),
+                                ) == normalized_spelling
+                            })
+                        });
+                        if !covered {
+                            missing_names.push(format!("`{spelling}`"));
+                        }
+                    }
+                    for span in unnamed_spans {
+                        if let Ok(diagnostic) = const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            span,
+                            sai_diagnostics::Code::RecordFieldNeedsName,
+                            "record constructor arguments must name a field".to_string(),
+                            "record field needs a name",
+                        ) {
+                            driver_diagnostics.push(diagnostic);
+                        }
+                    }
+                    for span in duplicate_spans {
+                        if let Ok(diagnostic) = const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            span,
+                            sai_diagnostics::Code::DuplicateField,
+                            "field is initialized more than once".to_string(),
+                            "duplicate field",
+                        ) {
+                            driver_diagnostics.push(diagnostic);
+                        }
+                    }
+                    for span in unknown_spans {
+                        if let Ok(diagnostic) = const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            span,
+                            sai_diagnostics::Code::UnknownField,
+                            "unknown record field".to_string(),
+                            "unknown field",
+                        ) {
+                            driver_diagnostics.push(diagnostic);
+                        }
+                    }
+                    if !missing_names.is_empty() {
+                        if let Ok(diagnostic) = const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            expression.span,
+                            sai_diagnostics::Code::MissingField,
+                            format!("missing fields {}", missing_names.join(", ")),
+                            "missing record field",
+                        ) {
+                            driver_diagnostics.push(diagnostic);
+                        }
+                    }
+                    constructor_sites.insert(
+                        expression.hir_id,
+                        sai_ty::typeck::body::RecordConstructorSite {
+                            def,
+                            fields: site_fields,
+                        },
+                    );
+                });
             }
             if !records.is_empty() {
                 visit_block_expressions(body_block, &mut |expression| {
@@ -13865,6 +14088,11 @@ fn check_function_body_primitive_local_block(
             }
         }
     }
+    *inputs.record_constructor_sites.borrow_mut() = if constructor_sites.is_empty() {
+        None
+    } else {
+        Some(constructor_sites.clone())
+    };
     let unknown_self_fields = Some(&merged_unknown_fields);
     let self_field_projections = Some(&merged_fields);
     let str_self_field_projections = Some(&merged_str_fields);
@@ -13976,8 +14204,13 @@ fn check_function_body_primitive_local_block(
     });
     let is_supported_call_tail = tail.is_some_and(|tail| {
         matches!(tail.kind, ExprKind::Call { base: None, .. })
-            && direct_call_signatures
+            && (direct_call_signatures
                 .is_some_and(|signatures| signatures.contains_key(&tail.hir_id))
+                || inputs
+                    .record_constructor_sites
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|sites| sites.contains_key(&tail.hir_id)))
     });
     let is_supported_binary_tail = matches!(tail_kind, Some(ExprKind::Binary(..)));
     let is_supported_literal_tail = matches!(tail_kind, Some(ExprKind::Lit(_)));
@@ -14341,30 +14574,42 @@ fn check_function_body_primitive_local_block(
             },
         ) = (is_supported_call_tail, tail.kind)
         {
-            let Some(signature) =
-                direct_call_signatures.and_then(|signatures| signatures.get(&tail.hir_id))
-            else {
-                return Ok(None);
-            };
-            if !args
-                .iter()
-                .take(signature.parameters.len())
-                .all(|argument| {
-                    is_supported_direct_call_argument_shape(
-                        argument.expr,
-                        &preceding_bindings,
-                        locals,
-                        inputs,
-                        symbols,
-                        type_paths,
-                        self_field_projections,
-                        unknown_self_fields,
-                        direct_call_signatures,
-                        &mut primitive_types,
-                    )
-                })
-            {
-                return Ok(None);
+            // Constructor tails skip the signature mirror like composite
+            // tails skip theirs: the kernel checks every field
+            // initializer against the constructor's shape itself.
+            let constructor_tail = inputs
+                .record_constructor_sites
+                .borrow()
+                .as_ref()
+                .is_some_and(|sites| sites.contains_key(&tail.hir_id));
+            if constructor_tail {
+                // Nothing to mirror — the kernel owns the check.
+            } else {
+                let Some(signature) =
+                    direct_call_signatures.and_then(|signatures| signatures.get(&tail.hir_id))
+                else {
+                    return Ok(None);
+                };
+                if !args
+                    .iter()
+                    .take(signature.parameters.len())
+                    .all(|argument| {
+                        is_supported_direct_call_argument_shape(
+                            argument.expr,
+                            &preceding_bindings,
+                            locals,
+                            inputs,
+                            symbols,
+                            type_paths,
+                            self_field_projections,
+                            unknown_self_fields,
+                            direct_call_signatures,
+                            &mut primitive_types,
+                        )
+                    })
+                {
+                    return Ok(None);
+                }
             }
         }
 
@@ -14454,6 +14699,7 @@ fn check_function_body_primitive_local_block(
             composite_annotations: Some(&composite_annotations),
             nominal_initial_bindings: Some(&nominal_initial_bindings),
             nominal_return_def,
+            record_constructor_sites: Some(&constructor_sites),
             str_bindings: Some(&str_admissions.locals),
             str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
@@ -15702,6 +15948,15 @@ fn primitive_value_expression_shape_is_supported(
             if self_field_projections.is_some_and(|fields| fields.contains_key(&init.hir_id))
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id))
                 || str_self_field_projected_family(init, inputs) == Some("`Str`") => {}
+        // Record construction admits through its site map: the kernel
+        // checks every field initializer itself, so admission only
+        // needs the site — argument shapes stay the kernel's concern.
+        ExprKind::Call { base: None, .. }
+            if inputs
+                .record_constructor_sites
+                .borrow()
+                .as_ref()
+                .is_some_and(|sites| sites.contains_key(&init.hir_id)) => {}
         ExprKind::Call {
             args, base: None, ..
         } if direct_call_signatures
@@ -36390,6 +36645,9 @@ struct CurrentOwnerInputs {
     // for the body currently walking the primitive path — keyed by the
     // reference expression's `HirId`, `None` outside a checked owner.
     const_path_sites: std::cell::RefCell<Option<HashMap<HirId, FunctionDirectType>>>,
+    record_constructor_sites:
+        std::cell::RefCell<Option<HashMap<HirId, sai_ty::typeck::body::RecordConstructorSite>>>,
+    record_type_defs: std::cell::RefCell<Option<HashMap<String, DefId>>>,
 }
 
 fn index_top_level_owner_descriptors(
@@ -43774,6 +44032,8 @@ impl RootDatabase {
             str_self_field_projections: std::cell::RefCell::new(None),
             str_self_method_calls: std::cell::RefCell::new(None),
             const_path_sites: std::cell::RefCell::new(None),
+            record_constructor_sites: std::cell::RefCell::new(None),
+            record_type_defs: std::cell::RefCell::new(None),
         })
     }
 
@@ -45649,6 +45909,41 @@ impl RootDatabase {
                                             }
                                             _ => None,
                                         };
+                                    // Record type definitions visible in
+                                    // this owner's module scope, keyed by
+                                    // normalized single-segment name —
+                                    // construction sites resolve their
+                                    // nominal identity through it.
+                                    *inputs.record_type_defs.borrow_mut() = match &module_scope {
+                                        Ok(module_scope) => Some(
+                                            module_scope
+                                                .scope
+                                                .iter()
+                                                .filter_map(|(sym, binding)| {
+                                                    if let Res::Def(DefKind::Struct, def) =
+                                                        binding.res
+                                                    {
+                                                        self.symbols.resolve(*sym).ok().map(
+                                                            |name| {
+                                                                (
+                                                                    sai_syntax::normalize_identifier(
+                                                                        name.strip_prefix("r#")
+                                                                            .unwrap_or(
+                                                                                name.as_ref(),
+                                                                            ),
+                                                                    ),
+                                                                    def,
+                                                                )
+                                                            },
+                                                        )
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect(),
+                                        ),
+                                        Err(_) => None,
+                                    };
                                     body_type_check = Some(check_function_body_type(
                                         &hir_owner,
                                         body,
@@ -76638,6 +76933,7 @@ property "shared"() {}
                 composite_annotations: None,
                 nominal_initial_bindings: None,
                 nominal_return_def: None,
+                record_constructor_sites: None,
                 str_bindings: None,
                 str_annotations: None,
                 primitive_types: &std::collections::HashMap::new(),
