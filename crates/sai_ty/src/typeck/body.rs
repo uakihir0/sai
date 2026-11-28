@@ -468,6 +468,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         binding_initializer_roots: HashMap::new(),
         binding_nodes,
         annotated_bindings: HashSet::new(),
+        binding_annotation_types: HashMap::new(),
         trusted_bindings,
         expression_type_candidates: RefCell::new(HashMap::new()),
         expression_nodes,
@@ -521,6 +522,9 @@ struct FnCtxt<'a, 'hir> {
     binding_initializer_roots: HashMap<BindingId, HirId>,
     binding_nodes: HashMap<BindingId, HirId>,
     annotated_bindings: HashSet<BindingId>,
+    /// Primitive annotation types per binding — an error-typed annotated
+    /// binding still assigns at its annotation, not the literal default.
+    binding_annotation_types: HashMap<BindingId, PrimTy>,
     trusted_bindings: HashSet<BindingId>,
     expression_type_candidates: RefCell<HashMap<HirId, LocalType>>,
     expression_nodes: HashMap<HirId, Expr<'hir>>,
@@ -1074,6 +1078,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             },
             None => (None, false),
         };
+        if let Some(annotation_type) = annotation {
+            self.binding_annotation_types
+                .insert(binding, annotation_type);
+        }
 
         let errors_before_initializer = self.errors.len();
         let InitializerCheck {
@@ -5103,9 +5111,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             // An error-typed place (a recovered destructured binding, say)
             // already carries its own diagnostic — the right side checks
-            // for its own errors and the assignment itself is accepted.
+            // for its own errors and the assignment itself is accepted. An
+            // annotated binding still assigns at its annotation: `var n:
+            // U64 = self.missing` range-checks later values at `U64`.
             LocalType::Error(_) | LocalType::ErrorLiteralVariable(_) => {
-                self.check_initializer_value(rhs, None)?;
+                let binding = self.plain_local_path_binding(lhs);
+                let annotation = binding
+                    .and_then(|binding| self.binding_annotation_types.get(&binding).copied());
+                self.check_initializer_value(rhs, annotation)?;
                 Ok(())
             }
             // `s = e` on a `Str` place desugars like `let s: Str = e` — the

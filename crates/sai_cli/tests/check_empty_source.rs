@@ -27432,3 +27432,38 @@ fn tuple_destructuring_binds_elements_in_let_statements() {
         }
     }
 }
+
+#[test]
+fn error_tainted_annotated_assignments_check_at_the_annotation() {
+    // A `var` whose initializer carries an error still assigns at its
+    // annotation: `var n: U64 = self.missing` range-checks later values
+    // at `U64`, not the `I64` literal default.
+    let output = run_check(
+        "type S { x: I32 }\nimpl S {\n    pub fn f(self: borrow Self) {\n        var n: U64 = self.missing\n        n = 9223372036854775808\n    }\n}\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""),
+        "2^63 fits the `U64` annotation:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "error-tainted assignment should check, not gate:\n{stdout}"
+    );
+
+    let output = run_check(
+        "type S { x: I32 }\nimpl S {\n    pub fn f(self: borrow Self) {\n        var n: U64 = self.missing\n        n = 18446744073709551616\n    }\n}\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let actual = stdout
+        .lines()
+        .filter(|record| record.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""))
+        .count();
+    assert_eq!(actual, 1, "2^64 exceeds `U64`:\n{stdout}");
+}
