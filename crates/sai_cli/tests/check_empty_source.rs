@@ -27619,6 +27619,55 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn composite_return_if_tails_check_branchwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Composite if tails check each branch against the return shape.
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, I64) {\n    if c { (x, 1) } else { (x, 2) }\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, I64) {\n    if c { (x, 1) } else if x > 0 { (x, 2) } else { (x, 3) }\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, I64) {\n    let t = (x, 1)\n    if c { t } else { (x, 2) }\n}\n",
+            &[],
+        ),
+        // Branch mismatches diagnose per branch.
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, Bool) {\n    if c { (x, 1) } else { (x, true) }\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, Bool) {\n    if c { (x, 1) } else { (x, 2) }\n}\n",
+            &[("TYPE_MISMATCH", 2)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "composite if tails should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn composite_return_path_tails_unify_leafwise() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // A composite binding or projection as the tail unifies with the
