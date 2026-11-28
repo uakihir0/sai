@@ -27607,6 +27607,441 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_str_field_reads_bind_strings() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `n.first` reads a `Str` field off a constructed binding, a
+        // parameter, or a direct construction.
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: \"ada\", age: 30)\n    var s = n.first\n}\n",
+            &[],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var s = Name(first: \"x\", age: 1).first\n}\n",
+            &[],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f(n: Name) {\n    var s = n.first\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record Str field reads should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn record_typed_call_signatures_check_arguments() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `var p = make()` binds a record-returning call; `take(q)`
+        // passes copies and constructions as record arguments.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn make() -> Point {\n    Point(x: 1, y: 2)\n}\npub fn f() -> I32 {\n    var p = make()\n    p.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn take(p: Point) -> I32 {\n    1\n}\npub fn f() {\n    var q = Point(x: 1, y: 2)\n    var r = take(q)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn take(p: Point) -> I32 {\n    1\n}\npub fn f() {\n    var r = take(Point(x: 1, y: 2))\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn make() -> Point {\n    Point(x: 1, y: 2)\n}\npub fn take(p: Point) -> I32 {\n    1\n}\npub fn f() {\n    var r = take(make())\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn take(p: Point) -> I32 {\n    1\n}\npub fn f() {\n    var r = take(Point(x: true, y: 2))\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn take(p: Point, n: I32) -> I32 {\n    n\n}\npub fn f() {\n    var q = Point(x: 1, y: 2)\n    var r = take(q, true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record call signatures should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn nested_record_construction_checks_recursively() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `Outer(inner: Inner(v: 1), w: 2)` — record-typed fields
+        // construct recursively, forward references included.
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var o = Outer(inner: Inner(v: 1), w: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Outer { inner: Inner, w: I32 }\npub type Inner { v: I32 }\npub fn make() -> Outer {\n    Outer(inner: Inner(v: 1), w: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var i = Inner(v: 1)\n    var o = Outer(inner: i, w: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type A { x: I32 }\npub type B { a: A }\npub type C { b: B }\npub fn f() {\n    var c = C(b: B(a: A(x: 1)))\n}\n",
+            &[],
+        ),
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var o = Outer(inner: Inner(v: true), w: 2)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var o = Outer(inner: Inner(), w: 2)\n}\n",
+            &[("MISSING_FIELD", 1)],
+        ),
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var o = Outer(inner: Inner(v: 1))\n}\n",
+            &[("MISSING_FIELD", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "nested construction should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn record_functional_update_checks_leafwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `Point(x: 3, ..p)` fills the remaining fields from the base.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    var q = Point(x: 3, ..p)\n    q.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    var q = Point(..p)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) {\n    var q = Point(y: 9, ..p)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn make() -> Point {\n    var p = Point(x: 1, y: 2)\n    Point(x: 5, ..p)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    var q = Point(x: 3, y: 4, ..p)\n}\n",
+            &[("REDUNDANT_UPDATE_BASE", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    var q = Point(x: true, ..p)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "functional update should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn direct_construction_projections_read_fields() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `Point(x: 1, y: 2).x` projects through the construction.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> I32 {\n    Point(x: 1, y: 2).x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var v = Point(x: 1, y: 2).y\n    v\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> I32 {\n    Point(x: 1, y: 2).z\n}\n",
+            &[("UNKNOWN_FIELD", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "direct construction projections should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn record_construction_checks_str_fields() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Records with `Str` fields construct with string literals;
+        // wrong-type initializers diagnose like a `Str` annotation.
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: \"ada\", age: 30)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn make() -> Name {\n    Name(first: \"ada\", age: 30)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: 3, age: 30)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: \"ada\", age: 300)\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub type Name { first: Str, age: U8 }\npub fn f() {\n    var n = Name(first: \"ada\")\n}\n",
+            &[("MISSING_FIELD", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record construction with Str fields should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn record_field_mutation_checks_leafwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `p.x = 3` on a `var` record binding assigns the primitive
+        // field leaf-wise; immutable bindings and params diagnose
+        // ASSIGN_TO_IMMUTABLE.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    p.x = 3\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> I32 {\n    var p = Point(x: 1, y: 2)\n    p.x = 3\n    p.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    let p = Point(x: 1, y: 2)\n    p.x = 3\n}\n",
+            &[("ASSIGN_TO_IMMUTABLE", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    p.x = true\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Point { x: U8, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    p.x = 300\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record field mutation should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn record_construction_checks_field_initializers() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `var p = Point(x: 1, y: 2)` constructs; field reads,
+        // arithmetic, pass-through returns, copies, expression
+        // initializers, and punning all check.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> I32 {\n    var p = Point(x: 1, y: 2)\n    p.x + p.y\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> Point {\n    var p = Point(x: 1, y: 2)\n    p\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(a: I32) {\n    var p = Point(x: a, y: a + 1)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(x: I32) {\n    var p = Point(x, y: 2)\n}\n",
+            &[],
+        ),
+        // Constructor tails check in return and unit positions.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> Point {\n    Point(x: 1, y: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(a: I32) -> Point {\n    Point(x: a, y: a + 1)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() -> Point {\n    Point(x: 1, y: true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    Point(x: 1, y: 2)\n}\n",
+            &[],
+        ),
+        // Structural errors diagnose per spec 6.18.1.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1)\n}\n",
+            &[("MISSING_FIELD", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2, x: 3)\n}\n",
+            &[("DUPLICATE_FIELD", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, z: 2, y: 3)\n}\n",
+            &[("UNKNOWN_FIELD", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(1, y: 2)\n}\n",
+            &[("RECORD_FIELD_NEEDS_NAME", 1)],
+        ),
+        // Initializer type errors diagnose like any primitive position.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Point { x: U8, y: I32 }\npub fn f() {\n    var p = Point(x: 300, y: 2)\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record construction should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn record_returns_accept_pass_through_tails() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `-> Point { p }` / copies pass through; statements may

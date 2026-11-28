@@ -54,6 +54,12 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// slice one accepts only pass-through tails: a path whose binding
     /// is the same record type. Other tail shapes gate.
     pub nominal_return_def: Option<sai_hir::DefId>,
+    /// Record construction call sites admitted by the owner-aware
+    /// driver, keyed by the call expression — slice one covers records
+    /// whose fields are all primitive. Structural errors (duplicate,
+    /// unknown, missing, or unnamed fields) are diagnosed driver-side;
+    /// the kernel checks the initializer of every named known field.
+    pub record_constructor_sites: Option<&'a HashMap<HirId, RecordConstructorSite>>,
     /// `Str`-typed parameter bindings admitted by the owner-aware driver —
     /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
     pub str_bindings: Option<&'a HashSet<BindingId>>,
@@ -126,6 +132,25 @@ fn intern_composite_shape(
 
 /// A direct function signature projected by the owner-aware driver for one
 /// call site. The call site and callee identities are both checked before use.
+/// A record construction site's shape: the constructed record's
+/// identity and its primitive field types keyed by field name. The
+/// driver keys sites by the call expression's `HirId`.
+#[derive(Clone, Debug)]
+pub struct RecordConstructorSite {
+    pub def: sai_hir::DefId,
+    pub fields: Vec<(sai_hir::Symbol, ConstructorFieldType)>,
+}
+
+/// A record constructor field's type: primitive fields check against
+/// their coercion type, `Str` fields against the string initializer
+/// rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConstructorFieldType {
+    Primitive(PrimTy),
+    Str,
+    Record(sai_hir::DefId),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrimitiveCallSignature {
     pub callee: HirId,
@@ -140,6 +165,7 @@ pub struct PrimitiveCallSignature {
 pub enum PrimitiveCallOutput {
     Primitive(PrimTy),
     Str,
+    Record(sai_hir::DefId),
 }
 
 /// What a direct call's explicit parameter accepts: a primitive literal
@@ -150,6 +176,7 @@ pub enum PrimitiveCallOutput {
 pub enum PrimitiveCallParameter {
     Primitive(PrimTy),
     Str,
+    Record(sai_hir::DefId),
 }
 
 /// The declared type of a const reference the driver resolved: a
@@ -840,6 +867,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let Some(tail) = block.tail else {
             return Err(());
         };
+        // A constructor tail of the same record type checks its field
+        // initializers like any construction site — `-> Point {
+        // Point(x: 1, y: 2) }` is the construction slice's natural
+        // return form.
+        if let ExprKind::Call { args, base, .. } = tail.kind {
+            if let Some(site) = self
+                .input
+                .record_constructor_sites
+                .and_then(|sites| sites.get(&tail.hir_id))
+                .filter(|site| site.def == expected)
+                .cloned()
+            {
+                self.check_record_constructor_call(args, base, &site)?;
+                self.record_expression_type(tail.hir_id, LocalType::Nominal(expected));
+                self.default_unresolved_literals(literal_floor);
+                return Ok(());
+            }
+        }
         let ExprKind::Path(path) = tail.kind else {
             return Err(());
         };
@@ -4584,6 +4629,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             PrimitiveCallParameter::Primitive(expected) => {
                 return self.check_annotated_path(source_type, expected, node);
             }
+            // A record parameter takes a same-record argument — copies,
+            // parameters, and nested constructions all synthesize the
+            // nominal type. Wrong-type arguments stay gated: primitive
+            // diagnostics cannot name the record type.
+            PrimitiveCallParameter::Record(def) => {
+                return match source_type {
+                    LocalType::Nominal(found) if found == def => Ok(()),
+                    LocalType::Error(_) => Ok(()),
+                    _ => Err(()),
+                };
+            }
             PrimitiveCallParameter::Str => {}
         }
         match source_type {
@@ -4635,11 +4691,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         expected: PrimitiveCallParameter,
         literal: Lit<'hir>,
         node: HirId,
-    ) {
+    ) -> Result<(), ()> {
         match expected {
             PrimitiveCallParameter::Primitive(expected) => {
                 let Some(found) = primitive_literal_kind(literal) else {
-                    return;
+                    return Ok(());
                 };
                 self.check_annotated_literal(expected, literal, found, node);
             }
@@ -4656,7 +4712,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     });
                 }
             }
+            // A literal never types as a record — the mismatch gates
+            // like other nominal mismatches.
+            PrimitiveCallParameter::Record(_) => return Err(()),
         }
+        Ok(())
     }
 
     fn check_expr_stmt(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
@@ -5784,7 +5844,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let mut base = lhs;
         loop {
             match base.kind {
-                ExprKind::TupleField { base: inner, .. } | ExprKind::Index(inner, _) => {
+                ExprKind::TupleField { base: inner, .. }
+                | ExprKind::Index(inner, _)
+                | ExprKind::Field { base: inner, .. } => {
                     base = inner;
                 }
                 _ => break,
@@ -5820,7 +5882,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.check_projection_place_mutability(lhs);
                     Ok(Some((leaf,)))
                 }
-                ExprKind::Field { .. } | ExprKind::Unary(UnOp::Deref, _) => Err(()),
+                // A record field place resolves its leaf type through
+                // the same projection map reads use — record parameters
+                // and constructed bindings project primitive fields.
+                ExprKind::Field { .. } => {
+                    let Some(primitive) = self
+                        .input
+                        .self_field_projections
+                        .and_then(|fields| fields.get(&lhs.hir_id))
+                        .copied()
+                    else {
+                        return Err(());
+                    };
+                    self.check_projection_place_mutability(lhs);
+                    Ok(Some((LocalType::Concrete(primitive),)))
+                }
+                ExprKind::Unary(UnOp::Deref, _) => Err(()),
                 _ => {
                     self.errors.push(PrimitiveBodyError {
                         node: lhs.hir_id,
@@ -8645,19 +8722,105 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
+    // A record construction call: every argument naming a known field
+    // checks its initializer against the field's primitive type.
+    // Structural errors — duplicate, unknown, missing, or unnamed
+    // fields — are diagnosed driver-side, so unknown names simply skip
+    // their check here and punning resolves the field from the path.
+    fn check_record_constructor_call(
+        &mut self,
+        args: &[sai_hir::expressions::Arg<'hir>],
+        base: Option<&Expr<'hir>>,
+        site: &RecordConstructorSite,
+    ) -> Result<LocalType, ()> {
+        // A functional-update base must be a same-record value (spec
+        // 6.18.1). This slice covers path bases — copies and
+        // parameters of the record type; other base expressions stay
+        // gated rather than misdiagnosed.
+        if let Some(base_expr) = base {
+            let ExprKind::Path(path) = base_expr.kind else {
+                return Err(());
+            };
+            if path.root != PathRoot::Plain || path.segments.len() != 1 {
+                return Err(());
+            }
+            match self.check_local_path(base_expr)? {
+                LocalType::Nominal(def) if def == site.def => {}
+                _ => return Err(()),
+            }
+        }
+        for argument in args {
+            let field_sym = if let Some(name) = argument.name {
+                Some(name.sym)
+            } else if let ExprKind::Path(path) = argument.expr.kind {
+                if path.root == PathRoot::Plain
+                    && path.segments.len() == 1
+                    && path.segments[0].args.is_none()
+                {
+                    Some(path.segments[0].name.sym)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let Some(field_sym) = field_sym else {
+                continue;
+            };
+            let Some((_, expected)) = site
+                .fields
+                .iter()
+                .find(|(name, _)| *name == field_sym)
+                .map(|(name, ty)| (*name, *ty))
+            else {
+                continue;
+            };
+            match expected {
+                ConstructorFieldType::Primitive(primitive) => {
+                    self.check_expr_expected(argument.expr, primitive)?;
+                }
+                ConstructorFieldType::Str => {
+                    self.check_str_annotated_initializer(argument.expr)?;
+                }
+                // A record-typed field initializes with a nested
+                // construction or a same-record path; the nested call
+                // carries its own constructor site, so the funnel
+                // checks its fields recursively.
+                ConstructorFieldType::Record(def) => {
+                    let found = match argument.expr.kind {
+                        ExprKind::Call { .. } => self.check_direct_call(argument.expr, false)?,
+                        ExprKind::Path(_) => self.check_local_path(argument.expr)?,
+                        _ => return Err(()),
+                    };
+                    if found != LocalType::Nominal(def) {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        Ok(LocalType::Nominal(site.def))
+    }
+
     fn check_direct_call(
         &mut self,
         expression: &Expr<'hir>,
         nested: bool,
     ) -> Result<LocalType, ()> {
-        let ExprKind::Call {
-            callee,
-            args,
-            base: None,
-        } = expression.kind
-        else {
+        let ExprKind::Call { callee, args, base } = expression.kind else {
             return Err(());
         };
+        if let Some(site) = self
+            .input
+            .record_constructor_sites
+            .and_then(|sites| sites.get(&expression.hir_id))
+            .cloned()
+        {
+            return self.check_record_constructor_call(args, base, &site);
+        }
+        // A non-construction call never carries an update base.
+        if base.is_some() {
+            return Err(());
+        }
         let signature = self
             .input
             .call_signatures
@@ -8722,7 +8885,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     {
                         return Err(());
                     }
-                    self.check_call_parameter_literal(expected, literal, argument.expr.hir_id);
+                    self.check_call_parameter_literal(expected, literal, argument.expr.hir_id)?;
                 }
                 ExprKind::Path(_) => {
                     let local_type = self.check_local_path(argument.expr)?;
@@ -8876,6 +9039,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                                     ExprKind::Lit(Lit::Byte(_)) => PrimTy::Byte,
                                     _ => return Err(()),
                                 },
+                                PrimitiveCallParameter::Record(_) => return Err(()),
                             };
                             self.check_direct_call_bitwise_not_literal(operand, expected)?
                         }
@@ -8929,6 +9093,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         PrimitiveCallParameter::Str => {
                             self.check_str_annotated_initializer(argument.expr)?;
                         }
+                        PrimitiveCallParameter::Record(_) => return Err(()),
                     }
                 }
                 // A `{ ...; e }` argument checks its inner statements and
@@ -8951,6 +9116,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         PrimitiveCallParameter::Str => {
                             self.check_str_annotated_initializer(argument.expr)?;
                         }
+                        PrimitiveCallParameter::Record(_) => return Err(()),
                     }
                 }
                 _ => return Err(()),
@@ -8959,6 +9125,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(match signature.output {
             PrimitiveCallOutput::Primitive(output) => LocalType::Concrete(output),
             PrimitiveCallOutput::Str => LocalType::Str,
+            PrimitiveCallOutput::Record(def) => LocalType::Nominal(def),
         })
     }
 

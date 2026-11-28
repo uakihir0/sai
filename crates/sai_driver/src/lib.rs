@@ -7435,6 +7435,7 @@ fn const_reference_literal_type(direct_type: FunctionDirectType) -> Option<Const
         FunctionDirectType::Primitive(primitive) => Some(ConstLiteralType::Primitive(primitive)),
         FunctionDirectType::Str => Some(ConstLiteralType::Str),
         FunctionDirectType::Unit => Some(ConstLiteralType::Unit),
+        FunctionDirectType::Record(_) => None,
     }
 }
 
@@ -9219,6 +9220,7 @@ fn check_function_body_shape_dispatch(
             None => Some(FunctionDirectType::Unit),
         };
         match return_type {
+            Some(FunctionDirectType::Record(_)) => return Ok(FunctionBodyTypeCheck::Unsupported),
             Some(FunctionDirectType::Unit) if block.stmts.is_empty() && block.tail.is_none() => {
                 Vec::new()
             }
@@ -9560,7 +9562,7 @@ fn synthesize_structural_operator_type(
                         ConstLiteralType::Primitive(*primitive)
                     }
                     FunctionDirectType::Str => ConstLiteralType::Str,
-                    FunctionDirectType::Unit => return Ok(None),
+                    FunctionDirectType::Unit | FunctionDirectType::Record(_) => return Ok(None),
                 };
                 Ok(StructuralOperandType::Concrete(direct))
             } else if let ExprKind::Path(path) = expr.kind {
@@ -13639,7 +13641,7 @@ fn check_function_body_primitive_local_block(
                 FunctionDirectType::Str => {
                     merged_str_fields.entry(*hir_id).or_insert("`Str`");
                 }
-                FunctionDirectType::Unit => {}
+                FunctionDirectType::Unit | FunctionDirectType::Record(_) => {}
             }
         }
     }
@@ -13738,12 +13740,22 @@ fn check_function_body_primitive_local_block(
     let mut merged_unknown_fields: HashSet<HirId> =
         unknown_self_fields.cloned().unwrap_or_default();
     let mut driver_diagnostics: Vec<Diagnostic> = Vec::new();
-    if !nominal_binding_record_names.is_empty()
-        && let ExprKind::Block(body_block) = body.value.kind
-    {
+    let mut constructor_sites: HashMap<HirId, sai_ty::typeck::body::RecordConstructorSite> =
+        HashMap::new();
+    let mut constructor_record_names: HashMap<HirId, String> = HashMap::new();
+    // The record scan serves both nominal-parameter projections and
+    // construction sites, so it runs for every block body — the walks
+    // are cheap AST scans and every use stays conditional on what it
+    // collected.
+    if let ExprKind::Block(body_block) = body.value.kind {
         use sai_syntax::ast::AstNode as _;
         if let Some(source_file) = ast::SourceFile::cast(inputs.root.clone()) {
             let mut records: HashMap<String, HashMap<String, sai_resolve::prelude::PrimTy>> =
+                HashMap::new();
+            // Record-typed fields: record key → field name → normalized
+            // field type text. Resolved against `records` at
+            // construction-scan time, so forward references work.
+            let mut record_composite_fields: HashMap<String, HashMap<String, String>> =
                 HashMap::new();
             // (type name span, candidate field spellings in declaration
             // order, every normalized field name, `Str` field names) —
@@ -13764,6 +13776,7 @@ fn check_function_body_primitive_local_block(
                         let mut fields = HashMap::new();
                         let mut all_fields = HashSet::new();
                         let mut str_fields = HashSet::new();
+                        let mut composite_type_texts: HashMap<String, String> = HashMap::new();
                         let mut candidates = Vec::new();
                         for (field_name, type_text, spelling) in &parsed.fields {
                             all_fields.insert(field_name.clone());
@@ -13772,6 +13785,12 @@ fn check_function_body_primitive_local_block(
                                 fields.insert(field_name.clone(), primitive);
                             } else if type_text == "Str" {
                                 str_fields.insert(field_name.clone());
+                            } else {
+                                let normalized_field_type = sai_syntax::normalize_identifier(
+                                    type_text.strip_prefix("r#").unwrap_or(type_text.as_str()),
+                                );
+                                composite_type_texts
+                                    .insert(field_name.clone(), normalized_field_type);
                             }
                         }
                         let key = sai_syntax::normalize_identifier(
@@ -13784,6 +13803,9 @@ fn check_function_body_primitive_local_block(
                             key.clone(),
                             (parsed.type_name_span, candidates, all_fields, str_fields),
                         );
+                        if !composite_type_texts.is_empty() {
+                            record_composite_fields.insert(key.clone(), composite_type_texts);
+                        }
                         records.insert(key, fields);
                     }
                 }
@@ -13807,24 +13829,314 @@ fn check_function_body_primitive_local_block(
                                 }
                             }
                         }
+                        // A constructor initializer seeds the binding with
+                        // the record name too, so `var p = Point(x: 1, y:
+                        // 2)` projects `p.x` like a copy does.
+                        // A call to a record-returning function seeds
+                        // the binding too — `var p = make()` projects
+                        // `p.x` like a constructed record does.
+                        if let ExprKind::Call { .. } = init.kind {
+                            if let Some(sai_ty::typeck::body::PrimitiveCallSignature {
+                                output:
+                                    sai_ty::typeck::body::PrimitiveCallOutput::Record(output_def),
+                                ..
+                            }) = direct_call_signatures
+                                .and_then(|signatures| signatures.get(&init.hir_id))
+                            {
+                                if let Some(record_name) =
+                                    inputs.record_type_defs.borrow().as_ref().and_then(|defs| {
+                                        defs.iter().find_map(|(name, def)| {
+                                            (def == output_def).then(|| name.clone())
+                                        })
+                                    })
+                                {
+                                    nominal_binding_record_names.insert(binding, record_name);
+                                }
+                            }
+                        }
+                        if let ExprKind::Call { callee, .. } = init.kind {
+                            if let ExprKind::Path(callee_path) = callee.kind {
+                                if callee_path.root == PathRoot::Plain
+                                    && callee_path.segments.len() == 1
+                                    && callee_path.segments[0].args.is_none()
+                                {
+                                    if let Ok(callee_name) =
+                                        symbols.resolve(callee_path.segments[0].name.sym)
+                                    {
+                                        let normalized = sai_syntax::normalize_identifier(
+                                            callee_name
+                                                .strip_prefix("r#")
+                                                .unwrap_or(callee_name.as_ref()),
+                                        );
+                                        if records.contains_key(&normalized) {
+                                            nominal_binding_record_names
+                                                .insert(binding, normalized);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+            }
+            // Record construction sites: a call whose callee is a plain
+            // single-segment path naming a scanned record. Structural
+            // errors — duplicate, unknown, missing, or unnamed fields
+            // — diagnose here; the kernel checks each known field's
+            // initializer. Slice one needs every field primitive and
+            // no `..base` — anything else stays outside the site map
+            // and gates.
+            if !records.is_empty() {
+                visit_block_expressions(body_block, &mut |expression| {
+                    let ExprKind::Call { callee, args, base } = expression.kind else {
+                        return;
+                    };
+                    let ExprKind::Path(callee_path) = callee.kind else {
+                        return;
+                    };
+                    if callee_path.root != PathRoot::Plain
+                        || callee_path.segments.len() != 1
+                        || callee_path.segments[0].args.is_some()
+                    {
+                        return;
+                    }
+                    let Ok(callee_name) = symbols.resolve(callee_path.segments[0].name.sym) else {
+                        return;
+                    };
+                    let normalized_type = sai_syntax::normalize_identifier(
+                        callee_name
+                            .strip_prefix("r#")
+                            .unwrap_or(callee_name.as_ref()),
+                    );
+                    let Some(fields) = records.get(&normalized_type) else {
+                        return;
+                    };
+                    let Some((_, candidates, all_fields, str_fields)) =
+                        record_meta.get(&normalized_type)
+                    else {
+                        return;
+                    };
+                    // Non-primitive fields (`Str`, records) gate the
+                    // site: every field must carry a primitive type in
+                    // this slice.
+                    let composite_fields = record_composite_fields.get(&normalized_type);
+                    if !all_fields.iter().all(|field| {
+                        fields.contains_key(field.as_str())
+                            || str_fields.contains(field.as_str())
+                            || composite_fields.is_some_and(|composite| {
+                                composite
+                                    .get(field.as_str())
+                                    .is_some_and(|ty| records.contains_key(ty.as_str()))
+                            })
+                    }) {
+                        return;
+                    }
+
+                    // The constructor's nominal identity comes from the
+                    // resolver: the callee path resolves to the record's
+                    // struct definition.
+                    let Some(def) = inputs
+                        .record_type_defs
+                        .borrow()
+                        .as_ref()
+                        .and_then(|defs| defs.get(&normalized_type).copied())
+                    else {
+                        return;
+                    };
+                    // Structural validation (spec 6.18.1): duplicates,
+                    // unknown names, missing fields, and unnamed
+                    // non-punning arguments diagnose; the site still
+                    // enters the kernel map so initializers check.
+                    let mut seen: HashSet<sai_hir::Symbol> = HashSet::new();
+                    let mut initialized: HashSet<sai_hir::Symbol> = HashSet::new();
+                    let mut duplicate_spans = Vec::new();
+                    let mut unknown_spans = Vec::new();
+                    let mut unnamed_spans = Vec::new();
+                    // Field types keyed by symbol for the kernel.
+                    let mut site_fields: Vec<(
+                        sai_hir::Symbol,
+                        sai_ty::typeck::body::ConstructorFieldType,
+                    )> = Vec::new();
+                    for argument in args {
+                        let (field_sym, field_span) = if let Some(name) = argument.name {
+                            (Some(name.sym), name.span)
+                        } else if let ExprKind::Path(path) = argument.expr.kind {
+                            if path.root == PathRoot::Plain
+                                && path.segments.len() == 1
+                                && path.segments[0].args.is_none()
+                            {
+                                (Some(path.segments[0].name.sym), path.segments[0].name.span)
+                            } else {
+                                (None, argument.expr.span)
+                            }
+                        } else {
+                            (None, argument.expr.span)
+                        };
+                        let Some(field_sym) = field_sym else {
+                            unnamed_spans.push(argument.expr.span);
+                            continue;
+                        };
+                        if !seen.insert(field_sym) {
+                            duplicate_spans.push(field_span);
+                        }
+                        let Ok(spelling) = symbols.resolve(field_sym) else {
+                            continue;
+                        };
+                        let normalized_field = sai_syntax::normalize_identifier(
+                            spelling.strip_prefix("r#").unwrap_or(spelling.as_ref()),
+                        );
+                        let field_type =
+                            if let Some(primitive) = fields.get(normalized_field.as_str()) {
+                                sai_ty::typeck::body::ConstructorFieldType::Primitive(*primitive)
+                            } else if str_fields.contains(normalized_field.as_str()) {
+                                sai_ty::typeck::body::ConstructorFieldType::Str
+                            } else if let Some(field_def) = composite_fields
+                                .and_then(|composite| composite.get(normalized_field.as_str()))
+                                .filter(|ty| records.contains_key(ty.as_str()))
+                                .and_then(|ty| {
+                                    inputs
+                                        .record_type_defs
+                                        .borrow()
+                                        .as_ref()
+                                        .and_then(|defs| defs.get(ty.as_str()).copied())
+                                })
+                            {
+                                sai_ty::typeck::body::ConstructorFieldType::Record(field_def)
+                            } else {
+                                unknown_spans.push(field_span);
+                                continue;
+                            };
+                        initialized.insert(field_sym);
+                        if !site_fields.iter().any(|(sym, _)| *sym == field_sym) {
+                            site_fields.push((field_sym, field_type));
+                        }
+                    }
+                    // `all_fields` is normalized-name keyed; the declared
+                    // order of candidate spellings lines up with the
+                    // record scan's parse order, so missing detection
+                    // compares normalized spellings.
+                    let mut missing_names = Vec::new();
+                    for spelling in candidates {
+                        let normalized_spelling = sai_syntax::normalize_identifier(
+                            spelling.strip_prefix("r#").unwrap_or(spelling.as_str()),
+                        );
+                        let covered = initialized.iter().any(|sym| {
+                            symbols.resolve(*sym).is_ok_and(|written| {
+                                sai_syntax::normalize_identifier(
+                                    written.strip_prefix("r#").unwrap_or(written.as_ref()),
+                                ) == normalized_spelling
+                            })
+                        });
+                        if !covered {
+                            missing_names.push(format!("`{spelling}`"));
+                        }
+                    }
+                    for span in unnamed_spans {
+                        if let Ok(diagnostic) = const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            span,
+                            sai_diagnostics::Code::RecordFieldNeedsName,
+                            "record constructor arguments must name a field".to_string(),
+                            "record field needs a name",
+                        ) {
+                            driver_diagnostics.push(diagnostic);
+                        }
+                    }
+                    for span in duplicate_spans {
+                        if let Ok(diagnostic) = const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            span,
+                            sai_diagnostics::Code::DuplicateField,
+                            "field is initialized more than once".to_string(),
+                            "duplicate field",
+                        ) {
+                            driver_diagnostics.push(diagnostic);
+                        }
+                    }
+                    for span in unknown_spans {
+                        if let Ok(diagnostic) = const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            span,
+                            sai_diagnostics::Code::UnknownField,
+                            "unknown record field".to_string(),
+                            "unknown field",
+                        ) {
+                            driver_diagnostics.push(diagnostic);
+                        }
+                    }
+                    if base.is_some() {
+                        // `..base` fills every field the arguments do
+                        // not name; initializing all of them makes the
+                        // base redundant (spec 6.18.1).
+                        if missing_names.is_empty() {
+                            if let Ok(diagnostic) = const_literal_diagnostic(
+                                owner.id,
+                                inputs,
+                                snapshot,
+                                expression.span,
+                                sai_diagnostics::Code::RedundantUpdateBase,
+                                "all fields are initialized; the update base is redundant"
+                                    .to_string(),
+                                "redundant update base",
+                            ) {
+                                driver_diagnostics.push(diagnostic);
+                            }
+                        }
+                    } else if !missing_names.is_empty() {
+                        if let Ok(diagnostic) = const_literal_diagnostic(
+                            owner.id,
+                            inputs,
+                            snapshot,
+                            expression.span,
+                            sai_diagnostics::Code::MissingField,
+                            format!("missing fields {}", missing_names.join(", ")),
+                            "missing record field",
+                        ) {
+                            driver_diagnostics.push(diagnostic);
+                        }
+                    }
+                    constructor_sites.insert(
+                        expression.hir_id,
+                        sai_ty::typeck::body::RecordConstructorSite {
+                            def,
+                            fields: site_fields,
+                        },
+                    );
+                    constructor_record_names.insert(expression.hir_id, normalized_type.clone());
+                });
             }
             if !records.is_empty() {
                 visit_block_expressions(body_block, &mut |expression| {
                     let ExprKind::Field { base, name, .. } = expression.kind else {
                         return;
                     };
-                    let ExprKind::Path(path) = base.kind else {
+                    let record_name = if let ExprKind::Path(path) = base.kind {
+                        let Some(binding) = resolved_plain_local_path_binding(path, locals, inputs)
+                        else {
+                            return;
+                        };
+                        let Some(record_name) = nominal_binding_record_names.get(&binding) else {
+                            return;
+                        };
+                        record_name.clone()
+                    } else if let ExprKind::Call { .. } = base.kind {
+                        // `Point(x: 1, y: 2).x` — a direct construction
+                        // projection reads through the constructed
+                        // record's fields (spec 6.7.1).
+                        let Some(record_name) = constructor_record_names.get(&base.hir_id) else {
+                            return;
+                        };
+                        record_name.clone()
+                    } else {
                         return;
                     };
-                    let Some(binding) = resolved_plain_local_path_binding(path, locals, inputs)
-                    else {
-                        return;
-                    };
-                    let Some(record_name) = nominal_binding_record_names.get(&binding) else {
-                        return;
-                    };
+                    let record_name = record_name.as_str();
                     let Some(fields) = records.get(record_name) else {
                         return;
                     };
@@ -13865,6 +14177,17 @@ fn check_function_body_primitive_local_block(
             }
         }
     }
+    // Publish the merged `Str` projections so admission — which
+    // consults the inputs side-channel — accepts record `Str` field
+    // reads like method `self` projections.
+    if !merged_str_fields.is_empty() {
+        *inputs.str_self_field_projections.borrow_mut() = Some(merged_str_fields.clone());
+    }
+    *inputs.record_constructor_sites.borrow_mut() = if constructor_sites.is_empty() {
+        None
+    } else {
+        Some(constructor_sites.clone())
+    };
     let unknown_self_fields = Some(&merged_unknown_fields);
     let self_field_projections = Some(&merged_fields);
     let str_self_field_projections = Some(&merged_str_fields);
@@ -13975,9 +14298,15 @@ fn check_function_body_primitive_local_block(
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)))
     });
     let is_supported_call_tail = tail.is_some_and(|tail| {
-        matches!(tail.kind, ExprKind::Call { base: None, .. })
-            && direct_call_signatures
-                .is_some_and(|signatures| signatures.contains_key(&tail.hir_id))
+        let constructor_site = inputs
+            .record_constructor_sites
+            .borrow()
+            .as_ref()
+            .is_some_and(|sites| sites.contains_key(&tail.hir_id));
+        (constructor_site && matches!(tail.kind, ExprKind::Call { .. }))
+            || (matches!(tail.kind, ExprKind::Call { base: None, .. })
+                && direct_call_signatures
+                    .is_some_and(|signatures| signatures.contains_key(&tail.hir_id)))
     });
     let is_supported_binary_tail = matches!(tail_kind, Some(ExprKind::Binary(..)));
     let is_supported_literal_tail = matches!(tail_kind, Some(ExprKind::Lit(_)));
@@ -14341,30 +14670,42 @@ fn check_function_body_primitive_local_block(
             },
         ) = (is_supported_call_tail, tail.kind)
         {
-            let Some(signature) =
-                direct_call_signatures.and_then(|signatures| signatures.get(&tail.hir_id))
-            else {
-                return Ok(None);
-            };
-            if !args
-                .iter()
-                .take(signature.parameters.len())
-                .all(|argument| {
-                    is_supported_direct_call_argument_shape(
-                        argument.expr,
-                        &preceding_bindings,
-                        locals,
-                        inputs,
-                        symbols,
-                        type_paths,
-                        self_field_projections,
-                        unknown_self_fields,
-                        direct_call_signatures,
-                        &mut primitive_types,
-                    )
-                })
-            {
-                return Ok(None);
+            // Constructor tails skip the signature mirror like composite
+            // tails skip theirs: the kernel checks every field
+            // initializer against the constructor's shape itself.
+            let constructor_tail = inputs
+                .record_constructor_sites
+                .borrow()
+                .as_ref()
+                .is_some_and(|sites| sites.contains_key(&tail.hir_id));
+            if constructor_tail {
+                // Nothing to mirror — the kernel owns the check.
+            } else {
+                let Some(signature) =
+                    direct_call_signatures.and_then(|signatures| signatures.get(&tail.hir_id))
+                else {
+                    return Ok(None);
+                };
+                if !args
+                    .iter()
+                    .take(signature.parameters.len())
+                    .all(|argument| {
+                        is_supported_direct_call_argument_shape(
+                            argument.expr,
+                            &preceding_bindings,
+                            locals,
+                            inputs,
+                            symbols,
+                            type_paths,
+                            self_field_projections,
+                            unknown_self_fields,
+                            direct_call_signatures,
+                            &mut primitive_types,
+                        )
+                    })
+                {
+                    return Ok(None);
+                }
             }
         }
 
@@ -14427,8 +14768,8 @@ fn check_function_body_primitive_local_block(
                             sai_ty::typeck::body::ConstPathType::Primitive(*primitive)
                         }
                         FunctionDirectType::Str => sai_ty::typeck::body::ConstPathType::Str,
-                        FunctionDirectType::Unit => {
-                            unreachable!("unit consts are not indexed")
+                        FunctionDirectType::Unit | FunctionDirectType::Record(_) => {
+                            unreachable!("unit and record consts are not indexed")
                         }
                     },
                 )
@@ -14454,6 +14795,7 @@ fn check_function_body_primitive_local_block(
             composite_annotations: Some(&composite_annotations),
             nominal_initial_bindings: Some(&nominal_initial_bindings),
             nominal_return_def,
+            record_constructor_sites: Some(&constructor_sites),
             str_bindings: Some(&str_admissions.locals),
             str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
@@ -14746,6 +15088,17 @@ fn is_supported_direct_call_argument_shape(
                 inputs,
                 self_field_projections,
             )
+        }
+        // A constructor call argument admits through its site — the
+        // kernel checks the record type against the parameter itself.
+        ExprKind::Call { .. }
+            if inputs
+                .record_constructor_sites
+                .borrow()
+                .as_ref()
+                .is_some_and(|sites| sites.contains_key(&expression.hir_id)) =>
+        {
+            true
         }
         ExprKind::Call {
             callee,
@@ -15702,6 +16055,15 @@ fn primitive_value_expression_shape_is_supported(
             if self_field_projections.is_some_and(|fields| fields.contains_key(&init.hir_id))
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id))
                 || str_self_field_projected_family(init, inputs) == Some("`Str`") => {}
+        // Record construction admits through its site map: the kernel
+        // checks every field initializer itself, so admission only
+        // needs the site — argument shapes stay the kernel's concern.
+        ExprKind::Call { .. }
+            if inputs
+                .record_constructor_sites
+                .borrow()
+                .as_ref()
+                .is_some_and(|sites| sites.contains_key(&init.hir_id)) => {}
         ExprKind::Call {
             args, base: None, ..
         } if direct_call_signatures
@@ -16283,12 +16645,14 @@ fn primitive_assign_target_shape_is_supported(
         // misdiagnosed.
         if matches!(
             target.kind,
-            ExprKind::TupleField { .. } | ExprKind::Index(..)
+            ExprKind::TupleField { .. } | ExprKind::Index(..) | ExprKind::Field { .. }
         ) {
             let mut root = target;
             loop {
                 match root.kind {
-                    ExprKind::TupleField { base, .. } | ExprKind::Index(base, _) => root = base,
+                    ExprKind::TupleField { base, .. }
+                    | ExprKind::Index(base, _)
+                    | ExprKind::Field { base, .. } => root = base,
                     _ => break,
                 }
             }
@@ -16298,10 +16662,7 @@ fn primitive_assign_target_shape_is_supported(
                 _ => false,
             };
         }
-        return !matches!(
-            target.kind,
-            ExprKind::Field { .. } | ExprKind::Unary(UnOp::Deref, _)
-        );
+        return !matches!(target.kind, ExprKind::Unary(UnOp::Deref, _));
     };
     let Some(binding) = resolved_plain_local_path_binding(path, locals, inputs) else {
         return false;
@@ -20395,6 +20756,7 @@ enum FunctionDirectType {
     Primitive(sai_resolve::prelude::PrimTy),
     Str,
     Unit,
+    Record(DefId),
 }
 
 #[derive(Clone, Debug)]
@@ -20578,6 +20940,7 @@ fn const_constructor_type_name(ty: &ConstConstructorType) -> String {
         }
         ConstConstructorType::Scalar(FunctionDirectType::Str) => "Str".to_string(),
         ConstConstructorType::Scalar(FunctionDirectType::Unit) => "()".to_string(),
+        ConstConstructorType::Scalar(FunctionDirectType::Record(_)) => "<record>".to_string(),
         ConstConstructorType::Tuple(elements) => {
             let mut display = elements
                 .iter()
@@ -20677,6 +21040,7 @@ fn function_direct_type_name(ty: FunctionDirectType) -> &'static str {
         FunctionDirectType::Primitive(primitive) => const_primitive_name(primitive),
         FunctionDirectType::Str => "Str",
         FunctionDirectType::Unit => "()",
+        FunctionDirectType::Record(_) => "<record>",
     }
 }
 
@@ -21171,6 +21535,9 @@ fn direct_primitive_call_site(
                 }
                 FunctionDirectType::Str => sai_ty::typeck::body::PrimitiveCallOutput::Str,
                 FunctionDirectType::Unit => return None,
+                FunctionDirectType::Record(def) => {
+                    sai_ty::typeck::body::PrimitiveCallOutput::Record(def)
+                }
             };
             Some(sai_ty::typeck::body::PrimitiveCallSignature {
                 callee: callee.hir_id,
@@ -21183,6 +21550,9 @@ fn direct_primitive_call_site(
                         ),
                         FunctionDirectType::Str => {
                             Some(sai_ty::typeck::body::PrimitiveCallParameter::Str)
+                        }
+                        FunctionDirectType::Record(def) => {
+                            Some(sai_ty::typeck::body::PrimitiveCallParameter::Record(*def))
                         }
                         FunctionDirectType::Unit => None,
                     })
@@ -21657,6 +22027,9 @@ fn const_literal_type_from_direct_type(direct_type: FunctionDirectType) -> Const
         FunctionDirectType::Primitive(primitive) => ConstLiteralType::Primitive(primitive),
         FunctionDirectType::Str => ConstLiteralType::Str,
         FunctionDirectType::Unit => ConstLiteralType::Unit,
+        // Const types never carry nominal records — those classify as
+        // `ConstConstructorType::Nominal` before this conversion.
+        FunctionDirectType::Record(_) => unreachable!("records are not const literal types"),
     }
 }
 
@@ -23669,7 +24042,7 @@ fn str_seed_resolve(
         let found_name = match const_type {
             FunctionDirectType::Primitive(found) => const_primitive_name(found),
             FunctionDirectType::Str => "Str",
-            FunctionDirectType::Unit => continue,
+            FunctionDirectType::Unit | FunctionDirectType::Record(_) => continue,
         };
         let matches_type = matches!(
             const_type,
@@ -24737,6 +25110,11 @@ fn str_expr_family(
                         // A `Str` parameter takes `Str`-family arguments
                         // with no primitive expectation to forward.
                         sai_ty::typeck::body::PrimitiveCallParameter::Str => Some(("`Str`", None)),
+                        // Record parameters admit opaquely — the kernel
+                        // checks nominal identity itself.
+                        sai_ty::typeck::body::PrimitiveCallParameter::Record(_) => {
+                            Some(("`Record`", None))
+                        }
                     })
                     .collect::<Option<Vec<_>>>()
                 else {
@@ -24747,6 +25125,7 @@ fn str_expr_family(
                         str_prim_family_name(primitive)
                     }
                     sai_ty::typeck::body::PrimitiveCallOutput::Str => Some("`Str`"),
+                    sai_ty::typeck::body::PrimitiveCallOutput::Record(_) => Some("`Record`"),
                 }) else {
                     return Ok(None);
                 };
@@ -25052,7 +25431,7 @@ fn str_match_arm_pattern(
         let found_name = match const_type {
             FunctionDirectType::Primitive(primitive) => const_primitive_name(primitive),
             FunctionDirectType::Str => "Str",
-            FunctionDirectType::Unit => return Ok(None),
+            FunctionDirectType::Unit | FunctionDirectType::Record(_) => return Ok(None),
         };
         if matches!(
             const_type,
@@ -25095,7 +25474,7 @@ fn str_match_arm_pattern(
             (Some(_), FunctionDirectType::Str) => true,
             (None, FunctionDirectType::Str) => false,
             (None, FunctionDirectType::Primitive(_)) => true,
-            (_, FunctionDirectType::Unit) => return Ok(None),
+            (_, FunctionDirectType::Unit | FunctionDirectType::Record(_)) => return Ok(None),
         };
         if mismatch {
             let expected_name = scrutinee_prim.map(const_primitive_name).unwrap_or("Str");
@@ -29909,6 +30288,9 @@ fn str_pure_init_family(
                                 str_prim_family_name(*primitive)
                             }
                             sai_ty::typeck::body::PrimitiveCallParameter::Str => Some("`Str`"),
+                            sai_ty::typeck::body::PrimitiveCallParameter::Record(_) => {
+                                Some("`Record`")
+                            }
                         })
                         .collect::<Option<Vec<_>>>()?,
                     match signature.output {
@@ -29916,6 +30298,7 @@ fn str_pure_init_family(
                             str_prim_family_name(primitive)?
                         }
                         sai_ty::typeck::body::PrimitiveCallOutput::Str => "`Str`",
+                        sai_ty::typeck::body::PrimitiveCallOutput::Record(_) => "`Record`",
                     },
                 )
             } else if let Some(signature) = str_self_method_call(init, inputs) {
@@ -33067,7 +33450,7 @@ fn local_enum_variant_parameter_primitive(
 
     match resolve_function_direct_type(*signature_parameter.ty, type_paths, symbols, inputs)? {
         FunctionDirectType::Primitive(primitive) => Some(primitive),
-        FunctionDirectType::Str | FunctionDirectType::Unit => None,
+        FunctionDirectType::Str | FunctionDirectType::Unit | FunctionDirectType::Record(_) => None,
     }
 }
 
@@ -33140,7 +33523,7 @@ fn local_enum_variant_annotated_local_type(
     match resolve_function_direct_type(*annotated_type?, type_paths, symbols, inputs)? {
         FunctionDirectType::Primitive(primitive) => Some(ConstLiteralType::Primitive(primitive)),
         FunctionDirectType::Unit => Some(ConstLiteralType::Unit),
-        FunctionDirectType::Str => None,
+        FunctionDirectType::Str | FunctionDirectType::Record(_) => None,
     }
 }
 
@@ -33440,7 +33823,7 @@ fn local_enum_variant_annotated_tuple_local_leaf_mismatch(
         let actual_leaf = match actual_leaf {
             FunctionDirectType::Primitive(primitive) => ConstLiteralType::Primitive(primitive),
             FunctionDirectType::Unit => ConstLiteralType::Unit,
-            FunctionDirectType::Str => continue,
+            FunctionDirectType::Str | FunctionDirectType::Record(_) => continue,
         };
         if !matches!(
             expected_leaf,
@@ -33588,7 +33971,7 @@ fn local_enum_variant_annotated_tuple_pattern_matches(
             let leaf_type = match leaf_type {
                 FunctionDirectType::Primitive(primitive) => ConstLiteralType::Primitive(primitive),
                 FunctionDirectType::Unit => ConstLiteralType::Unit,
-                FunctionDirectType::Str => return None,
+                FunctionDirectType::Str | FunctionDirectType::Record(_) => return None,
             };
             let local_binding = locals.bindings.get(&binding)?;
             let supported_mode = matches!(
@@ -36390,6 +36773,9 @@ struct CurrentOwnerInputs {
     // for the body currently walking the primitive path — keyed by the
     // reference expression's `HirId`, `None` outside a checked owner.
     const_path_sites: std::cell::RefCell<Option<HashMap<HirId, FunctionDirectType>>>,
+    record_constructor_sites:
+        std::cell::RefCell<Option<HashMap<HirId, sai_ty::typeck::body::RecordConstructorSite>>>,
+    record_type_defs: std::cell::RefCell<Option<HashMap<String, DefId>>>,
 }
 
 fn index_top_level_owner_descriptors(
@@ -43774,6 +44160,8 @@ impl RootDatabase {
             str_self_field_projections: std::cell::RefCell::new(None),
             str_self_method_calls: std::cell::RefCell::new(None),
             const_path_sites: std::cell::RefCell::new(None),
+            record_constructor_sites: std::cell::RefCell::new(None),
+            record_type_defs: std::cell::RefCell::new(None),
         })
     }
 
@@ -44283,8 +44671,13 @@ impl RootDatabase {
                         // `s: Str` parameters project `Str` — `take_str(s)`
                         // / `take_str("a")` bind like a `Str` annotation.
                         Some(FunctionDirectType::Str) => Some(FunctionDirectType::Str),
-                        Some(FunctionDirectType::Unit | FunctionDirectType::Primitive(_))
-                        | None => None,
+                        Some(FunctionDirectType::Unit | FunctionDirectType::Primitive(_)) => None,
+                        Some(record @ FunctionDirectType::Record(_)) => Some(record),
+                        // Record-typed parameters carry their nominal
+                        // identity so calls check arguments against the
+                        // same record type.
+                        None => resolve_record_type_def(*parameter.ty, Some(&type_paths))
+                            .map(FunctionDirectType::Record),
                     }
                 })
                 .collect::<Option<Vec<_>>>()
@@ -44308,6 +44701,10 @@ impl RootDatabase {
                 // `-> Str` callees project `PrimitiveCallOutput::Str` —
                 // `let t = make_str()` binds a `Str` local.
                 Some(FunctionDirectType::Str) => FunctionDirectType::Str,
+                None => match resolve_record_type_def(*return_ty, Some(&type_paths)) {
+                    Some(def) => FunctionDirectType::Record(def),
+                    None => continue,
+                },
                 _ => continue,
             };
 
@@ -45649,6 +46046,41 @@ impl RootDatabase {
                                             }
                                             _ => None,
                                         };
+                                    // Record type definitions visible in
+                                    // this owner's module scope, keyed by
+                                    // normalized single-segment name —
+                                    // construction sites resolve their
+                                    // nominal identity through it.
+                                    *inputs.record_type_defs.borrow_mut() = match &module_scope {
+                                        Ok(module_scope) => Some(
+                                            module_scope
+                                                .scope
+                                                .iter()
+                                                .filter_map(|(sym, binding)| {
+                                                    if let Res::Def(DefKind::Struct, def) =
+                                                        binding.res
+                                                    {
+                                                        self.symbols.resolve(*sym).ok().map(
+                                                            |name| {
+                                                                (
+                                                                    sai_syntax::normalize_identifier(
+                                                                        name.strip_prefix("r#")
+                                                                            .unwrap_or(
+                                                                                name.as_ref(),
+                                                                            ),
+                                                                    ),
+                                                                    def,
+                                                                )
+                                                            },
+                                                        )
+                                                    } else {
+                                                        None
+                                                    }
+                                                })
+                                                .collect(),
+                                        ),
+                                        Err(_) => None,
+                                    };
                                     body_type_check = Some(check_function_body_type(
                                         &hir_owner,
                                         body,
@@ -76638,6 +77070,7 @@ property "shared"() {}
                 composite_annotations: None,
                 nominal_initial_bindings: None,
                 nominal_return_def: None,
+                record_constructor_sites: None,
                 str_bindings: None,
                 str_annotations: None,
                 primitive_types: &std::collections::HashMap::new(),

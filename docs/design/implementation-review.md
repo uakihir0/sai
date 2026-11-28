@@ -11651,6 +11651,97 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1245: `Str` field reads on record values
+
+- Slice: the merged `Str` projection map publishes into the inputs
+  side-channel like the method path does, so `n.first` reads a `Str`
+  field off constructed bindings, copies, parameters, and direct
+  construction projections.
+
+## IR-1244: Record-typed call signatures
+
+- Slice: `FunctionDirectType::Record(DefId)` flows through the direct
+  call signature pipeline, so `var p = make()` binds a
+  record-returning call — the copy scan seeds the binding's record
+  name from the signature output — and `take(q)` /
+  `take(Point(x: 1, y: 2))` / `take(make())` check record arguments
+  against the parameter's nominal identity. Primitive parameters in
+  mixed signatures check like before. Bounded: mismatched-record and
+  scalar arguments gate — primitive diagnostics cannot name record
+  types — and unit-output callees stay outside the signature scan
+  (a pre-existing frontier: even `take(5)` on a unit-output fn gates
+  on main).
+
+## IR-1243: Nested record construction
+
+- Slice: record-typed constructor fields — `Outer(inner: Inner(v: 1),
+  w: 2)` checks recursively because the nested call carries its own
+  constructor site; path initializers of the same record type
+  (`inner: i`) work too, and forward type references resolve because
+  the scan collects every record before validating construction.
+  Wrong-type leaves report through the innermost construction.
+  Bounded: a scalar in a record field position (`inner: 5`) still
+  gates — primitive-only diagnostics cannot name the record type.
+
+## IR-1242: Functional update construction
+
+- Slice: `Point(x: 3, ..p)` — the update base fills every field the
+  arguments do not name, so MISSING_FIELD never fires with a base;
+  initializing all fields anyway diagnoses REDUNDANT_UPDATE_BASE.
+  This slice covers path bases (copies and parameters of the same
+  record type); other base expressions stay gated. Named initializers
+  check leaf-wise like plain construction.
+
+## IR-1241: Direct construction projections
+
+- Slice: `Point(x: 1, y: 2).x` projects a primitive or `Str` field
+  directly off the construction call; unknown fields diagnose
+  UNKNOWN_FIELD with the record's candidate spellings. Projection
+  sites merge into the same hir-id keyed maps copies use, so reads,
+  arithmetic, and mutation admission behave uniformly.
+
+## IR-1240: Record construction with `Str` fields
+
+- Slice: constructor field types are primitive-or-`Str`; a `Str`
+  field's initializer checks against the string initializer rules
+  (string literals, `Str`-typed paths and calls), so
+  `Name(first: "ada", age: 30)` constructs while `first: 3` reports
+  TYPE_MISMATCH. Constructor tails cover `Str` fields too.
+
+## IR-1239: Record field mutation
+
+- Slice: `p.x = 3` — a record field place assigns leaf-wise through
+  the same projection map reads use. Mutability is the root binding's:
+  `let` bindings and immutable parameters diagnose
+  `ASSIGN_TO_IMMUTABLE`; wrong-type and out-of-range values diagnose
+  like any primitive assignment.
+
+## IR-1238: Record construction with primitive fields
+
+- Slice: `var p = Point(x: 1, y: 2)` — a call whose callee is a plain
+  single-segment path naming a same-file record whose fields are all
+  primitive checks in the kernel: every initializer unifies with its
+  field type (`TYPE_MISMATCH`, `LITERAL_OUT_OF_RANGE`), and structural
+  errors diagnose driver-side per spec 6.18.1 (`DUPLICATE_FIELD`,
+  `UNKNOWN_FIELD`, `MISSING_FIELD`, `RECORD_FIELD_NEEDS_NAME`).
+  Punning (`Point(x)`) resolves like the const constructor slice.
+- The constructor's nominal identity comes from a module-scope scan
+  the driver side-channels through `CurrentOwnerInputs` (the same
+  pattern `const_path_sites` uses), so `var p = Point(..); p` returns
+  through the IR-1237 pass-through and `p.x` reads through the IR-1234
+  projection machinery — the copy scan treats constructor
+  initializers like path copies.
+- Constructor tails check in return position (`-> Point { Point(x: 1,
+  y: 2) }` — the kernel's nominal return accepts a constructor of the
+  same `DefId` and checks it like any site) and in unit-discard
+  position; a wrong-record constructor tail gates for the
+  type-display slice.
+- Bounded: `Str`/record-typed fields, `..base` functional updates,
+  nested-type construction when the outer record has non-primitive
+  fields, direct construction projections (`Point(..).x`), field
+  mutation, and module-qualified constructor paths gate for their own
+  slices.
+
 ## IR-1237: Record pass-through returns
 
 - Slice: `pub fn f(p: Point) -> Point { p }` — a body whose tail is a
