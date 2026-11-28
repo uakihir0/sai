@@ -13728,12 +13728,15 @@ fn check_function_body_primitive_local_block(
                     // like parameter shapes. Non-composite shapes stay
                     // gated.
                     if let ExprKind::Block(block) = body.value.kind {
-                        // Composite `if` tails have no driver-side
-                        // validator either, so statement-less bodies
-                        // ending in one admit to the kernel too.
-                        let if_tail =
-                            matches!(block.tail.map(|tail| tail.kind), Some(ExprKind::If { .. }));
-                        if block.stmts.is_empty() && !if_tail {
+                        // Composite `if`/`match` tails have no
+                        // driver-side validator either, so
+                        // statement-less bodies ending in one admit to
+                        // the kernel too.
+                        let branch_tail = matches!(
+                            block.tail.map(|tail| tail.kind),
+                            Some(ExprKind::If { .. } | ExprKind::Match { .. })
+                        );
+                        if block.stmts.is_empty() && !branch_tail {
                             return Ok(None);
                         }
                     }
@@ -14124,6 +14127,13 @@ fn check_function_body_primitive_local_block(
         {
             return Ok(None);
         }
+        // Composite `match` tails skip the shape mirror like composite
+        // `if` tails: the mirror's arm-body admission is
+        // primitive-oriented and rejects composite literals, while the
+        // kernel checks every arm body against the composite shape
+        // itself.
+        let skip_match_tail_mirror =
+            composite_return_shape.is_some() && matches!(tail.kind, ExprKind::Match { .. });
         if let (
             true,
             ExprKind::Match {
@@ -14131,8 +14141,10 @@ fn check_function_body_primitive_local_block(
                 arms,
                 source,
             },
-        ) = (is_supported_match_tail, tail.kind)
-        {
+        ) = (
+            is_supported_match_tail && !skip_match_tail_mirror,
+            tail.kind,
+        ) {
             if !primitive_match_tail_shape_is_supported(
                 scrutinee,
                 arms,

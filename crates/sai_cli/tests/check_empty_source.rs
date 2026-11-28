@@ -27619,6 +27619,56 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn composite_return_match_tails_check_armwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Composite match tails check each arm body against the return
+        // shape.
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, I64) {\n    match c { true => (x, 1), false => (x, 2) }\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> (I32, I64) {\n    match x { 1 => (x, 1), _ => (x, 2) }\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, I64) {\n    let t = (x, 1)\n    match c { true => t, _ => (x, 2) }\n}\n",
+            &[],
+        ),
+        // Arm mismatches diagnose per arm; exhaustiveness still applies.
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, Bool) {\n    match c { true => (x, 1), false => (x, true) }\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> (I32, I64) {\n    match x { 1 => (x, 1) }\n}\n",
+            &[("NON_EXHAUSTIVE_MATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "composite match tails should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn composite_return_if_tails_check_branchwise() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // Composite if tails check each branch against the return shape.

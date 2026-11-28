@@ -808,23 +808,47 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         for stmt in block.stmts {
             self.check_stmt(stmt)?;
         }
-        if matches!(tail.kind, ExprKind::Tuple(_) | ExprKind::Array(_)) {
-            self.check_composite_literal_value(tail, expected)?;
-        } else if let ExprKind::If { cond, then, els } = tail.kind {
-            self.check_if_composite_tail(cond, then, els, expected)?;
-        } else {
-            // A non-literal composite tail (`let t = (x, 1)` then `t`, or
-            // a projection yielding a composite) synthesizes first, then
-            // unifies with the return shape leaf-wise. Scalar tails stay
-            // gated for their own slice.
-            let synthesized = self.check_initializer_value(tail, None)?.local_type;
-            if !matches!(synthesized, LocalType::Composite(_) | LocalType::Error(_)) {
-                return Err(());
-            }
-            self.unify_composite_element(synthesized, expected, tail.hir_id)?;
-        }
+        self.check_composite_expr_expected(tail, expected)?;
         self.default_unresolved_literals(literal_floor);
         Ok(())
+    }
+
+    /// One expression checked against a composite shape: tuple and array
+    /// literals check elementwise, `if`/`match` tails check branch- and
+    /// arm-wise, nested blocks recurse, and anything else synthesizes
+    /// first and unifies with the shape leaf-wise. Scalar syntheses stay
+    /// gated for their own slice.
+    fn check_composite_expr_expected(
+        &mut self,
+        expression: &'hir Expr<'hir>,
+        expected: LocalType,
+    ) -> Result<(), ()> {
+        if matches!(expression.kind, ExprKind::Tuple(_) | ExprKind::Array(_)) {
+            return self.check_composite_literal_value(expression, expected);
+        }
+        match expression.kind {
+            ExprKind::If { cond, then, els } => {
+                self.check_if_composite_tail(cond, then, els, expected)
+            }
+            ExprKind::Match {
+                scrutinee,
+                arms,
+                source,
+            } => self
+                .check_match_tail(scrutinee, arms, source, expected)
+                .map(|_| ()),
+            ExprKind::Block(block) => self.check_block_composite_expected(block, expected),
+            _ => {
+                // A non-literal composite expression (a binding path or a
+                // projection yielding a composite) synthesizes first,
+                // then unifies with the shape leaf-wise.
+                let synthesized = self.check_initializer_value(expression, None)?.local_type;
+                if !matches!(synthesized, LocalType::Composite(_) | LocalType::Error(_)) {
+                    return Err(());
+                }
+                self.unify_composite_element(synthesized, expected, expression.hir_id)
+            }
+        }
     }
 
     /// An `if` tail checked against a composite shape branch-wise (spec
@@ -7799,6 +7823,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match expected {
             LocalType::Concrete(expected) => self.check_expr_expected(body, expected),
             LocalType::Str => self.check_str_branch_tail(body),
+            LocalType::Composite(_) => self.check_composite_expr_expected(body, expected),
             _ => Err(()),
         }
     }
