@@ -148,6 +148,7 @@ pub struct RecordConstructorSite {
 pub enum ConstructorFieldType {
     Primitive(PrimTy),
     Str,
+    Record(sai_hir::DefId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -8763,6 +8764,20 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 ConstructorFieldType::Str => {
                     self.check_str_annotated_initializer(argument.expr)?;
+                }
+                // A record-typed field initializes with a nested
+                // construction or a same-record path; the nested call
+                // carries its own constructor site, so the funnel
+                // checks its fields recursively.
+                ConstructorFieldType::Record(def) => {
+                    let found = match argument.expr.kind {
+                        ExprKind::Call { .. } => self.check_direct_call(argument.expr, false)?,
+                        ExprKind::Path(_) => self.check_local_path(argument.expr)?,
+                        _ => return Err(()),
+                    };
+                    if found != LocalType::Nominal(def) {
+                        return Err(());
+                    }
                 }
             }
         }

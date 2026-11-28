@@ -27607,6 +27607,63 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn nested_record_construction_checks_recursively() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `Outer(inner: Inner(v: 1), w: 2)` — record-typed fields
+        // construct recursively, forward references included.
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var o = Outer(inner: Inner(v: 1), w: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Outer { inner: Inner, w: I32 }\npub type Inner { v: I32 }\npub fn make() -> Outer {\n    Outer(inner: Inner(v: 1), w: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var i = Inner(v: 1)\n    var o = Outer(inner: i, w: 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub type A { x: I32 }\npub type B { a: A }\npub type C { b: B }\npub fn f() {\n    var c = C(b: B(a: A(x: 1)))\n}\n",
+            &[],
+        ),
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var o = Outer(inner: Inner(v: true), w: 2)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var o = Outer(inner: Inner(), w: 2)\n}\n",
+            &[("MISSING_FIELD", 1)],
+        ),
+        (
+            "pub type Inner { v: I32 }\npub type Outer { inner: Inner, w: I32 }\npub fn f() {\n    var o = Outer(inner: Inner(v: 1))\n}\n",
+            &[("MISSING_FIELD", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "nested construction should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn record_functional_update_checks_leafwise() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `Point(x: 3, ..p)` fills the remaining fields from the base.

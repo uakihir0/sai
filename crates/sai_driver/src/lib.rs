@@ -13750,6 +13750,11 @@ fn check_function_body_primitive_local_block(
         if let Some(source_file) = ast::SourceFile::cast(inputs.root.clone()) {
             let mut records: HashMap<String, HashMap<String, sai_resolve::prelude::PrimTy>> =
                 HashMap::new();
+            // Record-typed fields: record key → field name → normalized
+            // field type text. Resolved against `records` at
+            // construction-scan time, so forward references work.
+            let mut record_composite_fields: HashMap<String, HashMap<String, String>> =
+                HashMap::new();
             // (type name span, candidate field spellings in declaration
             // order, every normalized field name, `Str` field names) —
             // the metadata unknown-field diagnostics and `Str`
@@ -13769,6 +13774,7 @@ fn check_function_body_primitive_local_block(
                         let mut fields = HashMap::new();
                         let mut all_fields = HashSet::new();
                         let mut str_fields = HashSet::new();
+                        let mut composite_type_texts: HashMap<String, String> = HashMap::new();
                         let mut candidates = Vec::new();
                         for (field_name, type_text, spelling) in &parsed.fields {
                             all_fields.insert(field_name.clone());
@@ -13777,6 +13783,12 @@ fn check_function_body_primitive_local_block(
                                 fields.insert(field_name.clone(), primitive);
                             } else if type_text == "Str" {
                                 str_fields.insert(field_name.clone());
+                            } else {
+                                let normalized_field_type = sai_syntax::normalize_identifier(
+                                    type_text.strip_prefix("r#").unwrap_or(type_text.as_str()),
+                                );
+                                composite_type_texts
+                                    .insert(field_name.clone(), normalized_field_type);
                             }
                         }
                         let key = sai_syntax::normalize_identifier(
@@ -13789,6 +13801,9 @@ fn check_function_body_primitive_local_block(
                             key.clone(),
                             (parsed.type_name_span, candidates, all_fields, str_fields),
                         );
+                        if !composite_type_texts.is_empty() {
+                            record_composite_fields.insert(key.clone(), composite_type_texts);
+                        }
                         records.insert(key, fields);
                     }
                 }
@@ -13880,8 +13895,15 @@ fn check_function_body_primitive_local_block(
                     // Non-primitive fields (`Str`, records) gate the
                     // site: every field must carry a primitive type in
                     // this slice.
+                    let composite_fields = record_composite_fields.get(&normalized_type);
                     if !all_fields.iter().all(|field| {
-                        fields.contains_key(field.as_str()) || str_fields.contains(field.as_str())
+                        fields.contains_key(field.as_str())
+                            || str_fields.contains(field.as_str())
+                            || composite_fields.is_some_and(|composite| {
+                                composite
+                                    .get(field.as_str())
+                                    .is_some_and(|ty| records.contains_key(ty.as_str()))
+                            })
                     }) {
                         return;
                     }
@@ -13944,6 +13966,18 @@ fn check_function_body_primitive_local_block(
                                 sai_ty::typeck::body::ConstructorFieldType::Primitive(*primitive)
                             } else if str_fields.contains(normalized_field.as_str()) {
                                 sai_ty::typeck::body::ConstructorFieldType::Str
+                            } else if let Some(field_def) = composite_fields
+                                .and_then(|composite| composite.get(normalized_field.as_str()))
+                                .filter(|ty| records.contains_key(ty.as_str()))
+                                .and_then(|ty| {
+                                    inputs
+                                        .record_type_defs
+                                        .borrow()
+                                        .as_ref()
+                                        .and_then(|defs| defs.get(ty.as_str()).copied())
+                                })
+                            {
+                                sai_ty::typeck::body::ConstructorFieldType::Record(field_def)
                             } else {
                                 unknown_spans.push(field_span);
                                 continue;

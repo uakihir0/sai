@@ -11651,6 +11651,17 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1243: Nested record construction
+
+- Slice: record-typed constructor fields — `Outer(inner: Inner(v: 1),
+  w: 2)` checks recursively because the nested call carries its own
+  constructor site; path initializers of the same record type
+  (`inner: i`) work too, and forward type references resolve because
+  the scan collects every record before validating construction.
+  Wrong-type leaves report through the innermost construction.
+  Bounded: a scalar in a record field position (`inner: 5`) still
+  gates — primitive-only diagnostics cannot name the record type.
+
 ## IR-1242: Functional update construction
 
 - Slice: `Point(x: 3, ..p)` — the update base fills every field the
