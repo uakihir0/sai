@@ -805,13 +805,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         let Some(tail) = block.tail else {
             return Err(());
         };
-        if !matches!(tail.kind, ExprKind::Tuple(_) | ExprKind::Array(_)) {
-            return Err(());
-        }
         for stmt in block.stmts {
             self.check_stmt(stmt)?;
         }
-        self.check_composite_literal_value(tail, expected)?;
+        if matches!(tail.kind, ExprKind::Tuple(_) | ExprKind::Array(_)) {
+            self.check_composite_literal_value(tail, expected)?;
+        } else {
+            // A non-literal composite tail (`let t = (x, 1)` then `t`, or
+            // a projection yielding a composite) synthesizes first, then
+            // unifies with the return shape leaf-wise. Scalar tails stay
+            // gated for their own slice.
+            let synthesized = self.check_initializer_value(tail, None)?.local_type;
+            if !matches!(synthesized, LocalType::Composite(_) | LocalType::Error(_)) {
+                return Err(());
+            }
+            self.unify_composite_element(synthesized, expected, tail.hir_id)?;
+        }
         self.default_unresolved_literals(literal_floor);
         Ok(())
     }
