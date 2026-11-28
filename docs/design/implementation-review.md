@@ -11651,6 +11651,14 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1241: Direct construction projections
+
+- Slice: `Point(x: 1, y: 2).x` projects a primitive or `Str` field
+  directly off the construction call; unknown fields diagnose
+  UNKNOWN_FIELD with the record's candidate spellings. Projection
+  sites merge into the same hir-id keyed maps copies use, so reads,
+  arithmetic, and mutation admission behave uniformly.
+
 ## IR-1240: Record construction with `Str` fields
 
 - Slice: constructor field types are primitive-or-`Str`; a `Str`

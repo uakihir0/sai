@@ -13740,6 +13740,7 @@ fn check_function_body_primitive_local_block(
     let mut driver_diagnostics: Vec<Diagnostic> = Vec::new();
     let mut constructor_sites: HashMap<HirId, sai_ty::typeck::body::RecordConstructorSite> =
         HashMap::new();
+    let mut constructor_record_names: HashMap<HirId, String> = HashMap::new();
     // The record scan serves both nominal-parameter projections and
     // construction sites, so it runs for every block body — the walks
     // are cheap AST scans and every use stays conditional on what it
@@ -14036,6 +14037,7 @@ fn check_function_body_primitive_local_block(
                             fields: site_fields,
                         },
                     );
+                    constructor_record_names.insert(expression.hir_id, normalized_type.clone());
                 });
             }
             if !records.is_empty() {
@@ -14043,16 +14045,27 @@ fn check_function_body_primitive_local_block(
                     let ExprKind::Field { base, name, .. } = expression.kind else {
                         return;
                     };
-                    let ExprKind::Path(path) = base.kind else {
+                    let record_name = if let ExprKind::Path(path) = base.kind {
+                        let Some(binding) = resolved_plain_local_path_binding(path, locals, inputs)
+                        else {
+                            return;
+                        };
+                        let Some(record_name) = nominal_binding_record_names.get(&binding) else {
+                            return;
+                        };
+                        record_name.clone()
+                    } else if let ExprKind::Call { .. } = base.kind {
+                        // `Point(x: 1, y: 2).x` — a direct construction
+                        // projection reads through the constructed
+                        // record's fields (spec 6.7.1).
+                        let Some(record_name) = constructor_record_names.get(&base.hir_id) else {
+                            return;
+                        };
+                        record_name.clone()
+                    } else {
                         return;
                     };
-                    let Some(binding) = resolved_plain_local_path_binding(path, locals, inputs)
-                    else {
-                        return;
-                    };
-                    let Some(record_name) = nominal_binding_record_names.get(&binding) else {
-                        return;
-                    };
+                    let record_name = record_name.as_str();
                     let Some(fields) = records.get(record_name) else {
                         return;
                     };
