@@ -4389,7 +4389,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // comparison and drives pattern checking with `Bool`.
         if matches!(scrutinee.kind, ExprKind::Binary(..) | ExprKind::Unary(..)) {
             let local_type = self.check_operand_local_type(scrutinee)?;
-            let LocalType::Concrete(scrutinee_type) = local_type else {
+            // A resolved literal variable is concrete for pattern
+            // checking: `match 1 + x` at `x: I32` resolves the addition
+            // to `I32` even though the operand funnel keeps the variable
+            // wrapper on the literal-left arithmetic path.
+            let Some(scrutinee_type) = self.concrete_local_type(local_type) else {
                 return Err(());
             };
             return Ok(scrutinee_type);
