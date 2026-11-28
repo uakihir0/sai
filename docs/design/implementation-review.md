@@ -11651,6 +11651,20 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1222: Composite path elements in composite return tails
+
+- Slice: `pub fn f(x: I32) -> ((I32, I64), Bool) { let pair = (x, 1)\n(pair, true) }` —
+  non-literal elements of composite type inside composite literal tails
+  (paths and projections) synthesize first, then unify with the return
+  shape leaf-wise: literal variables inside the binding resolve against
+  the leaf expectations, concrete leaf mismatches report
+  `TYPE_MISMATCH`, arity/length mismatches report their diagnostics,
+  tuple/array shape crossings report `TYPE_MISMATCH`, and a composite
+  value where the leaf expects a primitive is a certain mismatch.
+- Gate: scalar elements where the shape expects a composite, composite
+  if/match tails, non-literal composite tails (`t` itself as the tail),
+  and composite assignment remain future slices.
+
 ## IR-1221: Composite literal tails in statement-bearing bodies
 
 - Slice: `pub fn f(x: I32) -> (I32, Bool) { let y = x + 1\n(y, true) }` —
@@ -11660,8 +11674,9 @@ recurse. Trait-based indexing, projections of scalar bases
   literals resolve against the leaf expectation (range and type
   mismatches diagnose), nested composites recurse, and arity/length
   mismatches report `TYPE_MISMATCH` while the shared prefix still
-  checks. Statement-less composite tails move from the driver-side
-  validators into the same kernel path.
+  checks. Statement-less composite tails keep the richer
+  driver-side validators — the kernel only takes statement-bearing
+  bodies.
 - Gate: non-literal composite tails (`t`, `t.0` as a returned
   composite), `return` statements with composite values, composite
   if/match tails, and composite assignment remain future slices.
