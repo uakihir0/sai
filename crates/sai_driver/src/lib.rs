@@ -17846,6 +17846,27 @@ fn primitive_if_branch_tail_shape_is_supported(
     match tail.kind {
         ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
             .is_some_and(|binding| preceding_bindings.contains(&binding)),
+        // Tuple and array branch tails admit element-wise — composite
+        // positions (annotated bindings, composite returns) check them
+        // leaf-wise in the kernel, and primitive positions gate there
+        // exactly as before.
+        ExprKind::Tuple(elements) | ExprKind::Array(elements) => {
+            !elements.is_empty()
+                && elements.iter().all(|element| {
+                    primitive_value_expression_shape_is_supported(
+                        element,
+                        preceding_bindings,
+                        locals,
+                        inputs,
+                        symbols,
+                        type_paths,
+                        self_field_projections,
+                        unknown_self_fields,
+                        direct_call_signatures,
+                        primitive_types,
+                    )
+                })
+        }
         ExprKind::Field { .. } => {
             self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id))
