@@ -11651,6 +11651,24 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1231: Composite annotated let bindings
+
+- Slice: `let t: (I32, I64) = (x, 1)` and `let a: Array<I32, 2> = [x, 1]`
+  — composite type annotations on `let` bindings check the initializer
+  against the shape leaf-wise and bind the local to the composite type,
+  so `t.0` projections, assignments, and composite returns flow through
+  the usual machinery.
+- The driver collects the precise shapes in one recursive pass (array
+  lengths need the target configuration the per-statement admission
+  walkers lack); admission itself is syntactic, and shapes the kernel
+  cannot check fall back to the gate.
+- Literal leaves range-check at the annotated type (`(300, 1)` at
+  `(U8, I64)` is `LITERAL_OUT_OF_RANGE`); arity, leaf type, and
+  tuple/array shape mismatches diagnose like composite return tails.
+- `if`/`match` initializers at composite annotations stay gated — the
+  driver-side value admission is primitive-oriented; the kernel already
+  checks them once admitted.
+
 ## IR-1230: Diverging composite return tails
 
 - Slice: `pub fn f(x: I32) -> (I32, I32) { return (x, 1) }` — a `return`

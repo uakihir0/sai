@@ -42,6 +42,10 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// driver — the shape interns into the composite arena at body-check
     /// start, so a composite literal tail checks against it elementwise.
     pub composite_return_shape: Option<&'a CompositeBindingShape>,
+    /// Composite type annotations on `let` statements, keyed by the
+    /// annotation type node — `let t: (I32, I64) = ..` checks the
+    /// initializer against the shape and binds the local to it.
+    pub composite_annotations: Option<&'a HashMap<HirId, CompositeBindingShape>>,
     /// `Str`-typed parameter bindings admitted by the owner-aware driver —
     /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
     pub str_bindings: Option<&'a HashSet<BindingId>>,
@@ -1578,6 +1582,30 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             self.mutable_bindings.insert(binding);
         }
 
+        // A composite annotation (`let t: (I32, I64) = ..`) checks the
+        // initializer against the interned shape leaf-wise and binds the
+        // local to the composite type directly — the scalar inference
+        // bookkeeping below is primitive-oriented and does not apply.
+        if let Some(ty) = ty {
+            if let Some(shape) = self
+                .input
+                .composite_annotations
+                .and_then(|annotations| annotations.get(&ty.hir_id))
+            {
+                if !matches!(shape, CompositeBindingShape::Primitive(_)) {
+                    let local_type = intern_composite_shape(shape, &mut self.composite_types);
+                    self.check_composite_expr_expected(init, local_type)?;
+                    self.record_expression_type(init.hir_id, local_type);
+                    self.binding_type_candidates.insert(binding, local_type);
+                    self.binding_candidate_order.push(binding);
+                    self.annotated_bindings.insert(binding);
+                    self.trusted_bindings.insert(binding);
+                    self.binding_initializer_roots.insert(binding, init.hir_id);
+                    self.known_bindings.insert(binding, local_type);
+                    return Ok(());
+                }
+            }
+        }
         let (annotation, str_annotation) = match ty {
             Some(ty) => match self.input.primitive_types.get(&ty.hir_id).copied() {
                 Some(primitive) => {
