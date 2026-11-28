@@ -38,6 +38,10 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// driver — the shapes intern into the composite arena at body-check
     /// start, so `t.0` projects through the usual composite machinery.
     pub composite_initial_bindings: Option<&'a HashMap<BindingId, CompositeBindingShape>>,
+    /// Composite tuple/array return type admitted by the owner-aware
+    /// driver — the shape interns into the composite arena at body-check
+    /// start, so a composite literal tail checks against it elementwise.
+    pub composite_return_shape: Option<&'a CompositeBindingShape>,
     /// `Str`-typed parameter bindings admitted by the owner-aware driver —
     /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
     pub str_bindings: Option<&'a HashSet<BindingId>>,
@@ -262,6 +266,11 @@ pub enum PrimitiveBodyErrorKind {
     CompositeLiteralAgainstPrimitive {
         expected: PrimTy,
         tuple: bool,
+    },
+    CompositeArityMismatch {
+        tuple: bool,
+        expected: usize,
+        found: usize,
     },
     ConstPatternType {
         found: ScalarType,
@@ -488,6 +497,9 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
             composite_seed_bindings.insert(*binding, local_type);
         }
     }
+    let composite_return_type = input
+        .composite_return_shape
+        .map(|shape| intern_composite_shape(shape, &mut seeded_composite_types));
     let mut known_bindings: HashMap<BindingId, LocalType> = input
         .initial_bindings
         .iter()
@@ -553,6 +565,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
         composite_types: seeded_composite_types,
+        composite_return_type,
         loop_stack: Vec::new(),
         errors: Vec::new(),
     };
@@ -609,6 +622,7 @@ struct FnCtxt<'a, 'hir> {
     pending_operator_trait_count: usize,
     literal_variables: Vec<LiteralVariable<'hir>>,
     composite_types: Vec<CompositeType>,
+    composite_return_type: Option<LocalType>,
     loop_stack: Vec<LoopFrame>,
     errors: Vec<PrimitiveBodyError>,
 }
@@ -759,9 +773,115 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_block(&mut self, block: &Block<'hir>) -> Result<(), ()> {
+        if let Some(composite) = self.composite_return_type {
+            return self.check_block_composite_expected(block, composite);
+        }
         match self.input.return_type {
             Some(return_type) => self.check_block_expected(block, return_type),
             None => self.check_block_unit(block),
+        }
+    }
+
+    /// A body checked against a composite tuple/array return type: the
+    /// statements check normally and the tail must be a composite literal
+    /// whose elements check against the shape elementwise. Non-literal
+    /// composite tails and `return` statements are later slices.
+    fn check_block_composite_expected(
+        &mut self,
+        block: &Block<'hir>,
+        expected: LocalType,
+    ) -> Result<(), ()> {
+        if block.safety != Safety::Safe {
+            return Err(());
+        }
+        let literal_floor = self.literal_variables.len();
+        let Some(tail) = block.tail else {
+            return Err(());
+        };
+        if !matches!(tail.kind, ExprKind::Tuple(_) | ExprKind::Array(_)) {
+            return Err(());
+        }
+        for stmt in block.stmts {
+            self.check_stmt(stmt)?;
+        }
+        self.check_composite_literal_value(tail, expected)?;
+        self.default_unresolved_literals(literal_floor);
+        Ok(())
+    }
+
+    /// A composite literal checked against a composite shape elementwise
+    /// (spec 6.3.1): tuple arity and array length are part of the type, so
+    /// a count mismatch is a type mismatch — the shared prefix still
+    /// checks elementwise and extra elements check in inference positions
+    /// so their own errors surface alongside.
+    fn check_composite_literal_value(
+        &mut self,
+        expression: &'hir Expr<'hir>,
+        expected: LocalType,
+    ) -> Result<(), ()> {
+        let LocalType::Composite(index) = expected else {
+            return Err(());
+        };
+        let Some(composite) = self.composite_types.get(index).cloned() else {
+            return Err(());
+        };
+        match (expression.kind, composite) {
+            (ExprKind::Tuple(elements), CompositeType::Tuple(shape_elements)) => {
+                if elements.len() != shape_elements.len() {
+                    self.errors.push(PrimitiveBodyError {
+                        node: expression.hir_id,
+                        kind: PrimitiveBodyErrorKind::CompositeArityMismatch {
+                            tuple: true,
+                            expected: shape_elements.len(),
+                            found: elements.len(),
+                        },
+                    });
+                }
+                for (element, element_type) in elements.iter().zip(shape_elements.iter()) {
+                    self.check_value_against_local_type(element, *element_type)?;
+                }
+                if elements.len() > shape_elements.len() {
+                    for element in elements[shape_elements.len()..].iter() {
+                        let _ = self.check_initializer_value(element, None);
+                    }
+                }
+                Ok(())
+            }
+            (ExprKind::Array(elements), CompositeType::Array { elem, len }) => {
+                if elements.len() != len {
+                    self.errors.push(PrimitiveBodyError {
+                        node: expression.hir_id,
+                        kind: PrimitiveBodyErrorKind::CompositeArityMismatch {
+                            tuple: false,
+                            expected: len,
+                            found: elements.len(),
+                        },
+                    });
+                }
+                for element in elements.iter() {
+                    self.check_value_against_local_type(element, elem)?;
+                }
+                Ok(())
+            }
+            _ => Err(()),
+        }
+    }
+
+    /// One composite element checked against its shape type: primitive
+    /// leaves check with the primitive expectation (literal resolution
+    /// included) and nested composites recurse.
+    fn check_value_against_local_type(
+        &mut self,
+        expression: &'hir Expr<'hir>,
+        local_type: LocalType,
+    ) -> Result<(), ()> {
+        match local_type {
+            LocalType::Concrete(primitive) => {
+                self.check_expr_value(expression, primitive)?;
+                Ok(())
+            }
+            LocalType::Composite(_) => self.check_composite_literal_value(expression, local_type),
+            _ => Err(()),
         }
     }
 
