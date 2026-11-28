@@ -13815,10 +13815,7 @@ fn check_function_body_primitive_local_block(
                         // A constructor initializer seeds the binding with
                         // the record name too, so `var p = Point(x: 1, y:
                         // 2)` projects `p.x` like a copy does.
-                        if let ExprKind::Call {
-                            callee, base: None, ..
-                        } = init.kind
-                        {
+                        if let ExprKind::Call { callee, .. } = init.kind {
                             if let ExprKind::Path(callee_path) = callee.kind {
                                 if callee_path.root == PathRoot::Plain
                                     && callee_path.segments.len() == 1
@@ -13888,9 +13885,7 @@ fn check_function_body_primitive_local_block(
                     }) {
                         return;
                     }
-                    if base.is_some() {
-                        return;
-                    }
+
                     // The constructor's nominal identity comes from the
                     // resolver: the callee path resolves to the record's
                     // struct definition.
@@ -14017,7 +14012,25 @@ fn check_function_body_primitive_local_block(
                             driver_diagnostics.push(diagnostic);
                         }
                     }
-                    if !missing_names.is_empty() {
+                    if base.is_some() {
+                        // `..base` fills every field the arguments do
+                        // not name; initializing all of them makes the
+                        // base redundant (spec 6.18.1).
+                        if missing_names.is_empty() {
+                            if let Ok(diagnostic) = const_literal_diagnostic(
+                                owner.id,
+                                inputs,
+                                snapshot,
+                                expression.span,
+                                sai_diagnostics::Code::RedundantUpdateBase,
+                                "all fields are initialized; the update base is redundant"
+                                    .to_string(),
+                                "redundant update base",
+                            ) {
+                                driver_diagnostics.push(diagnostic);
+                            }
+                        }
+                    } else if !missing_names.is_empty() {
                         if let Ok(diagnostic) = const_literal_diagnostic(
                             owner.id,
                             inputs,
@@ -14221,14 +14234,15 @@ fn check_function_body_primitive_local_block(
                 || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)))
     });
     let is_supported_call_tail = tail.is_some_and(|tail| {
-        matches!(tail.kind, ExprKind::Call { base: None, .. })
-            && (direct_call_signatures
-                .is_some_and(|signatures| signatures.contains_key(&tail.hir_id))
-                || inputs
-                    .record_constructor_sites
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|sites| sites.contains_key(&tail.hir_id)))
+        let constructor_site = inputs
+            .record_constructor_sites
+            .borrow()
+            .as_ref()
+            .is_some_and(|sites| sites.contains_key(&tail.hir_id));
+        (constructor_site && matches!(tail.kind, ExprKind::Call { .. }))
+            || (matches!(tail.kind, ExprKind::Call { base: None, .. })
+                && direct_call_signatures
+                    .is_some_and(|signatures| signatures.contains_key(&tail.hir_id)))
     });
     let is_supported_binary_tail = matches!(tail_kind, Some(ExprKind::Binary(..)));
     let is_supported_literal_tail = matches!(tail_kind, Some(ExprKind::Lit(_)));
@@ -15969,7 +15983,7 @@ fn primitive_value_expression_shape_is_supported(
         // Record construction admits through its site map: the kernel
         // checks every field initializer itself, so admission only
         // needs the site — argument shapes stay the kernel's concern.
-        ExprKind::Call { base: None, .. }
+        ExprKind::Call { .. }
             if inputs
                 .record_constructor_sites
                 .borrow()

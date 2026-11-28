@@ -868,10 +868,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // initializers like any construction site — `-> Point {
         // Point(x: 1, y: 2) }` is the construction slice's natural
         // return form.
-        if let ExprKind::Call {
-            args, base: None, ..
-        } = tail.kind
-        {
+        if let ExprKind::Call { args, base, .. } = tail.kind {
             if let Some(site) = self
                 .input
                 .record_constructor_sites
@@ -879,7 +876,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .filter(|site| site.def == expected)
                 .cloned()
             {
-                self.check_record_constructor_call(args, &site)?;
+                self.check_record_constructor_call(args, base, &site)?;
                 self.record_expression_type(tail.hir_id, LocalType::Nominal(expected));
                 self.default_unresolved_literals(literal_floor);
                 return Ok(());
@@ -8715,8 +8712,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn check_record_constructor_call(
         &mut self,
         args: &[sai_hir::expressions::Arg<'hir>],
+        base: Option<&Expr<'hir>>,
         site: &RecordConstructorSite,
     ) -> Result<LocalType, ()> {
+        // A functional-update base must be a same-record value (spec
+        // 6.18.1). This slice covers path bases — copies and
+        // parameters of the record type; other base expressions stay
+        // gated rather than misdiagnosed.
+        if let Some(base_expr) = base {
+            let ExprKind::Path(path) = base_expr.kind else {
+                return Err(());
+            };
+            if path.root != PathRoot::Plain || path.segments.len() != 1 {
+                return Err(());
+            }
+            match self.check_local_path(base_expr)? {
+                LocalType::Nominal(def) if def == site.def => {}
+                _ => return Err(()),
+            }
+        }
         for argument in args {
             let field_sym = if let Some(name) = argument.name {
                 Some(name.sym)
@@ -8760,12 +8774,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         expression: &Expr<'hir>,
         nested: bool,
     ) -> Result<LocalType, ()> {
-        let ExprKind::Call {
-            callee,
-            args,
-            base: None,
-        } = expression.kind
-        else {
+        let ExprKind::Call { callee, args, base } = expression.kind else {
             return Err(());
         };
         if let Some(site) = self
@@ -8774,7 +8783,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .and_then(|sites| sites.get(&expression.hir_id))
             .cloned()
         {
-            return self.check_record_constructor_call(args, &site);
+            return self.check_record_constructor_call(args, base, &site);
+        }
+        // A non-construction call never carries an update base.
+        if base.is_some() {
+            return Err(());
         }
         let signature = self
             .input

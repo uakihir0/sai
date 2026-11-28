@@ -27607,6 +27607,58 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_functional_update_checks_leafwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `Point(x: 3, ..p)` fills the remaining fields from the base.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    var q = Point(x: 3, ..p)\n    q.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    var q = Point(..p)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) {\n    var q = Point(y: 9, ..p)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn make() -> Point {\n    var p = Point(x: 1, y: 2)\n    Point(x: 5, ..p)\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    var q = Point(x: 3, y: 4, ..p)\n}\n",
+            &[("REDUNDANT_UPDATE_BASE", 1)],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f() {\n    var p = Point(x: 1, y: 2)\n    var q = Point(x: true, ..p)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "functional update should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn direct_construction_projections_read_fields() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `Point(x: 1, y: 2).x` projects through the construction.

@@ -11651,6 +11651,15 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1242: Functional update construction
+
+- Slice: `Point(x: 3, ..p)` — the update base fills every field the
+  arguments do not name, so MISSING_FIELD never fires with a base;
+  initializing all fields anyway diagnoses REDUNDANT_UPDATE_BASE.
+  This slice covers path bases (copies and parameters of the same
+  record type); other base expressions stay gated. Named initializers
+  check leaf-wise like plain construction.
+
 ## IR-1241: Direct construction projections
 
 - Slice: `Point(x: 1, y: 2).x` projects a primitive or `Str` field
