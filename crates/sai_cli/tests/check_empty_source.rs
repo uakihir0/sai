@@ -27403,6 +27403,21 @@ fn tuple_destructuring_binds_elements_in_let_statements() {
             "pub fn f(x: U8) {\n    var n: U64 = 1\n    n = [x, 300]\n}\n",
             &[("TYPE_MISMATCH", 1), ("LITERAL_OUT_OF_RANGE", 1)],
         ),
+        // Unsupported nested elements do not hide the certain mismatch.
+        (
+            "pub fn f() {\n    var n: U64 = 1\n    n = ([[1], [2]], 3)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        // An out-of-range projection in arithmetic reports its own error
+        // instead of hiding behind the implementation gate.
+        (
+            "pub fn f(t: (I32, Bool)) {\n    let r = t.5 + 1\n}\n",
+            &[("TUPLE_INDEX_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(t: (I32, Bool)) {\n    let r = 1 + t.5\n}\n",
+            &[("TUPLE_INDEX_OUT_OF_RANGE", 1)],
+        ),
         // Assigning to a `var` recovered binding does not cascade past
         // the pattern diagnostic either.
         (

@@ -1784,6 +1784,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.add_integer_literal_constraint(id, right_literal, right.hir_id)?;
                 return Ok(local_type);
             }
+            if let Ok(error_type @ LocalType::Error(_)) = self.check_operand_local_type(right) {
+                return Ok(error_type);
+            }
             let right_type = self
                 .check_operand_local_type(right)
                 .ok()
@@ -1816,6 +1819,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_local_type = self.check_operand_local_type(left).ok().ok_or(())?;
+        // An error left operand already reported its diagnostic (`t.5`
+        // out of range) — the arithmetic propagates it instead of
+        // gating so the error is not hidden behind the implementation
+        // gate. The right operand still checks for recovery.
+        if let LocalType::Error(_) = left_local_type {
+            let _ = self.check_operand_local_type(right);
+            return Ok(left_local_type);
+        }
         let unresolved_literal_variable = matches!(left_local_type, LocalType::LiteralVariable(id)
             if self
                 .literal_variables
@@ -1968,6 +1979,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
 
+        if let Ok(error_type @ LocalType::Error(_)) = self.check_operand_local_type(right) {
+            return Ok(error_type);
+        }
         let right_type = self
             .check_operand_local_type(right)
             .ok()
