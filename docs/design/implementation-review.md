@@ -11651,6 +11651,21 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1221: Composite literal tails in statement-bearing bodies
+
+- Slice: `pub fn f(x: I32) -> (I32, Bool) { let y = x + 1\n(y, true) }` —
+  the driver resolves a composite tuple/array return type into a
+  `CompositeBindingShape` the kernel interns into its arena, so a tuple
+  or array literal tail checks elementwise against the shape: leaf
+  literals resolve against the leaf expectation (range and type
+  mismatches diagnose), nested composites recurse, and arity/length
+  mismatches report `TYPE_MISMATCH` while the shared prefix still
+  checks. Statement-less composite tails move from the driver-side
+  validators into the same kernel path.
+- Gate: non-literal composite tails (`t`, `t.0` as a returned
+  composite), `return` statements with composite values, composite
+  if/match tails, and composite assignment remain future slices.
+
 ## IR-1220: Composite tuple and array parameters
 
 - Slice: `pub fn f(t: (I32, I32)) -> I32 { t.0 }` — tuple and array
@@ -11661,8 +11676,9 @@ recurse. Trait-based indexing, projections of scalar bases
   indices, and tail mismatches diagnose exactly like `let`-built
   composites. Array elements and tuple elements recurse, so nested
   composites like `Array<Array<I32, 2>, 3>` index through both levels.
-- Gate: `Str` elements inside composite parameters, composite return
-  types with statements, and composite assignment remain future slices.
+- Gate: `Str` elements inside composite parameters and composite
+  assignment remain future slices; composite literal return tails
+  landed in IR-1221.
 
 ## IR-1216: Operator expressions serve as match scrutinees
 
