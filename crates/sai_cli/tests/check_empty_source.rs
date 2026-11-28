@@ -27619,6 +27619,56 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn composite_diverging_return_tails_check_against_shape() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // A `return` tail diverges, so the block coerces; the return
+        // value checks against the composite shape.
+        (
+            "pub fn f(x: I32) -> (I32, I32) {\n    return (x, 1)\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> (I32, I32) {\n    let u = (x, 1)\n    return u\n}\n",
+            &[],
+        ),
+        ("pub fn f() -> (I32, I64) {\n    return (1, 2)\n}\n", &[]),
+        (
+            "pub fn f(x: I32) -> (I32, I32) {\n    if x > 0 {\n        return (x, 1)\n    }\n    return (x, 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> (I32, I32) {\n    return (x, true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> (I32, I32) {\n    if x > 0 {\n        return (x, true)\n    }\n    return (x, 2)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "diverging return tails should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn composite_projection_places_assign_leafwise() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // Tuple-field and index places assign through the projection:
