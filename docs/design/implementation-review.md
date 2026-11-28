@@ -11651,6 +11651,18 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1232: Composite if initializers
+
+- Slice: `let t: (I32, I64) = if x > 0 { (x, 1) } else { (x, 2) }` —
+  tuple/array branch tails admit element-wise in the branch-tail walker,
+  so composite `if` initializers reach the kernel, which already checks
+  each branch against the shape leaf-wise.
+- Primitive positions are unaffected: a tuple branch at a scalar
+  expectation still gates in the kernel exactly as before.
+- Unannotated composite `if` initializers (`let u = if .. { (x, 1) }
+  else { .. }`) stay gated — inference-position composite construction
+  through branches is a later slice.
+
 ## IR-1231: Composite annotated let bindings
 
 - Slice: `let t: (I32, I64) = (x, 1)` and `let a: Array<I32, 2> = [x, 1]`
