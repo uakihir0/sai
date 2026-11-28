@@ -5652,13 +5652,50 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     /// gated (`Err`), a non-place target pushes `INVALID_ASSIGN_TARGET` and
     /// returns `Ok(None)`, and an immutable target pushes `ASSIGN_TO_IMMUTABLE`
     /// while still returning the place so the right side is checked too.
-    fn assign_place(&mut self, lhs: &Expr<'hir>) -> Result<Option<(LocalType,)>, ()> {
+    /// Mutability of a projection place (`t.0`, `a[i]`) is the
+    /// mutability of its root local binding — `var t` permits `t.0 = e`,
+    /// an immutable `let t` diagnoses at the assignment.
+    fn check_projection_place_mutability(&mut self, lhs: &Expr<'hir>) {
+        let mut base = lhs;
+        loop {
+            match base.kind {
+                ExprKind::TupleField { base: inner, .. } | ExprKind::Index(inner, _) => {
+                    base = inner;
+                }
+                _ => break,
+            }
+        }
+        let ExprKind::Path(_) = base.kind else {
+            return;
+        };
+        let Some(binding) = self.plain_local_path_binding(base) else {
+            return;
+        };
+        if self.known_bindings.contains_key(&binding) && !self.mutable_bindings.contains(&binding) {
+            self.errors.push(PrimitiveBodyError {
+                node: lhs.hir_id,
+                kind: PrimitiveBodyErrorKind::AssignToImmutable,
+            });
+        }
+    }
+
+    fn assign_place(&mut self, lhs: &'hir Expr<'hir>) -> Result<Option<(LocalType,)>, ()> {
         let ExprKind::Path(_) = lhs.kind else {
             return match lhs.kind {
-                ExprKind::Field { .. }
-                | ExprKind::TupleField { .. }
-                | ExprKind::Index(..)
-                | ExprKind::Unary(UnOp::Deref, _) => Err(()),
+                // Tuple-field and index places resolve the leaf type
+                // through the same projection logic reads use; the
+                // mutability requirement applies to the root binding.
+                ExprKind::TupleField { base, index } => {
+                    let leaf = self.check_tuple_field_projection(base, index, lhs.hir_id)?;
+                    self.check_projection_place_mutability(lhs);
+                    Ok(Some((leaf,)))
+                }
+                ExprKind::Index(base, index) => {
+                    let leaf = self.check_builtin_index(base, index)?;
+                    self.check_projection_place_mutability(lhs);
+                    Ok(Some((leaf,)))
+                }
+                ExprKind::Field { .. } | ExprKind::Unary(UnOp::Deref, _) => Err(()),
                 _ => {
                     self.errors.push(PrimitiveBodyError {
                         node: lhs.hir_id,

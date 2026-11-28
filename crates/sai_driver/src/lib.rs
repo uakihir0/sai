@@ -15784,12 +15784,31 @@ fn primitive_assign_target_shape_is_supported(
     inputs: &CurrentOwnerInputs,
 ) -> bool {
     let ExprKind::Path(path) = target.kind else {
+        // Tuple-field and index places admit when their projection chain
+        // roots in a preceding local binding — the kernel resolves the
+        // leaf type through the composite projections and gates shapes it
+        // cannot check, so a wrongly shaped base stays gated rather than
+        // misdiagnosed.
+        if matches!(
+            target.kind,
+            ExprKind::TupleField { .. } | ExprKind::Index(..)
+        ) {
+            let mut root = target;
+            loop {
+                match root.kind {
+                    ExprKind::TupleField { base, .. } | ExprKind::Index(base, _) => root = base,
+                    _ => break,
+                }
+            }
+            return match root.kind {
+                ExprKind::Path(path) => resolved_plain_local_path_binding(path, locals, inputs)
+                    .is_some_and(|binding| preceding_bindings.contains(&binding)),
+                _ => false,
+            };
+        }
         return !matches!(
             target.kind,
-            ExprKind::Field { .. }
-                | ExprKind::TupleField { .. }
-                | ExprKind::Index(..)
-                | ExprKind::Unary(UnOp::Deref, _)
+            ExprKind::Field { .. } | ExprKind::Unary(UnOp::Deref, _)
         );
     };
     let Some(binding) = resolved_plain_local_path_binding(path, locals, inputs) else {
