@@ -11651,6 +11651,15 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1237: Record pass-through returns
+
+- Slice: `pub fn f(p: Point) -> Point { p }` — a body whose tail is a
+  path to a binding of the same record type checks, including copies
+  (`var q = p; q`) and statement-bearing bodies. The kernel seeds a
+  nominal return expectation and accepts only the same-`DefId`
+  pass-through; constructed, mismatched-record, or scalar tails gate
+  for their own slices.
+
 ## IR-1236: Unknown fields on record parameters
 
 - Slice: `p.z` where the record declares no `z` is `UNKNOWN_FIELD`
