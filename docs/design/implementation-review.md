@@ -11637,3 +11637,19 @@ positions through the shared operand funnel, and chains like `t.1.0`
 recurse. Trait-based indexing, projections of scalar bases
 (`UNKNOWN_FIELD`), tuple indexing and malformed index digits
 (`INVALID_TUPLE_INDEX`) stay gated for their own slices.
+
+## IR-1216: Operator expressions serve as match scrutinees
+
+**Slice.** Match scrutinees admitted only paths, fields and const
+references — `match x > 5 { true => .., false => .. }` and
+`match x + 1 { 1 => .., _ => .. }` gated even though the same operator
+expressions already type-checked as `if` conditions.
+
+**Implementation.** The kernel synthesizes binary and unary scrutinees
+through the shared operand funnel, exactly like `if` conditions (spec
+6.27): the comparison or arithmetic types against its operands and the
+resulting concrete type drives pattern checking, exhaustiveness and arm
+unification (spec 6.12). The walker admits operator scrutinee shapes
+through value admission; anything the funnel cannot type falls back to
+the gate. Literal scrutinees, typed-range patterns and `Str` comparisons
+keep their existing boundaries.

@@ -4372,7 +4372,20 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     // Primitive `match` scrutinees are plain local/const paths, member
     // consts, or record-field leaves whose primitive type the driver
     // projected. Other receiver projections stay outside this slice.
-    fn check_primitive_match_scrutinee(&self, scrutinee: &Expr<'hir>) -> Result<PrimTy, ()> {
+    fn check_primitive_match_scrutinee(
+        &mut self,
+        scrutinee: &'hir Expr<'hir>,
+    ) -> Result<PrimTy, ()> {
+        // Operator expressions synthesize through the operand funnel like
+        // `if` conditions (spec 6.27): `match x > 5 { .. }` types the
+        // comparison and drives pattern checking with `Bool`.
+        if matches!(scrutinee.kind, ExprKind::Binary(..) | ExprKind::Unary(..)) {
+            let local_type = self.check_operand_local_type(scrutinee)?;
+            let LocalType::Concrete(scrutinee_type) = local_type else {
+                return Err(());
+            };
+            return Ok(scrutinee_type);
+        }
         if let ExprKind::Field { .. } = scrutinee.kind
             && let Some(primitive) = self
                 .input
