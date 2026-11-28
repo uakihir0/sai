@@ -46,6 +46,10 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// annotation type node — `let t: (I32, I64) = ..` checks the
     /// initializer against the shape and binds the local to it.
     pub composite_annotations: Option<&'a HashMap<HirId, CompositeBindingShape>>,
+    /// Nominal record-typed parameter bindings admitted by the
+    /// owner-aware driver — slice one seeds them opaque: the value
+    /// cannot be constructed or projected yet, so every use gates.
+    pub nominal_initial_bindings: Option<&'a HashMap<BindingId, sai_hir::DefId>>,
     /// `Str`-typed parameter bindings admitted by the owner-aware driver —
     /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
     pub str_bindings: Option<&'a HashSet<BindingId>>,
@@ -419,6 +423,11 @@ enum LocalType {
     /// A tuple or array type — the index keys the `composite_types` arena
     /// on the context, keeping `LocalType` itself `Copy`.
     Composite(usize),
+    /// A nominal record type — the `DefId` of the type declaration is the
+    /// type identity. Slice one seeds the binding as opaque: the value
+    /// cannot be constructed, projected, or compared yet, so every use
+    /// beyond binding and passing gates.
+    Nominal(sai_hir::DefId),
 }
 
 /// Composite type storage for tuple and array literals in `let`
@@ -524,6 +533,11 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
             known_bindings.insert(*binding, LocalType::Str);
         }
     }
+    if let Some(nominals) = input.nominal_initial_bindings {
+        for (binding, def) in nominals {
+            known_bindings.insert(*binding, LocalType::Nominal(*def));
+        }
+    }
     let binding_type_candidates = known_bindings.clone();
     let trusted_bindings = input
         .initial_bindings
@@ -533,6 +547,13 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         .chain(
             input
                 .composite_initial_bindings
+                .into_iter()
+                .flatten()
+                .map(|(binding, _)| *binding),
+        )
+        .chain(
+            input
+                .nominal_initial_bindings
                 .into_iter()
                 .flatten()
                 .map(|(binding, _)| *binding),
@@ -3780,7 +3801,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                     _ => {
                         let found = match self.check_operand_local_type(right)? {
-                            LocalType::Composite(_) => return Err(()),
+                            LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
                             LocalType::Concrete(found) => ScalarType::Primitive(found),
                             LocalType::Str => ScalarType::Str,
                             LocalType::LiteralVariable(id)
@@ -4269,10 +4290,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     Ok(LocalType::Str)
                 }
                 LocalType::LiteralVariable(_) | LocalType::ErrorLiteralVariable(_) => Err(()),
-                LocalType::Composite(_) => Err(()),
+                LocalType::Composite(_) | LocalType::Nominal(_) => Err(()),
             },
             _ => match self.check_local_path(init)? {
-                LocalType::Composite(_) => return Err(()),
+                LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
                 LocalType::Str => Ok(LocalType::Str),
                 LocalType::Concrete(found) => {
                     self.errors.push(PrimitiveBodyError {
@@ -4333,7 +4354,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Ok(ScalarType::Primitive(expected));
         }
         match self.check_operand_local_type(operand)? {
-            LocalType::Composite(_) => return Err(()),
+            LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
             LocalType::Concrete(found) => Ok(ScalarType::Primitive(found)),
             LocalType::Str => Ok(ScalarType::Str),
             LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
@@ -4375,7 +4396,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                 self.literal_variables.get(id)?.resolved?
             }
-            LocalType::Str | LocalType::Error(_) | LocalType::Composite(_) => return None,
+            LocalType::Str
+            | LocalType::Error(_)
+            | LocalType::Composite(_)
+            | LocalType::Nominal(_) => return None,
         };
         supports_primitive_literal(primitive).then_some(primitive)
     }
@@ -4449,7 +4473,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match source_type {
             // Composite sources and composite annotations are a later
             // slice — the primitive coercion positions stay gated.
-            LocalType::Composite(_) => return Err(()),
+            LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
             LocalType::Concrete(found) if found != expected => {
                 self.errors.push(PrimitiveBodyError {
                     node,
@@ -4519,7 +4543,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         match source_type {
             LocalType::Str | LocalType::Error(_) => {}
-            LocalType::Composite(_) => return Err(()),
+            LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
             LocalType::Concrete(found) => {
                 self.errors.push(PrimitiveBodyError {
                     node,
@@ -4873,7 +4897,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match self.loop_stack[index].break_state {
             LoopBreakState::Unfixed => {
                 self.loop_stack[index].break_state = match local_type {
-                    LocalType::Composite(_) => return Err(()),
+                    LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
                     LocalType::Concrete(found) => LoopBreakState::Concrete(found),
                     LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                         // A break value may carry an already-resolved
@@ -4896,7 +4920,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 kind: PrimitiveBodyErrorKind::InvalidBreakValue,
             }),
             LoopBreakState::Concrete(expected) => match local_type {
-                LocalType::Composite(_) => return Err(()),
+                LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
                 LocalType::Concrete(found) => {
                     if found != expected {
                         self.errors.push(PrimitiveBodyError {
@@ -4950,7 +4974,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             // error type stays inert, and anything else reports the
             // `Str` mismatch.
             LoopBreakState::Str => match local_type {
-                LocalType::Composite(_) => return Err(()),
+                LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
                 LocalType::Str | LocalType::Error(_) => {}
                 LocalType::Concrete(found) => {
                     self.errors.push(PrimitiveBodyError {
@@ -5654,7 +5678,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         match local_type {
             // Composite tails against primitive expectations are a later
             // slice — composite return types need their own rendering.
-            LocalType::Composite(_) => return Err(()),
+            LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
             LocalType::Error(found) => {
                 if let Some(found) = found {
                     self.check_concrete_tail_type(found, expected, expression.hir_id);
@@ -6502,7 +6526,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     return Ok(());
                 }
                 match self.check_local_path(expression)? {
-                    LocalType::Composite(_) => return Err(()),
+                    LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
                     LocalType::Str => Ok(()),
                     LocalType::Concrete(found) => {
                         self.errors.push(PrimitiveBodyError {
@@ -6614,7 +6638,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             },
         };
         match local_type {
-            LocalType::Composite(_) => return Err(()),
+            LocalType::Composite(_) | LocalType::Nominal(_) => return Err(()),
             LocalType::Concrete(found) => self.errors.push(PrimitiveBodyError {
                 node: expression.hir_id,
                 kind: PrimitiveBodyErrorKind::ScalarTypeMismatch {
@@ -9383,7 +9407,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             | LocalType::Str
             | LocalType::Error(_)
             | LocalType::ErrorLiteralVariable(_)
-            | LocalType::Composite(_) => None,
+            | LocalType::Composite(_)
+            | LocalType::Nominal(_) => None,
         }
     }
 

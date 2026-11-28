@@ -11651,6 +11651,18 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1233: Record parameters as opaque nominal bindings
+
+- Slice: `pub fn f(p: Point) -> I32 { 1 }` — record-typed parameters
+  admit into function bodies. The kernel gains `LocalType::Nominal`
+  keyed by the type declaration's `DefId`; slice one treats the value
+  as opaque, so construction, projection, comparison, and every other
+  use gate exactly as before — only binding and passing through the
+  parameter admit.
+- The driver resolves the parameter type path to `Res::Def(DefKind::Struct)`
+  and seeds the nominal binding map like composite parameters; scalar
+  bodies mixed with unused record parameters check unchanged.
+
 ## IR-1232: Composite if initializers
 
 - Slice: `let t: (I32, I64) = if x > 0 { (x, 1) } else { (x, 2) }` —

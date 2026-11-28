@@ -27619,6 +27619,47 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_parameters_seed_opaque_bindings() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Record parameters admit — slice one treats the value as
+        // opaque, so unused parameters and scalar bodies check.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> I32 {\n    1\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) {\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point, x: I32) -> I32 {\n    x + 1\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record parameters should admit, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn composite_if_initializers_check_branchwise() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `let t: (I32, I64) = if .. { (x, 1) } else { (x, 2) }` —
