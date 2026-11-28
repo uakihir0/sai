@@ -225,6 +225,14 @@ pub enum PrimitiveBodyErrorKind {
         expected: ScalarType,
         found: ScalarLiteralKind,
     },
+    /// `expected <literal>, found <type>` — the mirror of
+    /// `ScalarLiteralTypeMismatch` for positions where the literal
+    /// variable is the established type and the concrete scalar is the
+    /// newcomer (`[1, true]` blames `true`).
+    LiteralScalarTypeMismatch {
+        expected: ScalarLiteralKind,
+        found: ScalarType,
+    },
     OperatorNotSupported {
         operator: BinOp,
         operand: PrimitiveOperatorOperand,
@@ -6142,6 +6150,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             LocalType::Str => Some(ScalarType::Str),
             _ => None,
         };
+        // The direct comparison below resolves or reports the literal
+        // group it touches; the pending drain must not re-resolve (and
+        // re-report) that same group when the anchor arrives.
+        let mut handled_group_root: Option<usize> = None;
         let result = match (join, element_type) {
             (LocalType::Concrete(left), LocalType::Concrete(right)) => {
                 if left == right {
@@ -6181,8 +6193,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
                 Ok(LocalType::Concrete(expected))
             }
-            (LocalType::Str, LocalType::LiteralVariable(id))
-            | (LocalType::LiteralVariable(id), LocalType::Str) => {
+            (LocalType::Str, LocalType::LiteralVariable(id)) => {
+                handled_group_root = Some(self.literal_variable_group_root(id));
                 let kind = self
                     .literal_variables
                     .get(id)
@@ -6197,8 +6209,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
                 Ok(LocalType::Str)
             }
-            (LocalType::Concrete(expected), LocalType::LiteralVariable(id))
-            | (LocalType::LiteralVariable(id), LocalType::Concrete(expected)) => {
+            (LocalType::LiteralVariable(id), LocalType::Str) => {
+                handled_group_root = Some(self.literal_variable_group_root(id));
+                let kind = self
+                    .literal_variables
+                    .get(id)
+                    .map(|variable| variable.kind)
+                    .unwrap_or(PrimitiveLiteralKind::Integer);
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::LiteralScalarTypeMismatch {
+                        expected: ScalarLiteralKind::Primitive(kind),
+                        found: ScalarType::Str,
+                    },
+                });
+                Ok(LocalType::Str)
+            }
+            (LocalType::Concrete(expected), LocalType::LiteralVariable(id)) => {
+                handled_group_root = Some(self.literal_variable_group_root(id));
                 if self.resolve_literal_variable(id, expected).is_ok() {
                     Ok(LocalType::Concrete(expected))
                 } else {
@@ -6215,6 +6243,26 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         },
                     });
                     Ok(LocalType::Concrete(expected))
+                }
+            }
+            (LocalType::LiteralVariable(id), LocalType::Concrete(concrete)) => {
+                handled_group_root = Some(self.literal_variable_group_root(id));
+                if self.resolve_literal_variable(id, concrete).is_ok() {
+                    Ok(LocalType::Concrete(concrete))
+                } else {
+                    let kind = self
+                        .literal_variables
+                        .get(id)
+                        .map(|variable| variable.kind)
+                        .unwrap_or(PrimitiveLiteralKind::Integer);
+                    self.errors.push(PrimitiveBodyError {
+                        node,
+                        kind: PrimitiveBodyErrorKind::LiteralScalarTypeMismatch {
+                            expected: ScalarLiteralKind::Primitive(kind),
+                            found: ScalarType::Primitive(concrete),
+                        },
+                    });
+                    Ok(LocalType::Concrete(concrete))
                 }
             }
             (LocalType::LiteralVariable(left), LocalType::LiteralVariable(right)) => {
@@ -6322,6 +6370,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             if let Some(anchor) = anchor {
                 let pending = std::mem::take(pending_literals);
                 for (id, literal_node) in pending {
+                    // Merged group members share one resolution: the
+                    // direct comparison already resolved or reported the
+                    // group it touched, so re-resolving it here would
+                    // report the same mismatch twice (`[1, true]`).
+                    if handled_group_root
+                        .is_some_and(|root| self.literal_variable_group_root(id) == root)
+                    {
+                        continue;
+                    }
                     self.resolve_pending_array_literal(id, literal_node, anchor)?;
                 }
             }
