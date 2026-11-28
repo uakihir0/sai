@@ -50,6 +50,10 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// owner-aware driver — slice one seeds them opaque: the value
     /// cannot be constructed or projected yet, so every use gates.
     pub nominal_initial_bindings: Option<&'a HashMap<BindingId, sai_hir::DefId>>,
+    /// Nominal record return type admitted by the owner-aware driver —
+    /// slice one accepts only pass-through tails: a path whose binding
+    /// is the same record type. Other tail shapes gate.
+    pub nominal_return_def: Option<sai_hir::DefId>,
     /// `Str`-typed parameter bindings admitted by the owner-aware driver —
     /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
     pub str_bindings: Option<&'a HashSet<BindingId>>,
@@ -805,12 +809,53 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_block(&mut self, block: &Block<'hir>) -> Result<(), ()> {
+        if let Some(nominal_def) = self.input.nominal_return_def {
+            return self.check_block_nominal_expected(block, nominal_def);
+        }
         if let Some(composite) = self.composite_return_type {
             return self.check_block_composite_expected(block, composite);
         }
         match self.input.return_type {
             Some(return_type) => self.check_block_expected(block, return_type),
             None => self.check_block_unit(block),
+        }
+    }
+
+    /// A body checked against a nominal record return type: the
+    /// statements check normally and the tail must be a pass-through —
+    /// a path whose binding is the same record type. Constructed or
+    /// mismatched tails gate for their own slices.
+    fn check_block_nominal_expected(
+        &mut self,
+        block: &Block<'hir>,
+        expected: sai_hir::DefId,
+    ) -> Result<(), ()> {
+        if block.safety != Safety::Safe {
+            return Err(());
+        }
+        let literal_floor = self.literal_variables.len();
+        for stmt in block.stmts {
+            self.check_stmt(stmt)?;
+        }
+        let Some(tail) = block.tail else {
+            return Err(());
+        };
+        let ExprKind::Path(path) = tail.kind else {
+            return Err(());
+        };
+        if path.root != PathRoot::Plain || path.segments.len() != 1 {
+            return Err(());
+        }
+        let Some(binding) = self.input.local_paths.get(&path.hir_id).copied() else {
+            return Err(());
+        };
+        match self.known_bindings.get(&binding) {
+            Some(LocalType::Nominal(def)) if *def == expected => {
+                self.record_expression_type(tail.hir_id, LocalType::Nominal(expected));
+                self.default_unresolved_literals(literal_floor);
+                Ok(())
+            }
+            _ => Err(()),
         }
     }
 

@@ -13873,11 +13873,19 @@ fn check_function_body_primitive_local_block(
     // expectation, any type accepted (spec 6.11.1/6.25.2) — so the
     // kernel input carries no primitive expectation for them.
     let mut composite_return_shape = None;
+    let mut nominal_return_def = None;
     let return_type = match sig.ret {
         Some(return_ty) => {
             match resolve_function_direct_type(*return_ty, type_paths, symbols, inputs) {
                 Some(FunctionDirectType::Primitive(primitive)) => Some(primitive),
                 Some(FunctionDirectType::Unit) => None,
+                _ if resolve_record_type_def(*return_ty, type_paths).is_some() => {
+                    // A record return type admits pass-through tails —
+                    // the kernel accepts a path whose binding is the
+                    // same record type; other tail shapes gate.
+                    nominal_return_def = resolve_record_type_def(*return_ty, type_paths);
+                    None
+                }
                 _ => {
                     // Statement-less composite tails stay with the
                     // driver-side validators — their type-display
@@ -14445,6 +14453,7 @@ fn check_function_body_primitive_local_block(
             composite_return_shape: composite_return_shape.as_ref(),
             composite_annotations: Some(&composite_annotations),
             nominal_initial_bindings: Some(&nominal_initial_bindings),
+            nominal_return_def,
             str_bindings: Some(&str_admissions.locals),
             str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
@@ -76628,6 +76637,7 @@ property "shared"() {}
                 composite_return_shape: None,
                 composite_annotations: None,
                 nominal_initial_bindings: None,
+                nominal_return_def: None,
                 str_bindings: None,
                 str_annotations: None,
                 primitive_types: &std::collections::HashMap::new(),

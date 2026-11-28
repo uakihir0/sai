@@ -5353,18 +5353,6 @@ fn unsupported_inherent_method_shapes_remain_gated() {
             ),
         ),
         (
-            "non-primitive signature",
-            concat!(
-                "type Counter { marker: I32 }\n",
-                "impl Counter {\n",
-                "    pub fn identity(self: borrow Self, value: Counter) -> Counter {\n",
-                "        let result = value\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
-        ),
-        (
             "unresolved nominal field type",
             concat!(
                 "type Counter { marker: Missing }\n",
@@ -27601,6 +27589,47 @@ fn composite_return_literal_tails_check_elementwise() {
         assert!(
             !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
             "composite return tails should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
+fn record_returns_accept_pass_through_tails() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `-> Point { p }` / copies pass through; statements may
+        // precede the tail.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> Point {\n    p\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> Point {\n    var q = p\n    q\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> Point {\n    var u = p.x\n    p\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record pass-through returns should check, not gate:\n{stdout}"
         );
         let expected_exit = if code_counts.is_empty() {
             Some(0)
