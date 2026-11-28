@@ -11651,6 +11651,19 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1235: Record copies project fields through the copy
+
+- Slice: `var q = p` / `let q = p` where `p` is a record-typed
+  parameter (or another copy) seeds the new binding with the source
+  record name, so field reads project through the copy — including
+  chains (`var r = q` after `var q = p`). Mistyped uses diagnose
+  `TYPE_MISMATCH` like direct parameter reads.
+- The driver scans the body block's statements in order before the
+  field-projection walk; statement order resolves copy chains.
+- Bounded: copies inside nested blocks, record returns/comparisons of
+  copies, and copies of non-parameter nominals gate for their own
+  slices.
+
 ## IR-1234: Record field reads on parameters
 
 - Slice: `pub fn f(p: Point) -> I32 { p.x }` — a field access whose base

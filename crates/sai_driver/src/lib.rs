@@ -13763,6 +13763,28 @@ fn check_function_body_primitive_local_block(
                     }
                 }
             }
+            // Copies seed their binding with the source record name, so
+            // `var q = p` keeps field reads projecting through `q`.
+            // Statement-order scanning resolves copy chains (`var r =
+            // q` after `var q = p`); nested blocks gate for their own
+            // slice.
+            for stmt in body_block.stmts {
+                if let StmtKind::Let { pat, init, .. } = stmt.kind {
+                    if let PatKind::Binding { binding, .. } = pat.kind {
+                        if let ExprKind::Path(path) = init.kind {
+                            if let Some(source) =
+                                resolved_plain_local_path_binding(path, locals, inputs)
+                            {
+                                if let Some(record_name) =
+                                    nominal_binding_record_names.get(&source).cloned()
+                                {
+                                    nominal_binding_record_names.insert(binding, record_name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if !records.is_empty() {
                 visit_block_expressions(body_block, &mut |expression| {
                     let ExprKind::Field { base, name, .. } = expression.kind else {

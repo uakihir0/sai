@@ -27619,6 +27619,51 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_copies_project_fields_through_the_copy() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `var q = p` seeds the copy with the source record name, so
+        // field reads project through `q` — including copy chains.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> I32 {\n    var q = p\n    q.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> I32 {\n    let q = p\n    q.x + q.y\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> I32 {\n    var q = p\n    var r = q\n    r.y\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: U8, y: I32 }\npub fn f(p: Point) -> I32 {\n    var q = p\n    q.x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record copies should project fields, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn record_field_reads_project_primitive_fields() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `p.x` on a record parameter reads the primitive field type —
