@@ -877,7 +877,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     ) -> Result<(), ()> {
         match local_type {
             LocalType::Concrete(primitive) => {
-                self.check_expr_value(expression, primitive)?;
+                // The synthesized element type still unifies with the
+                // leaf expectation: bare literals come back as inference
+                // variables that must resolve against it (range checks
+                // included), and concrete mismatches report here.
+                let synthesized = self.check_expr_value(expression, primitive)?;
+                self.check_annotated_path(synthesized, primitive, expression.hir_id)?;
                 Ok(())
             }
             LocalType::Composite(_) => self.check_composite_literal_value(expression, local_type),
