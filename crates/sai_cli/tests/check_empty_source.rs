@@ -27398,6 +27398,11 @@ fn tuple_destructuring_binds_elements_in_let_statements() {
             "pub fn f() {\n    var n: U64 = 1\n    n = (1, 2)\n}\n",
             &[("TYPE_MISMATCH", 1)],
         ),
+        // Element errors surface alongside the certain mismatch.
+        (
+            "pub fn f(x: U8) {\n    var n: U64 = 1\n    n = [x, 300]\n}\n",
+            &[("TYPE_MISMATCH", 1), ("LITERAL_OUT_OF_RANGE", 1)],
+        ),
         // Assigning to a `var` recovered binding does not cascade past
         // the pattern diagnostic either.
         (
