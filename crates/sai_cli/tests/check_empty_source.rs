@@ -27307,3 +27307,54 @@ fn literal_left_operator_scrutinees_resolve_through_concrete_operands() {
         }
     }
 }
+
+#[test]
+fn tuple_destructuring_binds_elements_in_let_statements() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, b) = (x, 1)\n    a + b\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, (b, c)) = (x, (1, 2))\n    a + b + c\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (var a, _) = (x, 1)\n    a = a + 1\n    a\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, b, c) = (x, 1)\n    a\n}\n",
+            &[("PATTERN_ARITY_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, (b, c, d)) = (x, (1, 2))\n    a\n}\n",
+            &[("PATTERN_ARITY_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> I32 {\n    let (a, _) = (x, 1)\n    a = 2\n    a\n}\n",
+            &[("ASSIGN_TO_IMMUTABLE", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "tuple destructuring should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}

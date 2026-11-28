@@ -11638,6 +11638,19 @@ recurse. Trait-based indexing, projections of scalar bases
 (`UNKNOWN_FIELD`), tuple indexing and malformed index digits
 (`INVALID_TUPLE_INDEX`) stay gated for their own slices.
 
+## IR-1219: Tuple destructuring in let statements
+
+- Slice: `let (a, b) = (x, 1)` destructures tuple literals and composite
+  bindings in the primitive kernel, binding the elements with their
+  projected types; nested tuple patterns, wildcards, and `var` bindings
+  are supported (spec 6.21.2). Arity mismatches are diagnosed as
+  `PATTERN_ARITY_MISMATCH` with the pattern span; the checker recovers by
+  binding the shared prefix and error-typing the missing elements so
+  their uses do not cascade. Immutable destructured bindings diagnose
+  `ASSIGN_TO_IMMUTABLE` on assignment while `var` bindings accept it.
+- Gate: annotated destructuring, non-tuple subpatterns, and refutable
+  subpatterns remain future slices.
+
 ## IR-1216: Operator expressions serve as match scrutinees
 
 **Slice.** Match scrutinees admitted only paths, fields and const

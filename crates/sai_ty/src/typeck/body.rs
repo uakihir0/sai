@@ -207,6 +207,12 @@ pub enum PrimitiveBodyErrorKind {
     },
     /// `t.N` with `N` not less than the tuple's arity (spec 6.6.2).
     TupleIndexOutOfRange,
+    /// A tuple pattern whose element count differs from the tuple type's
+    /// arity (spec 6.21.2): `expected` is the type's arity.
+    PatternArityMismatch {
+        expected: usize,
+        found: usize,
+    },
     ConstPatternType {
         found: ScalarType,
     },
@@ -1020,6 +1026,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         };
 
+        if let PatKind::Tuple(patterns) = pat.kind {
+            return self.check_tuple_let(pat, patterns, ty.is_some(), init);
+        }
         let PatKind::Binding {
             mode: mode @ (BindingMode::Value | BindingMode::Var),
             binding,
@@ -1455,6 +1464,124 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
         self.known_bindings.insert(binding, local_type);
+        Ok(())
+    }
+
+    /// Tuple destructuring in `let` (spec 6.21.2): the initializer must
+    /// synthesize a tuple composite whose arity matches the pattern, and
+    /// each element type binds to its subpattern — the binding shares the
+    /// element's inference state, so `let (a, b) = (x, 1)` keeps the
+    /// literal `1` a variable until later constraints resolve it.
+    /// Annotated destructuring, refutable subpatterns and slice patterns
+    /// stay gated for their own slices.
+    fn check_tuple_let(
+        &mut self,
+        pat: &Pat<'hir>,
+        patterns: &'hir [Pat<'hir>],
+        annotated: bool,
+        init: &'hir Expr<'hir>,
+    ) -> Result<(), ()> {
+        if annotated {
+            return Err(());
+        }
+        let local_type = self.check_initializer_value(init, None)?.local_type;
+        let LocalType::Composite(composite) = local_type else {
+            return Err(());
+        };
+        let Some(CompositeType::Tuple(element_types)) =
+            self.composite_types.get(composite).cloned()
+        else {
+            return Err(());
+        };
+        if element_types.len() != patterns.len() {
+            self.errors.push(PrimitiveBodyError {
+                node: pat.hir_id,
+                kind: PrimitiveBodyErrorKind::PatternArityMismatch {
+                    expected: element_types.len(),
+                    found: patterns.len(),
+                },
+            });
+            // Recover like the checker: bind the shared prefix so uses of
+            // the healthy elements still type-check, and give the missing
+            // elements error types so their uses do not cascade.
+            self.bind_tuple_pattern(patterns, &element_types)?;
+            if patterns.len() > element_types.len() {
+                self.bind_error_pattern_elements(&patterns[element_types.len()..]);
+            }
+            return Ok(());
+        }
+        self.bind_tuple_pattern(patterns, &element_types)
+    }
+
+    fn bind_error_pattern_elements(&mut self, patterns: &'hir [Pat<'hir>]) {
+        for pattern in patterns {
+            match pattern.kind {
+                PatKind::Wild => {}
+                PatKind::Binding {
+                    mode: mode @ (BindingMode::Value | BindingMode::Var),
+                    binding,
+                    sub: None,
+                    ..
+                } => {
+                    self.binding_nodes.insert(binding, pattern.hir_id);
+                    if mode == BindingMode::Var {
+                        self.mutable_bindings.insert(binding);
+                    }
+                    self.known_bindings.insert(binding, LocalType::Error(None));
+                }
+                PatKind::Tuple(nested) => self.bind_error_pattern_elements(nested),
+                _ => {}
+            }
+        }
+    }
+
+    fn bind_tuple_pattern(
+        &mut self,
+        patterns: &'hir [Pat<'hir>],
+        element_types: &[LocalType],
+    ) -> Result<(), ()> {
+        for (pattern, element_type) in patterns.iter().zip(element_types.iter().copied()) {
+            match pattern.kind {
+                PatKind::Wild => {}
+                PatKind::Binding {
+                    mode: mode @ (BindingMode::Value | BindingMode::Var),
+                    binding,
+                    sub: None,
+                    ..
+                } => {
+                    self.binding_nodes.insert(binding, pattern.hir_id);
+                    if mode == BindingMode::Var {
+                        self.mutable_bindings.insert(binding);
+                    }
+                    self.known_bindings.insert(binding, element_type);
+                }
+                // Nested tuple patterns destructure nested composites the
+                // same way; a scalar element here means the pattern is not
+                // a tuple for its type, which stays gated in this slice.
+                PatKind::Tuple(nested) => {
+                    let LocalType::Composite(composite) = element_type else {
+                        return Err(());
+                    };
+                    let Some(CompositeType::Tuple(nested_types)) =
+                        self.composite_types.get(composite).cloned()
+                    else {
+                        return Err(());
+                    };
+                    if nested_types.len() != nested.len() {
+                        self.errors.push(PrimitiveBodyError {
+                            node: pattern.hir_id,
+                            kind: PrimitiveBodyErrorKind::PatternArityMismatch {
+                                expected: nested_types.len(),
+                                found: nested.len(),
+                            },
+                        });
+                        continue;
+                    }
+                    self.bind_tuple_pattern(nested, &nested_types)?;
+                }
+                _ => return Err(()),
+            }
+        }
         Ok(())
     }
 
