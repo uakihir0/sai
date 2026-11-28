@@ -8189,16 +8189,36 @@ fn check_function_body_type(
     // only one the supported slice can express — stays gated rather than
     // passing silently. Scalar-only exports check like any function.
     if item.vis == Visibility::Export {
+        // Composite tuple/array types do not resolve to a direct type at
+        // all, so an `is_some_and` test would treat them as scalar. Any
+        // parameter or return type that fails primitive resolution is
+        // non-scalar for the boundary: it gates here, and a type that
+        // genuinely cannot resolve would gate downstream anyway.
+        // A type with an invalid array length is spec-invalid on its
+        // own (spec 5.2.2): the length diagnostic downstream must still
+        // fire, so such types do not count toward the boundary gate here
+        // — the gate would swallow the diagnostic behind it.
+        let has_invalid_length = |ty: sai_hir::types::Ty<'_>| {
+            find_invalid_array_length_type_argument(ty, type_paths, target_cfg.pointer_width())
+                .is_some()
+        };
         let non_scalar = sig.params.iter().any(|parameter| {
-            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
-                .is_some_and(|direct| !matches!(direct, FunctionDirectType::Primitive(_)))
+            !has_invalid_length(*parameter.ty)
+                && resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+                    .map_or(true, |direct| {
+                        !matches!(direct, FunctionDirectType::Primitive(_))
+                    })
         }) || sig.ret.is_some_and(|ret| {
-            resolve_function_direct_type(*ret, type_paths, symbols, inputs).is_some_and(|direct| {
-                !matches!(
-                    direct,
-                    FunctionDirectType::Primitive(_) | FunctionDirectType::Unit
+            !has_invalid_length(*ret)
+                && resolve_function_direct_type(*ret, type_paths, symbols, inputs).map_or(
+                    true,
+                    |direct| {
+                        !matches!(
+                            direct,
+                            FunctionDirectType::Primitive(_) | FunctionDirectType::Unit
+                        )
+                    },
                 )
-            })
         });
         if non_scalar {
             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -13626,6 +13646,7 @@ fn check_function_body_primitive_local_block(
     let self_field_projections = Some(&merged_fields);
     let str_self_field_projections = Some(&merged_str_fields);
     let mut initial_bindings = HashMap::new();
+    let mut composite_initial_bindings = HashMap::new();
     let mut str_admissions = StrShapeAdmissions::default();
     if sig.params.len() != body.params.len() {
         return Ok(None);
@@ -13664,7 +13685,27 @@ fn check_function_body_primitive_local_block(
             Some(FunctionDirectType::Str) => {
                 str_admissions.locals.insert(body_parameter.binding);
             }
-            _ => return Ok(None),
+            // Tuple and array parameters seed the composite binding map —
+            // their shapes intern into the kernel's composite arena, so
+            // `t.0` and `a[i]` project through the usual machinery.
+            _ => {
+                let Some(shape) = resolve_composite_binding_shape(
+                    *parameter.ty,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    target_cfg,
+                ) else {
+                    return Ok(None);
+                };
+                if matches!(
+                    shape,
+                    sai_ty::typeck::body::CompositeBindingShape::Primitive(_)
+                ) {
+                    return Ok(None);
+                }
+                composite_initial_bindings.insert(body_parameter.binding, shape);
+            }
         }
     }
 
@@ -13771,12 +13812,28 @@ fn check_function_body_primitive_local_block(
     // blocks stay gated with the statement-admission boundary). Every let
     // binding in the body precedes the tail.
     let mut primitive_types = HashMap::new();
-    let mut block_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
+    let mut block_bindings = initial_bindings
+        .keys()
+        .copied()
+        .chain(composite_initial_bindings.keys().copied())
+        .collect::<HashSet<_>>();
     block_bindings.insert(const_path_sentinel_binding());
     for stmt in block.stmts {
         if let StmtKind::Let { pat, .. } = stmt.kind {
-            if let PatKind::Binding { binding, .. } = pat.kind {
-                block_bindings.insert(binding);
+            // Destructuring patterns bind their elements in the same
+            // scope (spec 6.21.2) — a tuple pattern's bindings precede
+            // the tail like a plain `let` binding does.
+            let mut pattern_stack = vec![*pat];
+            while let Some(pattern) = pattern_stack.pop() {
+                match pattern.kind {
+                    PatKind::Binding { binding, .. } => {
+                        block_bindings.insert(binding);
+                    }
+                    PatKind::Tuple(nested) => {
+                        pattern_stack.extend(nested.iter().copied());
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -13958,7 +14015,11 @@ fn check_function_body_primitive_local_block(
         }
     }
 
-    let mut preceding_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
+    let mut preceding_bindings = initial_bindings
+        .keys()
+        .copied()
+        .chain(composite_initial_bindings.keys().copied())
+        .collect::<HashSet<_>>();
     // `Str` parameters are admitted everywhere a preceding local is — the
     // kernel decides which operand positions still reject `LocalType::Str`.
     preceding_bindings.extend(str_admissions.locals.iter().copied());
@@ -14155,6 +14216,7 @@ fn check_function_body_primitive_local_block(
             body,
             return_type,
             initial_bindings: &initial_bindings,
+            composite_initial_bindings: Some(&composite_initial_bindings),
             str_bindings: Some(&str_admissions.locals),
             str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
@@ -19904,6 +19966,54 @@ struct PrimitiveFunctionCallSignature {
     owner: OwnerId,
     parameters: Vec<FunctionDirectType>,
     output: FunctionDirectType,
+}
+
+/// Resolve a parameter type into the kernel's composite binding shape:
+/// primitive leaves resolve through the direct fragment, tuple elements
+/// and array element types recurse (spec 6.5.1/5.4.2). `Str` and nominal
+/// leaves stay outside this slice.
+fn resolve_composite_binding_shape(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    target_cfg: &TargetCfg,
+) -> Option<sai_ty::typeck::body::CompositeBindingShape> {
+    if let Some(FunctionDirectType::Primitive(primitive)) =
+        resolve_function_direct_type(ty, type_paths, symbols, inputs)
+    {
+        return Some(sai_ty::typeck::body::CompositeBindingShape::Primitive(
+            primitive,
+        ));
+    }
+    match ty.kind {
+        TyKind::Tuple(elements) if !elements.is_empty() => {
+            let elements = elements
+                .iter()
+                .map(|element| {
+                    resolve_composite_binding_shape(
+                        *element, type_paths, symbols, inputs, target_cfg,
+                    )
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(sai_ty::typeck::body::CompositeBindingShape::Tuple(elements))
+        }
+        _ => {
+            let (element_ty, len) =
+                resolve_const_array_type(ty, type_paths, target_cfg.pointer_width())?;
+            let elem = resolve_composite_binding_shape(
+                *element_ty,
+                type_paths,
+                symbols,
+                inputs,
+                target_cfg,
+            )?;
+            Some(sai_ty::typeck::body::CompositeBindingShape::Array {
+                elem: Box::new(elem),
+                len: usize::try_from(len).ok()?,
+            })
+        }
+    }
 }
 
 fn resolve_function_direct_type(
@@ -75880,6 +75990,7 @@ property "shared"() {}
                 body: diagnostic_order_body,
                 return_type: Some(PrimTy::Bool),
                 initial_bindings: &std::collections::HashMap::new(),
+                composite_initial_bindings: None,
                 str_bindings: None,
                 str_annotations: None,
                 primitive_types: &std::collections::HashMap::new(),

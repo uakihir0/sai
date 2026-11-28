@@ -11651,6 +11651,19 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1220: Composite tuple and array parameters
+
+- Slice: `pub fn f(t: (I32, I32)) -> I32 { t.0 }` — tuple and array
+  parameters intern into the kernel's composite arena at body-check
+  start, so projections `t.0`/`t.1.0`, built-in indexing `a[0]`/`a[i]`,
+  operator uses, and destructuring `let (a, b) = t` all check through
+  the existing composite machinery; element mismatches, out-of-range
+  indices, and tail mismatches diagnose exactly like `let`-built
+  composites. Array elements and tuple elements recurse, so nested
+  composites like `Array<Array<I32, 2>, 3>` index through both levels.
+- Gate: `Str` elements inside composite parameters, composite return
+  types with statements, and composite assignment remain future slices.
+
 ## IR-1216: Operator expressions serve as match scrutinees
 
 **Slice.** Match scrutinees admitted only paths, fields and const

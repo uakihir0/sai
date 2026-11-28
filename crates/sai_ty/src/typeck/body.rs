@@ -34,6 +34,10 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// expectation and any type is accepted.
     pub return_type: Option<PrimTy>,
     pub initial_bindings: &'a HashMap<BindingId, PrimTy>,
+    /// Tuple/array-typed parameter bindings admitted by the owner-aware
+    /// driver — the shapes intern into the composite arena at body-check
+    /// start, so `t.0` projects through the usual composite machinery.
+    pub composite_initial_bindings: Option<&'a HashMap<BindingId, CompositeBindingShape>>,
     /// `Str`-typed parameter bindings admitted by the owner-aware driver —
     /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
     pub str_bindings: Option<&'a HashSet<BindingId>>,
@@ -67,6 +71,41 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     pub mutable_params: Option<&'a HashSet<BindingId>>,
     pub symbols: &'a Interner,
     pub pointer_width: u8,
+}
+
+/// A composite parameter or binding shape projected by the owner-aware
+/// driver for tuple and array type positions. Primitive leaves keep the
+/// direct primitive fragment; composites recurse.
+#[derive(Clone, Debug)]
+pub enum CompositeBindingShape {
+    Primitive(PrimTy),
+    Tuple(Vec<CompositeBindingShape>),
+    Array {
+        elem: Box<CompositeBindingShape>,
+        len: usize,
+    },
+}
+
+fn intern_composite_shape(
+    shape: &CompositeBindingShape,
+    arena: &mut Vec<CompositeType>,
+) -> LocalType {
+    match shape {
+        CompositeBindingShape::Primitive(primitive) => LocalType::Concrete(*primitive),
+        CompositeBindingShape::Tuple(elements) => {
+            let elements = elements
+                .iter()
+                .map(|element| intern_composite_shape(element, arena))
+                .collect();
+            arena.push(CompositeType::Tuple(elements));
+            LocalType::Composite(arena.len() - 1)
+        }
+        CompositeBindingShape::Array { elem, len } => {
+            let elem = intern_composite_shape(elem, arena);
+            arena.push(CompositeType::Array { elem, len: *len });
+            LocalType::Composite(arena.len() - 1)
+        }
+    }
 }
 
 /// A direct function signature projected by the owner-aware driver for one
@@ -441,11 +480,22 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         .iter()
         .map(|parameter| (parameter.binding, parameter.hir_id))
         .collect();
+    let mut seeded_composite_types = Vec::new();
+    let mut composite_seed_bindings: HashMap<BindingId, LocalType> = HashMap::new();
+    if let Some(composites) = input.composite_initial_bindings {
+        for (binding, shape) in composites {
+            let local_type = intern_composite_shape(shape, &mut seeded_composite_types);
+            composite_seed_bindings.insert(*binding, local_type);
+        }
+    }
     let mut known_bindings: HashMap<BindingId, LocalType> = input
         .initial_bindings
         .iter()
         .map(|(binding, ty)| (*binding, LocalType::Concrete(*ty)))
         .collect();
+    for (binding, local_type) in &composite_seed_bindings {
+        known_bindings.insert(*binding, *local_type);
+    }
     if let Some(str_bindings) = input.str_bindings {
         for binding in str_bindings {
             known_bindings.insert(*binding, LocalType::Str);
@@ -457,6 +507,13 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         .keys()
         .copied()
         .chain(input.str_bindings.into_iter().flatten().copied())
+        .chain(
+            input
+                .composite_initial_bindings
+                .into_iter()
+                .flatten()
+                .map(|(binding, _)| *binding),
+        )
         .collect();
     let mut expression_nodes = HashMap::new();
     if matches!(input.body.value.kind, ExprKind::Block(_)) {
@@ -495,7 +552,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         deferred_bitnot_result_bindings: HashSet::new(),
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
-        composite_types: Vec::new(),
+        composite_types: seeded_composite_types,
         loop_stack: Vec::new(),
         errors: Vec::new(),
     };
@@ -986,7 +1043,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Block(inner) if inner.safety == Safety::Safe
         );
         let is_supported_path_tail = matches!(tail.kind, ExprKind::Path(_));
+        // Projection/index tails read composite locals — the scalar
+        // result unifies with the expectation like a path tail.
+        let is_supported_projection_tail =
+            matches!(tail.kind, ExprKind::TupleField { .. } | ExprKind::Index(..));
         if block.stmts.is_empty()
+            && !is_supported_projection_tail
             && !is_supported_field_tail
             && !is_supported_call_tail
             && !is_supported_unary_tail
@@ -1722,6 +1784,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.add_integer_literal_constraint(id, right_literal, right.hir_id)?;
                 return Ok(local_type);
             }
+            // An error right operand propagates: diagnostic-backed
+            // errors keep their already-reported diagnostic visible, and
+            // a `!` operand coerces — the literal's inference variable
+            // stays unresolved either way.
+            if let Ok(error_type @ LocalType::Error(_)) = self.check_operand_local_type(right) {
+                // The left literal still registers its inference
+                // variable so a later annotation or tail range-checks
+                // it — diverging operands do not erase the literal's
+                // own constraints.
+                if matches!(
+                    kind,
+                    PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                ) {
+                    self.local_type_for_unannotated_literal(literal, kind, left.hir_id);
+                }
+                return Ok(error_type);
+            }
             let right_type = self
                 .check_operand_local_type(right)
                 .ok()
@@ -1754,6 +1833,70 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         let left_local_type = self.check_operand_local_type(left).ok().ok_or(())?;
+        // An error left operand produced *with* a diagnostic (`t.5` out
+        // of range) propagates instead of gating, so the error is not
+        // hidden behind the implementation gate. A silent error type —
+        // an `if` whose branches all `return` carries no diagnostic —
+        // must not skip the operator's own validation, so it gates as
+        // before. The right operand still checks for recovery.
+        if let LocalType::Error(_) = left_local_type {
+            // An error left operand is either diagnostic-backed (an
+            // out-of-range projection already reported) or the `!` of a
+            // diverging `if`/`match`. Either way the arithmetic must not
+            // gate: gating would discard diagnostics the body already
+            // produced. `!` coerces to the other operand's type, so with
+            // a concrete right operand the operator validates as if the
+            // left had that type; against a literal or another error the
+            // error propagates without further commitment.
+            match self.check_operand_local_type(right) {
+                Ok(LocalType::Concrete(right_type)) => {
+                    // `!` coerces to the right operand's type, so the
+                    // operator validates as if both operands had it.
+                    // The result stays the error type: committing to
+                    // the numeric result would let a later projection
+                    // gate the body and swallow the operand's diagnostic.
+                    return match primitive_arithmetic_result(operator, right_type, right_type) {
+                        PrimitiveArithmeticResult::Type(_) => Ok(left_local_type),
+                        _ => {
+                            self.report_operator_not_supported(
+                                expression,
+                                operator,
+                                PrimitiveOperatorOperand::Concrete(right_type),
+                            );
+                            Ok(left_local_type)
+                        }
+                    };
+                }
+                Ok(_) => {
+                    return Ok(left_local_type);
+                }
+                Err(()) => {
+                    // Literal right operands error out of the operand
+                    // checker by design — register the numeric literal's
+                    // inference variable so a later annotation or tail
+                    // still range-checks it, then propagate the error.
+                    if let ExprKind::Lit(literal) = right.kind {
+                        if let Some(kind) = primitive_literal_kind(literal) {
+                            if matches!(
+                                kind,
+                                PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                            ) {
+                                self.local_type_for_unannotated_literal(
+                                    literal,
+                                    kind,
+                                    right.hir_id,
+                                );
+                                return Ok(left_local_type);
+                            }
+                        }
+                    }
+                    // A genuinely unsupported right operand keeps the
+                    // gate — the error operand must not launder it into
+                    // acceptance.
+                    return Err(());
+                }
+            }
+        }
         let unresolved_literal_variable = matches!(left_local_type, LocalType::LiteralVariable(id)
             if self
                 .literal_variables
@@ -1906,6 +2049,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
 
+        if let Ok(error_type @ LocalType::Error(_)) = self.check_operand_local_type(right) {
+            // `!` coerces to the concrete left operand's type — the
+            // operator validates as if both operands had it. A
+            // diagnostic-backed error propagates the same way; either
+            // beats gating, which would discard diagnostics the body
+            // already produced.
+            return match primitive_arithmetic_result(operator, left_type, left_type) {
+                PrimitiveArithmeticResult::Type(_) => Ok(error_type),
+                _ => {
+                    self.report_operator_not_supported(
+                        expression,
+                        operator,
+                        PrimitiveOperatorOperand::Concrete(left_type),
+                    );
+                    Ok(error_type)
+                }
+            };
+        }
         let right_type = self
             .check_operand_local_type(right)
             .ok()
