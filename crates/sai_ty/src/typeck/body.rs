@@ -213,6 +213,10 @@ pub enum PrimitiveBodyErrorKind {
         expected: usize,
         found: usize,
     },
+    /// A tuple pattern against a non-tuple element type (spec 6.21.2
+    /// TYPE_MISMATCH): the pattern requires a tuple but the value is a
+    /// scalar or inference variable.
+    TuplePatternOnNonTuple,
     ConstPatternType {
         found: ScalarType,
     },
@@ -1576,13 +1580,37 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 // same way; a scalar element here means the pattern is not
                 // a tuple for its type, which stays gated in this slice.
                 PatKind::Tuple(nested) => {
+                    // Error-typed elements already carry their own
+                    // diagnostic upstream — recover the nested bindings as
+                    // error types so uses do not cascade past it.
+                    if matches!(
+                        element_type,
+                        LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
+                    ) {
+                        self.bind_error_pattern_elements(nested);
+                        continue;
+                    }
                     let LocalType::Composite(composite) = element_type else {
-                        return Err(());
+                        // A tuple pattern against a scalar or inference
+                        // element is a type mismatch (spec 6.21.2) — the
+                        // bindings recover as error types.
+                        self.errors.push(PrimitiveBodyError {
+                            node: pattern.hir_id,
+                            kind: PrimitiveBodyErrorKind::TuplePatternOnNonTuple,
+                        });
+                        self.bind_error_pattern_elements(nested);
+                        continue;
                     };
                     let Some(CompositeType::Tuple(nested_types)) =
                         self.composite_types.get(composite).cloned()
                     else {
-                        return Err(());
+                        // An array element is not a tuple either.
+                        self.errors.push(PrimitiveBodyError {
+                            node: pattern.hir_id,
+                            kind: PrimitiveBodyErrorKind::TuplePatternOnNonTuple,
+                        });
+                        self.bind_error_pattern_elements(nested);
+                        continue;
                     };
                     if nested_types.len() != nested.len() {
                         self.errors.push(PrimitiveBodyError {

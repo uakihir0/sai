@@ -27337,6 +27337,12 @@ fn tuple_destructuring_binds_elements_in_let_statements() {
             "pub fn f(x: I32) -> I32 {\n    let (a, (b, c, d)) = (x, (1, 2))\n    b\n}\n",
             &[("PATTERN_ARITY_MISMATCH", 1)],
         ),
+        // A tuple pattern against a scalar element is a type mismatch
+        // (spec 6.21.2), not a gate — the bindings recover as error types.
+        (
+            "pub fn f(x: I32, y: I32) -> I32 {\n    let (a, (b, c)) = (x, y)\n    b\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
         (
             "pub fn f(x: I32) -> I32 {\n    let (a, b, c) = (x, 1)\n    a\n}\n",
             &[("PATTERN_ARITY_MISMATCH", 1)],

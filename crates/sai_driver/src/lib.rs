@@ -18857,6 +18857,15 @@ fn primitive_body_errors_to_diagnostics(
                     "type mismatch",
                 )?
             }
+            PrimitiveBodyErrorKind::TuplePatternOnNonTuple => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                "tuple pattern requires a tuple type".to_string(),
+                "not a tuple",
+            )?,
             PrimitiveBodyErrorKind::OperatorNotSupported { operator, operand } => {
                 let operator_text = match operator {
                     BinOp::Add => "+",
