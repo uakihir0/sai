@@ -13728,15 +13728,18 @@ fn check_function_body_primitive_local_block(
                     // like parameter shapes. Non-composite shapes stay
                     // gated.
                     if let ExprKind::Block(block) = body.value.kind {
-                        // Composite `if`/`match` tails have no
-                        // driver-side validator either, so
+                        // Only tuple/array literal tails keep the
+                        // driver-side validators (their type-display
+                        // diagnostics are richer); every other tail
+                        // shape — `if`/`match`, paths, projections —
+                        // has no driver-side validator, so
                         // statement-less bodies ending in one admit to
-                        // the kernel too.
-                        let branch_tail = matches!(
+                        // the kernel.
+                        let literal_tail = matches!(
                             block.tail.map(|tail| tail.kind),
-                            Some(ExprKind::If { .. } | ExprKind::Match { .. })
+                            Some(ExprKind::Tuple(_) | ExprKind::Array(_))
                         );
-                        if block.stmts.is_empty() && !branch_tail {
+                        if block.stmts.is_empty() && literal_tail {
                             return Ok(None);
                         }
                     }
