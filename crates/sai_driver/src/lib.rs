@@ -16332,7 +16332,7 @@ fn resolve_record_type_def(
     };
     match type_paths?.paths().get(&path.hir_id) {
         Some(PathRes {
-            base: Res::Def(DefKind::Struct, def),
+            base: Res::Def(DefKind::Struct | DefKind::Enum, def),
             ..
         }) => Some(*def),
         _ => None,

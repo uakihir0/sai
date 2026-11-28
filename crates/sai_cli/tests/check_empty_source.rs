@@ -27607,6 +27607,56 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn enum_parameters_and_returns_pass_through() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // Enum declarations coexist with function bodies; enum-typed
+        // parameters pass through as opaque nominal values — copies
+        // included — including payload-carrying enums.
+        (
+            "pub enum Color { Red, Green, Blue }\npub fn f() {\n    1\n}\n",
+            &[],
+        ),
+        (
+            "pub enum Color { Red, Green, Blue }\npub fn f(c: Color) {\n}\n",
+            &[],
+        ),
+        (
+            "pub enum Color { Red, Green, Blue }\npub fn f(c: Color) -> Color {\n    c\n}\n",
+            &[],
+        ),
+        (
+            "pub enum Color { Red, Green, Blue }\npub fn f(c: Color) -> Color {\n    var d = c\n    d\n}\n",
+            &[],
+        ),
+        (
+            "pub enum Shape { Circle(I32), Dot }\npub fn f(s: Shape) -> Shape {\n    s\n}\n",
+            &[],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "enum pass-through should check, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn record_str_field_reads_bind_strings() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // `n.first` reads a `Str` field off a constructed binding, a

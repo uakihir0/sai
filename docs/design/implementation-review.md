@@ -11651,6 +11651,16 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1246: Enum parameters as opaque nominals
+
+- Slice: the source scanner admits enum declarations whose variant
+  payloads use primitive, `Str`, or declared/imported nominal types,
+  and nominal type resolution covers `DefKind::Enum` — so enum-typed
+  parameters seed opaque nominal bindings like records, pass-through
+  returns and copies check, and payload-carrying enums behave the
+  same. Construction (`Color.Red`), matching, and variant field
+  access remain gated for the next enum slices.
+
 ## IR-1245: `Str` field reads on record values
 
 - Slice: the merged `Str` projection map publishes into the inputs

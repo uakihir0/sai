@@ -2058,17 +2058,25 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
     let mut type_names = HashSet::new();
     let mut public_type_names = HashSet::new();
     for item in source_file.items() {
-        if let sai_syntax::ast::Item::Type(type_decl) = item {
-            if let Some(name) = type_decl
-                .name()
-                .and_then(|name| name.token())
-                .map(|token| token.text().to_owned())
-            {
-                if is_public_visibility(type_decl.visibility()) {
-                    public_type_names.insert(name.clone());
-                }
-                type_names.insert(name);
+        let (name, visibility) = match &item {
+            sai_syntax::ast::Item::Type(type_decl) => (
+                type_decl.name(),
+                is_public_visibility(type_decl.visibility()),
+            ),
+            sai_syntax::ast::Item::Enum(enumeration) => (
+                enumeration.name(),
+                is_public_visibility(enumeration.visibility()),
+            ),
+            _ => continue,
+        };
+        if let Some(name) = name
+            .and_then(|name| name.token())
+            .map(|token| token.text().to_owned())
+        {
+            if visibility {
+                public_type_names.insert(name.clone());
             }
+            type_names.insert(name);
         }
     }
     if !check_type_decls_acyclic(&source_file, source, &type_names) {
@@ -2100,6 +2108,13 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
                     &use_item_bound_names(&source_file, source),
                 )
         }
+        sai_syntax::ast::Item::Enum(enumeration) => check_enum_decl_variants_supported(
+            &enumeration,
+            source,
+            &type_names,
+            &public_type_names,
+            &use_item_bound_names(&source_file, source),
+        ),
         sai_syntax::ast::Item::Use(_) => true,
         _ => false,
     }) && saw_function
@@ -2316,6 +2331,156 @@ fn package_module_type_inventory(
 // `self.<field>.<leaf>` projections). An empty record has nothing to
 // verify and is admissible. `type_names`/`public_type_names` hold raw
 // declared spellings; comparisons normalize `r#` like the impl check.
+
+// Whether a field or payload type text names a supported type: a
+// primitive, `Str` (unless shadowed), or a declared/imported nominal.
+// `pub_exposed` positions additionally require the nominal to be
+// public, mirroring PRIVATE_TYPE_IN_PUBLIC_API coverage.
+fn scanner_payload_type_is_supported(
+    type_text: &[u8],
+    type_names: &HashSet<String>,
+    public_type_names: &HashSet<String>,
+    imported_names: &HashSet<String>,
+    str_shadowed: bool,
+    pub_exposed: bool,
+) -> bool {
+    matches!(
+        type_text,
+        b"Bool"
+            | b"Byte"
+            | b"Char"
+            | b"I8"
+            | b"I16"
+            | b"I32"
+            | b"I64"
+            | b"ISize"
+            | b"U8"
+            | b"U16"
+            | b"U32"
+            | b"U64"
+            | b"USize"
+            | b"F32"
+            | b"F64"
+    ) || (type_text == b"Str" && !str_shadowed)
+        || {
+            let Ok(text) = std::str::from_utf8(type_text) else {
+                return false;
+            };
+            let normalized = normalize_type_name(text);
+            // `Self` is invalid outside `impl`/`trait` headers —
+            // a `type r#Self` decl must not let it pass as a
+            // record name (upstream rejects it on type-path
+            // resolution).
+            let declared = !matches!(text, "Self" | "self" | "r#Self" | "r#self")
+                && type_names
+                    .iter()
+                    .any(|name| normalize_type_name(name) == normalized);
+            let imported = imported_names
+                .iter()
+                .any(|name| normalize_type_name(name) == normalized);
+            (declared || imported)
+                && !(pub_exposed
+                    && (imported
+                        || (declared
+                            && !public_type_names
+                                .iter()
+                                .any(|name| normalize_type_name(name) == normalized))))
+        }
+}
+
+fn scanner_type_text_is_supported(
+    ty: &sai_syntax::ast::Type,
+    source: &[u8],
+    type_names: &HashSet<String>,
+    public_type_names: &HashSet<String>,
+    imported_names: &HashSet<String>,
+    str_shadowed: bool,
+    pub_exposed: bool,
+) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    let range = ty.syntax().text_range();
+    let Some(type_text) = source.get(range.start().to_usize()..range.end().to_usize()) else {
+        return false;
+    };
+    scanner_payload_type_is_supported(
+        type_text,
+        type_names,
+        public_type_names,
+        imported_names,
+        str_shadowed,
+        pub_exposed,
+    )
+}
+
+// Enum declarations admit like records: no attributes, generics,
+// `where` clauses, or syntax errors; every variant is unit or carries
+// tuple/record payloads whose types pass the same nominal scan record
+// fields use. Because variants share their enum's visibility, payload
+// types on a public enum face the same pub-exposure rule as `pub`
+// record fields.
+fn check_enum_decl_variants_supported(
+    enumeration: &sai_syntax::ast::EnumDecl,
+    source: &[u8],
+    type_names: &HashSet<String>,
+    public_type_names: &HashSet<String>,
+    imported_names: &HashSet<String>,
+) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    if enumeration.attrs().next().is_some()
+        || enumeration
+            .syntax()
+            .children()
+            .any(|child| sai_syntax::ast::GenericParamList::can_cast(child.kind()))
+        || enumeration
+            .syntax()
+            .descendants()
+            .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+        || enumeration.syntax().descendants().any(|node| {
+            node.kind() == sai_syntax::SyntaxKind::ERROR
+                || node
+                    .children_with_tokens()
+                    .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+        })
+    {
+        return false;
+    }
+    let str_shadowed = type_names
+        .iter()
+        .any(|name| normalize_type_name(name) == "Str");
+    let decl_is_public = is_public_visibility(enumeration.visibility());
+    let Some(variants) = enumeration.variants() else {
+        return true;
+    };
+    variants.variants().all(|variant| {
+        let payload_type_supported = |ty: sai_syntax::ast::Type| {
+            scanner_type_text_is_supported(
+                &ty,
+                source,
+                type_names,
+                public_type_names,
+                imported_names,
+                str_shadowed,
+                decl_is_public,
+            )
+        };
+        let tuple_ok = variant
+            .tuple_shape()
+            .map(|shape| shape.types().all(payload_type_supported))
+            .unwrap_or(true);
+        let record_ok = variant
+            .record_shape()
+            .map(|shape| {
+                shape.fields().all(|field| {
+                    field.attrs().next().is_none()
+                        && field.ty().is_some_and(|ty| payload_type_supported(ty))
+                })
+            })
+            .unwrap_or(true);
+        tuple_ok && record_ok
+    })
+}
 
 fn check_type_decl_primitive_fields(
     type_decl: &sai_syntax::ast::TypeDecl,
