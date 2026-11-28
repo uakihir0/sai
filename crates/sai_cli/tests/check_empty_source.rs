@@ -27619,6 +27619,55 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn record_field_reads_project_primitive_fields() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // `p.x` on a record parameter reads the primitive field type —
+        // tail, arithmetic, and initializer positions.
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> I32 {\n    p.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) -> I32 {\n    p.x + p.y\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: I32, y: I32 }\npub fn f(p: Point) {\n    var u = p.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: U8, y: I32 }\npub fn f(p: Point) -> U8 {\n    p.x\n}\n",
+            &[],
+        ),
+        (
+            "pub type Point { x: U8, y: I32 }\npub fn f(p: Point) -> I32 {\n    p.x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "record field reads should project, not gate:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn record_parameters_seed_opaque_bindings() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // Record parameters admit — slice one treats the value as
