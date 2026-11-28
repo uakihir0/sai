@@ -27619,6 +27619,46 @@ fn composite_return_literal_tails_check_elementwise() {
 }
 
 #[test]
+fn composite_return_statements_check_against_shape() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // A composite `return` value checks against the return shape.
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, I64) {\n    if c { return (x, 1) }\n    (x, 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, I64) {\n    let t = (x, 1)\n    if c { return t }\n    (x, 2)\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32, c: Bool) -> (I32, Bool) {\n    if c { return (x, 1) }\n    (x, true)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "composite return statements should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
+
+#[test]
 fn composite_return_match_tails_check_armwise() {
     let cases: &[(&str, &[(&str, usize)])] = &[
         // Composite match tails check each arm body against the return

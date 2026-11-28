@@ -11651,6 +11651,14 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1226: Composite return statement values
+
+- Slice: `pub fn f(x: I32, c: Bool) -> (I32, I64) { if c { return (x, 1) }\n(x, 2) }` —
+  a return value in a composite-returning body checks against the
+  return shape through the shared composite expression dispatcher.
+- Gate: bare `return` in composite bodies (unit-typed), composite
+  assignment, and annotated composite bindings remain future slices.
+
 ## IR-1225: Composite match tails
 
 - Slice: `pub fn f(x: I32, c: Bool) -> (I32, I64) { match c { true => (x, 1), false => (x, 2) } }` —
