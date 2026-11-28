@@ -11651,6 +11651,17 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1225: Composite match tails
+
+- Slice: `pub fn f(x: I32, c: Bool) -> (I32, I64) { match c { true => (x, 1), false => (x, 2) } }` —
+  composite match tails check each arm body against the return shape
+  through the shared composite expression dispatcher (literals
+  elementwise, paths/projections leaf-wise, nested if/match recursion);
+  the primitive-oriented driver shape mirror is skipped because the
+  kernel checks every arm body itself.
+- Gate: composite scrutinees, composite `return` statements, composite
+  assignment, and annotated composite bindings remain future slices.
+
 ## IR-1224: Composite if tails
 
 - Slice: `pub fn f(x: I32, c: Bool) -> (I32, I64) { if c { (x, 1) } else { (x, 2) } }` —
