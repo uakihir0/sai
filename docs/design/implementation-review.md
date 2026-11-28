@@ -11651,6 +11651,16 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1224: Composite if tails
+
+- Slice: `pub fn f(x: I32, c: Bool) -> (I32, I64) { if c { (x, 1) } else { (x, 2) } }` —
+  composite if tails check each branch block against the return shape
+  recursively, with else-if chains nesting the same checking;
+  statement-less bodies ending in a composite if admit to the kernel
+  because no driver-side validator covers them.
+- Gate: if-without-else tails (unit-typed), composite match tails, and
+  composite assignment remain future slices.
+
 ## IR-1223: Non-literal composite tails
 
 - Slice: `pub fn f(x: I32) -> (I32, I64) { let t = (x, 1)\n t }` — a
