@@ -13735,6 +13735,9 @@ fn check_function_body_primitive_local_block(
     // into the same projection map `self.<field>` uses, so every
     // downstream admission and the kernel's Field synthesis work
     // unchanged. Nested chains, copies, and non-primitive fields gate.
+    let mut merged_unknown_fields: HashSet<HirId> =
+        unknown_self_fields.cloned().unwrap_or_default();
+    let mut driver_diagnostics: Vec<Diagnostic> = Vec::new();
     if !nominal_binding_record_names.is_empty()
         && let ExprKind::Block(body_block) = body.value.kind
     {
@@ -13742,24 +13745,46 @@ fn check_function_body_primitive_local_block(
         if let Some(source_file) = ast::SourceFile::cast(inputs.root.clone()) {
             let mut records: HashMap<String, HashMap<String, sai_resolve::prelude::PrimTy>> =
                 HashMap::new();
+            // (type name span, candidate field spellings in declaration
+            // order, every normalized field name, `Str` field names) —
+            // the metadata unknown-field diagnostics and `Str`
+            // projections need beyond the primitive field types.
+            let mut record_meta: HashMap<
+                String,
+                (
+                    sai_diagnostics::Span,
+                    Vec<String>,
+                    HashSet<String>,
+                    HashSet<String>,
+                ),
+            > = HashMap::new();
             for item in source_file.items() {
                 if let ast::Item::Type(type_decl) = item {
                     if let Some(parsed) = parse_inherent_method_record(&type_decl, inputs) {
                         let mut fields = HashMap::new();
-                        for (field_name, type_text, _) in &parsed.fields {
+                        let mut all_fields = HashSet::new();
+                        let mut str_fields = HashSet::new();
+                        let mut candidates = Vec::new();
+                        for (field_name, type_text, spelling) in &parsed.fields {
+                            all_fields.insert(field_name.clone());
+                            candidates.push(spelling.clone());
                             if let Some(primitive) = primitive_method_field_type(type_text) {
                                 fields.insert(field_name.clone(), primitive);
+                            } else if type_text == "Str" {
+                                str_fields.insert(field_name.clone());
                             }
                         }
-                        records.insert(
-                            sai_syntax::normalize_identifier(
-                                parsed
-                                    .type_name
-                                    .strip_prefix("r#")
-                                    .unwrap_or(&parsed.type_name),
-                            ),
-                            fields,
+                        let key = sai_syntax::normalize_identifier(
+                            parsed
+                                .type_name
+                                .strip_prefix("r#")
+                                .unwrap_or(&parsed.type_name),
                         );
+                        record_meta.insert(
+                            key.clone(),
+                            (parsed.type_name_span, candidates, all_fields, str_fields),
+                        );
+                        records.insert(key, fields);
                     }
                 }
             }
@@ -13811,11 +13836,36 @@ fn check_function_body_primitive_local_block(
                     );
                     if let Some(primitive) = fields.get(normalized.as_str()) {
                         merged_fields.insert(expression.hir_id, *primitive);
+                    } else if let Some((type_name_span, candidates, all_fields, str_fields)) =
+                        record_meta.get(record_name)
+                    {
+                        if str_fields.contains(normalized.as_str()) {
+                            merged_str_fields.insert(expression.hir_id, "`Str`");
+                        } else if !all_fields.contains(normalized.as_str()) {
+                            // A field the record does not declare is
+                            // `UNKNOWN_FIELD` (spec 6.7.1) — diagnosed
+                            // like an unknown `self` field, with the
+                            // projection recovering as an error type.
+                            merged_unknown_fields.insert(expression.hir_id);
+                            match unknown_self_field_diagnostic(
+                                owner.id,
+                                record_name,
+                                *type_name_span,
+                                candidates,
+                                name,
+                                inputs,
+                                snapshot,
+                            ) {
+                                Ok(diagnostic) => driver_diagnostics.push(diagnostic),
+                                Err(_) => {}
+                            }
+                        }
                     }
                 });
             }
         }
     }
+    let unknown_self_fields = Some(&merged_unknown_fields);
     let self_field_projections = Some(&merged_fields);
     let str_self_field_projections = Some(&merged_str_fields);
     // A missing return type is the implicit `-> ()` (spec 6.5.1). Unit
@@ -14417,11 +14467,12 @@ fn check_function_body_primitive_local_block(
         return Ok(None);
     };
 
-    let Some(diagnostics) =
+    let Some(mut diagnostics) =
         primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)?
     else {
         return Ok(None);
     };
+    diagnostics.extend(driver_diagnostics);
     Ok(Some((
         diagnostics,
         type_results.with_canonical_primitive_types(semantic_types),
