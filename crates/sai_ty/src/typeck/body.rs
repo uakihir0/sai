@@ -34,6 +34,10 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// expectation and any type is accepted.
     pub return_type: Option<PrimTy>,
     pub initial_bindings: &'a HashMap<BindingId, PrimTy>,
+    /// Tuple/array-typed parameter bindings admitted by the owner-aware
+    /// driver — the shapes intern into the composite arena at body-check
+    /// start, so `t.0` projects through the usual composite machinery.
+    pub composite_initial_bindings: Option<&'a HashMap<BindingId, CompositeBindingShape>>,
     /// `Str`-typed parameter bindings admitted by the owner-aware driver —
     /// `Str` is not a `PrimTy`, so these bind `LocalType::Str`.
     pub str_bindings: Option<&'a HashSet<BindingId>>,
@@ -67,6 +71,41 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     pub mutable_params: Option<&'a HashSet<BindingId>>,
     pub symbols: &'a Interner,
     pub pointer_width: u8,
+}
+
+/// A composite parameter or binding shape projected by the owner-aware
+/// driver for tuple and array type positions. Primitive leaves keep the
+/// direct primitive fragment; composites recurse.
+#[derive(Clone, Debug)]
+pub enum CompositeBindingShape {
+    Primitive(PrimTy),
+    Tuple(Vec<CompositeBindingShape>),
+    Array {
+        elem: Box<CompositeBindingShape>,
+        len: usize,
+    },
+}
+
+fn intern_composite_shape(
+    shape: &CompositeBindingShape,
+    arena: &mut Vec<CompositeType>,
+) -> LocalType {
+    match shape {
+        CompositeBindingShape::Primitive(primitive) => LocalType::Concrete(*primitive),
+        CompositeBindingShape::Tuple(elements) => {
+            let elements = elements
+                .iter()
+                .map(|element| intern_composite_shape(element, arena))
+                .collect();
+            arena.push(CompositeType::Tuple(elements));
+            LocalType::Composite(arena.len() - 1)
+        }
+        CompositeBindingShape::Array { elem, len } => {
+            let elem = intern_composite_shape(elem, arena);
+            arena.push(CompositeType::Array { elem, len: *len });
+            LocalType::Composite(arena.len() - 1)
+        }
+    }
 }
 
 /// A direct function signature projected by the owner-aware driver for one
@@ -434,11 +473,22 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         .iter()
         .map(|parameter| (parameter.binding, parameter.hir_id))
         .collect();
+    let mut seeded_composite_types = Vec::new();
+    let mut composite_seed_bindings: HashMap<BindingId, LocalType> = HashMap::new();
+    if let Some(composites) = input.composite_initial_bindings {
+        for (binding, shape) in composites {
+            let local_type = intern_composite_shape(shape, &mut seeded_composite_types);
+            composite_seed_bindings.insert(*binding, local_type);
+        }
+    }
     let mut known_bindings: HashMap<BindingId, LocalType> = input
         .initial_bindings
         .iter()
         .map(|(binding, ty)| (*binding, LocalType::Concrete(*ty)))
         .collect();
+    for (binding, local_type) in &composite_seed_bindings {
+        known_bindings.insert(*binding, *local_type);
+    }
     if let Some(str_bindings) = input.str_bindings {
         for binding in str_bindings {
             known_bindings.insert(*binding, LocalType::Str);
@@ -450,6 +500,13 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         .keys()
         .copied()
         .chain(input.str_bindings.into_iter().flatten().copied())
+        .chain(
+            input
+                .composite_initial_bindings
+                .into_iter()
+                .flatten()
+                .map(|(binding, _)| *binding),
+        )
         .collect();
     let mut expression_nodes = HashMap::new();
     if matches!(input.body.value.kind, ExprKind::Block(_)) {
@@ -488,7 +545,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         deferred_bitnot_result_bindings: HashSet::new(),
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
-        composite_types: Vec::new(),
+        composite_types: seeded_composite_types,
         loop_stack: Vec::new(),
         errors: Vec::new(),
     };
@@ -979,7 +1036,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Block(inner) if inner.safety == Safety::Safe
         );
         let is_supported_path_tail = matches!(tail.kind, ExprKind::Path(_));
+        // Projection/index tails read composite locals — the scalar
+        // result unifies with the expectation like a path tail.
+        let is_supported_projection_tail =
+            matches!(tail.kind, ExprKind::TupleField { .. } | ExprKind::Index(..));
         if block.stmts.is_empty()
+            && !is_supported_projection_tail
             && !is_supported_field_tail
             && !is_supported_call_tail
             && !is_supported_unary_tail

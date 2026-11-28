@@ -27467,3 +27467,62 @@ fn error_tainted_annotated_assignments_check_at_the_annotation() {
         .count();
     assert_eq!(actual, 1, "2^64 exceeds `U64`:\n{stdout}");
 }
+
+#[test]
+fn composite_tuple_and_array_parameters_project_and_index() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        ("pub fn f(t: (I32, I32)) -> I32 { t.0 }\n", &[]),
+        ("pub fn f(t: (I32, (I32, I32))) -> I32 { t.1.0 }\n", &[]),
+        (
+            "pub fn f(t: (I32, I32)) -> I32 {\n    let x = t.0 + t.1\n    x\n}\n",
+            &[],
+        ),
+        ("pub fn f(a: Array<I32, 2>) -> I32 { a[0] }\n", &[]),
+        (
+            "pub fn f(a: Array<I32, 2>, i: USize) -> I32 { a[i] }\n",
+            &[],
+        ),
+        (
+            "pub fn f(a: Array<Array<I32, 2>, 3>) -> I32 { a[1][0] }\n",
+            &[],
+        ),
+        (
+            "pub fn f(t: (I32, I32)) -> I32 {\n    let (a, b) = t\n    a + b\n}\n",
+            &[],
+        ),
+        ("pub fn f(var t: (I32, I32)) -> I32 { t.0 }\n", &[]),
+        (
+            "pub fn f(t: (I32, Bool)) -> I32 {\n    let x = t.0 + t.1\n    x\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(t: (I32, I32)) -> I32 { t.5 }\n",
+            &[("TUPLE_INDEX_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(t: (I32, I32)) -> Bool { t.0 }\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "composite parameters should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}
