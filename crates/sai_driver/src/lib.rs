@@ -13643,11 +13643,10 @@ fn check_function_body_primitive_local_block(
             }
         }
     }
-    let self_field_projections = Some(&merged_fields);
-    let str_self_field_projections = Some(&merged_str_fields);
     let mut initial_bindings = HashMap::new();
     let mut composite_initial_bindings = HashMap::new();
     let mut nominal_initial_bindings = HashMap::new();
+    let mut nominal_binding_record_names: HashMap<sai_hir::BindingId, String> = HashMap::new();
     let mut str_admissions = StrShapeAdmissions::default();
     if sig.params.len() != body.params.len() {
         return Ok(None);
@@ -13695,6 +13694,19 @@ fn check_function_body_primitive_local_block(
                 // constructed or projected yet, so every use gates.
                 if let Some(def) = resolve_record_type_def(*parameter.ty, type_paths) {
                     nominal_initial_bindings.insert(body_parameter.binding, def);
+                    if let TyKind::Path(path) = parameter.ty.kind {
+                        if path.root == PathRoot::Plain
+                            && path.segments.len() == 1
+                            && let Ok(name) = symbols.resolve(path.segments[0].name.sym)
+                        {
+                            nominal_binding_record_names.insert(
+                                body_parameter.binding,
+                                sai_syntax::normalize_identifier(
+                                    name.strip_prefix("r#").unwrap_or(name.as_ref()),
+                                ),
+                            );
+                        }
+                    }
                     continue;
                 }
                 let Some(shape) = resolve_composite_binding_shape(
@@ -13717,6 +13729,73 @@ fn check_function_body_primitive_local_block(
         }
     }
 
+    // Record field projections (IR-1234): a `field` access whose base
+    // is a direct path to a record parameter resolves through the
+    // same-file record declaration's primitive field types — merged
+    // into the same projection map `self.<field>` uses, so every
+    // downstream admission and the kernel's Field synthesis work
+    // unchanged. Nested chains, copies, and non-primitive fields gate.
+    if !nominal_binding_record_names.is_empty()
+        && let ExprKind::Block(body_block) = body.value.kind
+    {
+        use sai_syntax::ast::AstNode as _;
+        if let Some(source_file) = ast::SourceFile::cast(inputs.root.clone()) {
+            let mut records: HashMap<String, HashMap<String, sai_resolve::prelude::PrimTy>> =
+                HashMap::new();
+            for item in source_file.items() {
+                if let ast::Item::Type(type_decl) = item {
+                    if let Some(parsed) = parse_inherent_method_record(&type_decl, inputs) {
+                        let mut fields = HashMap::new();
+                        for (field_name, type_text, _) in &parsed.fields {
+                            if let Some(primitive) = primitive_method_field_type(type_text) {
+                                fields.insert(field_name.clone(), primitive);
+                            }
+                        }
+                        records.insert(
+                            sai_syntax::normalize_identifier(
+                                parsed
+                                    .type_name
+                                    .strip_prefix("r#")
+                                    .unwrap_or(&parsed.type_name),
+                            ),
+                            fields,
+                        );
+                    }
+                }
+            }
+            if !records.is_empty() {
+                visit_block_expressions(body_block, &mut |expression| {
+                    let ExprKind::Field { base, name, .. } = expression.kind else {
+                        return;
+                    };
+                    let ExprKind::Path(path) = base.kind else {
+                        return;
+                    };
+                    let Some(binding) = resolved_plain_local_path_binding(path, locals, inputs)
+                    else {
+                        return;
+                    };
+                    let Some(record_name) = nominal_binding_record_names.get(&binding) else {
+                        return;
+                    };
+                    let Some(fields) = records.get(record_name) else {
+                        return;
+                    };
+                    let Ok(field_name) = symbols.resolve(name.sym) else {
+                        return;
+                    };
+                    let normalized = sai_syntax::normalize_identifier(
+                        field_name.strip_prefix("r#").unwrap_or(field_name.as_ref()),
+                    );
+                    if let Some(primitive) = fields.get(normalized.as_str()) {
+                        merged_fields.insert(expression.hir_id, *primitive);
+                    }
+                });
+            }
+        }
+    }
+    let self_field_projections = Some(&merged_fields);
+    let str_self_field_projections = Some(&merged_str_fields);
     // A missing return type is the implicit `-> ()` (spec 6.5.1). Unit
     // returns check the tail as a discard — synthesized without an
     // expectation, any type accepted (spec 6.11.1/6.25.2) — so the

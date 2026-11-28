@@ -11651,6 +11651,21 @@ recurse. Trait-based indexing, projections of scalar bases
 - Gate: annotated destructuring, non-tuple subpatterns, and refutable
   subpatterns remain future slices.
 
+## IR-1234: Record field reads on parameters
+
+- Slice: `pub fn f(p: Point) -> I32 { p.x }` — a field access whose base
+  is a direct path to a record parameter projects the primitive field
+  type, in tail, arithmetic, and initializer positions; a mistyped use
+  (`p.x` at `I32` when the field is `U8`) is `TYPE_MISMATCH`.
+- The driver resolves the field type through the same-file record
+  declaration (the `parse_inherent_method_record` scanner the inherent
+  method machinery already uses) and merges the projection into the
+  same `HirId`-keyed map `self.<field>` uses, so admission and the
+  kernel's Field synthesis needed no changes.
+- Bounded: nested chains (`p.inner.x`), copies (`var q = p; q.x`),
+  non-primitive fields, unknown fields, and records declared in other
+  files gate for their own slices.
+
 ## IR-1233: Record parameters as opaque nominal bindings
 
 - Slice: `pub fn f(p: Point) -> I32 { 1 }` — record-typed parameters
