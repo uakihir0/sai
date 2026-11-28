@@ -27553,3 +27553,67 @@ fn composite_tuple_and_array_parameters_project_and_index() {
         }
     }
 }
+
+#[test]
+fn composite_return_literal_tails_check_elementwise() {
+    let cases: &[(&str, &[(&str, usize)])] = &[
+        // A statement-bearing body returning a tuple literal checks the
+        // elements against the return shape.
+        (
+            "pub fn f(x: I32) -> (I32, Bool) {\n    let y = x + 1\n    (y, true)\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> ((I32, Bool), I32) {\n    ((x, true), 1)\n}\n",
+            &[],
+        ),
+        (
+            "pub fn f(x: I32) -> Array<I32, 2> {\n    let y = x + 1\n    [y, 2]\n}\n",
+            &[],
+        ),
+        // Leaf literals resolve against the leaf expectation — range
+        // errors and type mismatches surface elementwise.
+        (
+            "pub fn f() -> (U8, Bool) {\n    (300, true)\n}\n",
+            &[("LITERAL_OUT_OF_RANGE", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> (I32, Bool) {\n    (x, 1)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> Array<I32, 2> {\n    [x, true]\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        // Arity and length are part of the type.
+        (
+            "pub fn f(x: I32) -> (I32, Bool) {\n    (x, true, 1)\n}\n",
+            &[("TYPE_MISMATCH", 1)],
+        ),
+        (
+            "pub fn f(x: I32) -> Array<I32, 2> {\n    [x, 1, 2]\n}\n",
+            &[("ARRAY_LENGTH_MISMATCH", 1)],
+        ),
+    ];
+    for (source, code_counts) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "composite return tails should be checked, not gated:\n{stdout}"
+        );
+        let expected_exit = if code_counts.is_empty() {
+            Some(0)
+        } else {
+            Some(1)
+        };
+        assert_eq!(output.status.code(), expected_exit, "{stdout}");
+        for (code, count) in code_counts.iter() {
+            let actual = stdout
+                .lines()
+                .filter(|record| record.contains(&format!("\"code\":\"{code}\"")))
+                .count();
+            assert_eq!(actual, *count, "{code} count mismatch:\n{stdout}");
+        }
+    }
+}

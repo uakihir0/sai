@@ -13720,17 +13720,23 @@ fn check_function_body_primitive_local_block(
                 Some(FunctionDirectType::Primitive(primitive)) => Some(primitive),
                 Some(FunctionDirectType::Unit) => None,
                 _ => {
-                    // Composite tuple/array returns check a composite
-                    // literal tail elementwise in the kernel — the shape
-                    // interns into the composite arena like parameter
-                    // shapes. Non-composite shapes stay gated.
+                    // Statement-less composite tails stay with the
+                    // driver-side validators — their type-display
+                    // diagnostics are richer. The kernel takes bodies
+                    // with statements, which those validators cannot
+                    // check: the shape interns into the composite arena
+                    // like parameter shapes. Non-composite shapes stay
+                    // gated.
+                    if let ExprKind::Block(block) = body.value.kind {
+                        if block.stmts.is_empty() {
+                            return Ok(None);
+                        }
+                    }
                     match resolve_composite_binding_shape(
                         *return_ty, type_paths, symbols, inputs, target_cfg,
                     ) {
                         Some(
-                            shape
-                            @
-                            (sai_ty::typeck::body::CompositeBindingShape::Tuple(_)
+                            shape @ (sai_ty::typeck::body::CompositeBindingShape::Tuple(_)
                             | sai_ty::typeck::body::CompositeBindingShape::Array { .. }),
                         ) => {
                             composite_return_shape = Some(shape);
@@ -18894,22 +18900,29 @@ fn primitive_body_errors_to_diagnostics(
                 tuple,
                 expected,
                 found,
-            } => const_literal_diagnostic(
-                owner.id,
-                inputs,
-                snapshot,
-                span,
-                sai_diagnostics::Code::TypeMismatch,
-                format!(
-                    "expected {} of {} {}, found {} {}",
-                    if tuple { "a tuple" } else { "an array" },
-                    expected,
-                    if tuple { "element(s)" } else { "element(s)" },
-                    found,
-                    if tuple { "element(s)" } else { "element(s)" },
-                ),
-                "type mismatch",
-            )?,
+            } => {
+                if tuple {
+                    const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected a tuple of arity {expected}, found arity {found}"),
+                        "type mismatch",
+                    )?
+                } else {
+                    const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        span,
+                        sai_diagnostics::Code::ArrayLengthMismatch,
+                        format!("expected array length {expected}, found {found}"),
+                        "array length mismatch",
+                    )?
+                }
+            }
             PrimitiveBodyErrorKind::MissingBlockTail { expected } => const_literal_diagnostic(
                 owner.id,
                 inputs,
