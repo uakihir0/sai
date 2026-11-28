@@ -13713,12 +13713,38 @@ fn check_function_body_primitive_local_block(
     // returns check the tail as a discard — synthesized without an
     // expectation, any type accepted (spec 6.11.1/6.25.2) — so the
     // kernel input carries no primitive expectation for them.
+    let mut composite_return_shape = None;
     let return_type = match sig.ret {
         Some(return_ty) => {
             match resolve_function_direct_type(*return_ty, type_paths, symbols, inputs) {
                 Some(FunctionDirectType::Primitive(primitive)) => Some(primitive),
                 Some(FunctionDirectType::Unit) => None,
-                _ => return Ok(None),
+                _ => {
+                    // Statement-less composite tails stay with the
+                    // driver-side validators — their type-display
+                    // diagnostics are richer. The kernel takes bodies
+                    // with statements, which those validators cannot
+                    // check: the shape interns into the composite arena
+                    // like parameter shapes. Non-composite shapes stay
+                    // gated.
+                    if let ExprKind::Block(block) = body.value.kind {
+                        if block.stmts.is_empty() {
+                            return Ok(None);
+                        }
+                    }
+                    match resolve_composite_binding_shape(
+                        *return_ty, type_paths, symbols, inputs, target_cfg,
+                    ) {
+                        Some(
+                            shape @ (sai_ty::typeck::body::CompositeBindingShape::Tuple(_)
+                            | sai_ty::typeck::body::CompositeBindingShape::Array { .. }),
+                        ) => {
+                            composite_return_shape = Some(shape);
+                            None
+                        }
+                        _ => return Ok(None),
+                    }
+                }
             }
         }
         None => None,
@@ -13786,6 +13812,10 @@ fn check_function_body_primitive_local_block(
     // `[x, 1]` tails validate their interiors instead of gating.
     let is_supported_unit_tail =
         return_type.is_none() && matches!(tail_kind, Some(ExprKind::Tuple(_) | ExprKind::Array(_)));
+    // A composite return type admits tuple/array literal tails of its
+    // own — the kernel checks them elementwise against the shape.
+    let is_supported_composite_tail = composite_return_shape.is_some()
+        && matches!(tail_kind, Some(ExprKind::Tuple(_) | ExprKind::Array(_)));
     // Unit-mode `if` tails check branch-wise in the kernel, so an omitted
     // `else` — `{}` by spec 6.14.1 — is admissible there too.
     let is_supported_if_tail = matches!(tail_kind, Some(ExprKind::If { els: Some(_), .. }))
@@ -13937,7 +13967,11 @@ fn check_function_body_primitive_local_block(
         Some(ExprKind::TupleField { .. } | ExprKind::Index(..)) if is_supported_projection_tail => {
             None
         }
-        Some(ExprKind::Tuple(_) | ExprKind::Array(_)) if is_supported_unit_tail => None,
+        Some(ExprKind::Tuple(_) | ExprKind::Array(_))
+            if is_supported_unit_tail || is_supported_composite_tail =>
+        {
+            None
+        }
         // A statement-only unit body carries no tail binding.
         None => None,
         _ => return Ok(None),
@@ -13959,6 +13993,7 @@ fn check_function_body_primitive_local_block(
         && !is_supported_block_tail
         && !is_supported_unit_tail
         && !is_supported_projection_tail
+        && !is_supported_composite_tail
     {
         return Ok(None);
     }
@@ -14217,6 +14252,7 @@ fn check_function_body_primitive_local_block(
             return_type,
             initial_bindings: &initial_bindings,
             composite_initial_bindings: Some(&composite_initial_bindings),
+            composite_return_shape: composite_return_shape.as_ref(),
             str_bindings: Some(&str_admissions.locals),
             str_annotations: Some(&str_admissions.annotations),
             primitive_types: &primitive_types,
@@ -18858,6 +18894,56 @@ fn primitive_body_errors_to_diagnostics(
                         "tuple pattern has {found} element(s) but the type has arity {expected}"
                     ),
                     "pattern arity mismatch",
+                )?
+            }
+            PrimitiveBodyErrorKind::CompositeArityMismatch {
+                tuple,
+                expected,
+                found,
+            } => {
+                if tuple {
+                    const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        span,
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected a tuple of arity {expected}, found arity {found}"),
+                        "type mismatch",
+                    )?
+                } else {
+                    const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        span,
+                        sai_diagnostics::Code::ArrayLengthMismatch,
+                        format!("expected array length {expected}, found {found}"),
+                        "array length mismatch",
+                    )?
+                }
+            }
+            PrimitiveBodyErrorKind::CompositeShapeMismatch { expected_tuple } => {
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected {}, found {}",
+                        if expected_tuple {
+                            "a tuple"
+                        } else {
+                            "an array"
+                        },
+                        if expected_tuple {
+                            "an array"
+                        } else {
+                            "a tuple"
+                        },
+                    ),
+                    "type mismatch",
                 )?
             }
             PrimitiveBodyErrorKind::MissingBlockTail { expected } => const_literal_diagnostic(
@@ -75991,6 +76077,7 @@ property "shared"() {}
                 return_type: Some(PrimTy::Bool),
                 initial_bindings: &std::collections::HashMap::new(),
                 composite_initial_bindings: None,
+                composite_return_shape: None,
                 str_bindings: None,
                 str_annotations: None,
                 primitive_types: &std::collections::HashMap::new(),
