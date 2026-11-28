@@ -18891,6 +18891,21 @@ fn primitive_body_errors_to_diagnostics(
                     "type mismatch",
                 )?
             }
+            PrimitiveBodyErrorKind::CompositeLiteralAgainstPrimitive { expected, tuple } => {
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found {}",
+                        const_primitive_name(expected),
+                        if tuple { "a tuple" } else { "an array" },
+                    ),
+                    "type mismatch",
+                )?
+            }
             PrimitiveBodyErrorKind::TuplePatternOnNonTuple => const_literal_diagnostic(
                 owner.id,
                 inputs,
