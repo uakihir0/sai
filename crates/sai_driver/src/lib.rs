@@ -13728,7 +13728,12 @@ fn check_function_body_primitive_local_block(
                     // like parameter shapes. Non-composite shapes stay
                     // gated.
                     if let ExprKind::Block(block) = body.value.kind {
-                        if block.stmts.is_empty() {
+                        // Composite `if` tails have no driver-side
+                        // validator either, so statement-less bodies
+                        // ending in one admit to the kernel too.
+                        let if_tail =
+                            matches!(block.tail.map(|tail| tail.kind), Some(ExprKind::If { .. }));
+                        if block.stmts.is_empty() && !if_tail {
                             return Ok(None);
                         }
                     }

@@ -810,6 +810,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         if matches!(tail.kind, ExprKind::Tuple(_) | ExprKind::Array(_)) {
             self.check_composite_literal_value(tail, expected)?;
+        } else if let ExprKind::If { cond, then, els } = tail.kind {
+            self.check_if_composite_tail(cond, then, els, expected)?;
         } else {
             // A non-literal composite tail (`let t = (x, 1)` then `t`, or
             // a projection yielding a composite) synthesizes first, then
@@ -823,6 +825,31 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
         self.default_unresolved_literals(literal_floor);
         Ok(())
+    }
+
+    /// An `if` tail checked against a composite shape branch-wise (spec
+    /// 6.25.2): both branches must yield the composite type, so each
+    /// branch block checks against the same shape and `else if` chains
+    /// recurse. An `if` without `else` is `()`-typed and stays gated.
+    fn check_if_composite_tail(
+        &mut self,
+        condition: &'hir Expr<'hir>,
+        then: &'hir Block<'hir>,
+        els: Option<&'hir Expr<'hir>>,
+        expected: LocalType,
+    ) -> Result<(), ()> {
+        let Some(els) = els else {
+            return Err(());
+        };
+        self.check_if_condition(condition)?;
+        self.check_block_composite_expected(then, expected)?;
+        match els.kind {
+            ExprKind::Block(block) => self.check_block_composite_expected(block, expected),
+            ExprKind::If { cond, then, els } => {
+                self.check_if_composite_tail(cond, then, els, expected)
+            }
+            _ => Err(()),
+        }
     }
 
     /// A composite literal checked against a composite shape elementwise
