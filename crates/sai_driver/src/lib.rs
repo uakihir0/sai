@@ -8194,18 +8194,31 @@ fn check_function_body_type(
         // parameter or return type that fails primitive resolution is
         // non-scalar for the boundary: it gates here, and a type that
         // genuinely cannot resolve would gate downstream anyway.
+        // A type with an invalid array length is spec-invalid on its
+        // own (spec 5.2.2): the length diagnostic downstream must still
+        // fire, so such types do not count toward the boundary gate here
+        // — the gate would swallow the diagnostic behind it.
+        let has_invalid_length = |ty: sai_hir::types::Ty<'_>| {
+            find_invalid_array_length_type_argument(ty, type_paths, target_cfg.pointer_width())
+                .is_some()
+        };
         let non_scalar = sig.params.iter().any(|parameter| {
-            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
-                .map_or(true, |direct| {
-                    !matches!(direct, FunctionDirectType::Primitive(_))
-                })
+            !has_invalid_length(*parameter.ty)
+                && resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+                    .map_or(true, |direct| {
+                        !matches!(direct, FunctionDirectType::Primitive(_))
+                    })
         }) || sig.ret.is_some_and(|ret| {
-            resolve_function_direct_type(*ret, type_paths, symbols, inputs).map_or(true, |direct| {
-                !matches!(
-                    direct,
-                    FunctionDirectType::Primitive(_) | FunctionDirectType::Unit
+            !has_invalid_length(*ret)
+                && resolve_function_direct_type(*ret, type_paths, symbols, inputs).map_or(
+                    true,
+                    |direct| {
+                        !matches!(
+                            direct,
+                            FunctionDirectType::Primitive(_) | FunctionDirectType::Unit
+                        )
+                    },
                 )
-            })
         });
         if non_scalar {
             return Ok(FunctionBodyTypeCheck::Unsupported);
